@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pica3DS</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --border: #2a2f3a;
+    --text: #e6e8ee;
+    --muted: #8b93a7;
+    --accent: #e4002b;
+    --accent-2: #ff5468;
+    --ok: #3ccf91;
+    --warn: #f5b942;
+    --shell: #23262e;
+    --screen-bezel: #08090b;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { min-height: 100vh; display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  header .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+  header .tag { color: var(--muted); font-size: 12px; }
+  main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 20px; padding: 20px; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+
+  .stage { display: flex; justify-content: center; align-items: flex-start; }
+  .device { background: var(--shell); border-radius: 22px; padding: 18px 18px 22px; border: 1px solid #333846; box-shadow: 0 20px 60px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.04); display: flex; flex-direction: column; align-items: center; gap: 14px; position: relative; max-width: 100%; }
+  .screen { background: var(--screen-bezel); padding: 10px; border-radius: 10px; position: relative; max-width: 100%; }
+  canvas { display: block; image-rendering: pixelated; image-rendering: crisp-edges; background: #000; max-width: 100%; height: auto; }
+  #bottom { cursor: crosshair; touch-action: none; }
+  .hinge { width: 60%; height: 6px; border-radius: 3px; background: #1a1d24; }
+
+  .overlay { position: absolute; inset: 10px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; text-align: center; background: rgba(8,9,11,.88); color: var(--text); padding: 20px; }
+  .overlay[hidden] { display: none; }
+  .overlay h2 { margin: 0; font-size: 18px; }
+  .overlay p { margin: 0; color: var(--muted); max-width: 520px; }
+  .overlay pre { margin: 0; text-align: left; font: 11px/1.4 ui-monospace, Consolas, monospace; color: #ffb4bd; white-space: pre-wrap; max-height: 70%; overflow: auto; }
+
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  button, .btn { appearance: none; border: 1px solid var(--border); background: var(--panel-2); color: var(--text); padding: 8px 14px; border-radius: 8px; font: inherit; font-weight: 550; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+  button:hover:not(:disabled), .btn:hover { border-color: #3d4453; background: #252a35; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary, .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled), .btn.primary:hover { background: var(--accent-2); border-color: var(--accent-2); }
+  input[type=file] { display: none; }
+
+  aside { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .card h3 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); font-weight: 650; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .stat { background: var(--panel-2); border-radius: 8px; padding: 8px 10px; }
+  .stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: 11px; }
+  .status { margin-top: 10px; font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 8px; min-height: 20px; }
+  .status i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .status.running i { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .status.paused i { background: var(--warn); }
+  .status.halted i { background: var(--accent); }
+
+  .keys { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; }
+  .keys dt { color: var(--muted); }
+  .keys dd { margin: 0; }
+  kbd { font: 11px ui-monospace, Consolas, monospace; background: var(--panel-2); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; padding: 1px 5px; }
+
+  #log { height: 220px; overflow: auto; font: 11.5px/1.5 ui-monospace, Consolas, monospace; background: #0b0d11; border-radius: 8px; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; }
+  #log .dbg { color: #9fd3ff; }
+  #log .err { color: #ff8a98; }
+  #log .info { color: var(--muted); }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  select { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font: inherit; }
+  .drop-hint { position: fixed; inset: 0; background: rgba(228,0,43,.12); border: 3px dashed var(--accent); display: none; align-items: center; justify-content: center; font-size: 22px; font-weight: 650; z-index: 10; pointer-events: none; }
+  body.dragging .drop-hint { display: flex; }
+  .note { color: var(--muted); font-size: 12.5px; margin: 0; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot"></span>
+  <h1>Pica3DS</h1>
+  <span class="tag">ARM11 interpreter · HLE kernel &amp; services · .3dsx / .elf / decrypted .3ds &amp; .cxi</span>
+</header>
+
+<main>
+  <section class="stage">
+    <div class="device">
+      <div class="screen">
+        <canvas id="top" width="400" height="240"></canvas>
+        <div class="overlay" id="overlay">
+          <h2 id="ov-title">No application loaded</h2>
+          <p id="ov-text">Open a <b>.3dsx</b>, <b>.elf</b>, or decrypted <b>.3ds</b> / <b>.cxi</b> file, drop one anywhere on this page, or run the built-in demo.</p>
+          <pre id="ov-detail" hidden></pre>
+          <div class="btns">
+            <label class="btn primary" for="file">Open file…</label>
+            <button id="ov-demo">Run demo</button>
+          </div>
+        </div>
+      </div>
+      <div class="hinge"></div>
+      <div class="screen">
+        <canvas id="bottom" width="320" height="240"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <aside>
+    <div class="card">
+      <h3>Emulation</h3>
+      <div class="btns">
+        <label class="btn primary" for="file">Open file…</label>
+        <button id="demo">Demo</button>
+        <button id="pause" disabled>Pause</button>
+        <button id="reset" disabled>Reset</button>
+      </div>
+      <input type="file" id="file" accept=".3dsx,.elf,.axf,.3ds,.cci,.cxi">
+      <input type="file" id="sysfiles" multiple>
+      <div class="row" style="margin-top:12px">
+        <span class="note" id="sys-status">System files: none</span>
+        <span><label class="btn" for="sysfiles" style="padding:3px 10px;font-size:12px">System files…</label>
+        <button id="sys-clear" style="padding:3px 10px;font-size:12px" disabled>Clear</button></span>
+      </div>
+      <div class="status" id="status"><i></i><span id="status-text">Idle</span></div>
+      <div class="stats" style="margin-top:10px">
+        <div class="stat"><b id="fps">–</b><span>FPS</span></div>
+        <div class="stat"><b id="mips">–</b><span>MIPS</span></div>
+        <div class="stat"><b id="speed">–</b><span>Speed</span></div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <span class="note">Screen scale</span>
+        <select id="scale">
+          <option value="1">1×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2" selected>2×</option>
+          <option value="2.5">2.5×</option>
+          <option value="3">3×</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Controls</h3>
+      <dl class="keys">
+        <dt>D-Pad</dt><dd><kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd></dd>
+        <dt>Circle Pad</dt><dd><kbd>I</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd></dd>
+        <dt>A / B</dt><dd><kbd>X</kbd> / <kbd>Z</kbd></dd>
+        <dt>X / Y</dt><dd><kbd>S</kbd> / <kbd>A</kbd></dd>
+        <dt>L / R</dt><dd><kbd>Q</kbd> / <kbd>W</kbd></dd>
+        <dt>Start / Select</dt><dd><kbd>Enter</kbd> / <kbd>Backspace</kbd></dd>
+        <dt>Touch</dt><dd>Mouse or finger on the bottom screen</dd>
+        <dt>Gamepad</dt><dd>Supported (standard mapping)</dd>
+      </dl>
+    </div>
+
+    <div class="card">
+      <div class="row"><h3 style="margin:0">Log</h3><button id="clear-log" style="padding:3px 10px;font-size:12px">Clear</button></div>
+      <div id="log" style="margin-top:10px"></div>
+    </div>
+
+    <p class="note">Runs homebrew built with devkitARM/libctru, as .3dsx/.elf or packaged as a decrypted .3ds/.cxi (RomFS supported). Encrypted .3ds and .cia files are not supported. The 3D GPU (PICA200) is emulated in software (geometry shaders, procedural textures and gas are not yet). Games that read system data (Mii data, fonts) need those files dumped and decrypted from your own 3DS, added with "System files…". Commercial games are experimental and may stop on unsupported features.</p>
+  </aside>
+</main>
+<div class="drop-hint">Drop a .3dsx, .elf, .3ds or .cxi to run it</div>
+
+<script src="src/memory.js"></script>
+<script src="src/cpu.js"></script>
+<script src="src/kernel.js"></script>
+<script src="src/services.js"></script>
+<script src="src/gpu.js"></script>
+<script src="src/sysdata.js"></script>
+<script src="src/loader.js"></script>
+<script src="src/emulator.js"></script>
+<script src="src/demo-rom.js"></script>
+<script src="src/main.js"></script>
+</body>
+</html>

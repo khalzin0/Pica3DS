@@ -1,0 +1,241 @@
+// Loaders for homebrew executables: .3dsx (with relocations) and ARM ELF.
+(function (EMU) {
+  'use strict';
+
+  const BASE = 0x00100000;
+  const align = (v) => (v + 0xFFF) & ~0xFFF;
+
+  function load3dsx(mem, bytes) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const u16 = (o) => dv.getUint16(o, true), u32 = (o) => dv.getUint32(o, true);
+    if (u32(0) !== 0x58534433) throw new EMU.EmuError('Not a 3DSX file (bad magic)');
+    const headerSize = u16(4), relocHdrSize = u16(6);
+    const codeSize = u32(0x10), rodataSize = u32(0x14), dataSize = u32(0x18), bssSize = u32(0x1C);
+    const segSizes = [align(codeSize), align(rodataSize), align(dataSize)];
+    const total = segSizes[0] + segSizes[1] + segSizes[2];
+    const image = new Uint8Array(total);
+    const segOff = [0, segSizes[0], segSizes[0] + segSizes[1]];
+    const nTables = relocHdrSize / 4;
+
+    let pos = headerSize;
+    const relocs = [];
+    for (let s = 0; s < 3; s++) {
+      const t = [];
+      for (let i = 0; i < nTables; i++) t.push(u32(pos + i * 4));
+      relocs.push(t);
+      pos += relocHdrSize;
+    }
+    image.set(bytes.subarray(pos, pos + codeSize), segOff[0]); pos += codeSize;
+    image.set(bytes.subarray(pos, pos + rodataSize), segOff[1]); pos += rodataSize;
+    image.set(bytes.subarray(pos, pos + dataSize - bssSize), segOff[2]); pos += dataSize - bssSize;
+
+    const idv = new DataView(image.buffer);
+    const offsets = [segSizes[0], segSizes[0] + segSizes[1]];
+    const translate = (a) => (a < offsets[0] ? BASE + a : a < offsets[1] ? BASE + segSizes[0] + a - offsets[0] : BASE + segSizes[0] + segSizes[1] + a - offsets[1]);
+
+    for (let s = 0; s < 3; s++) {
+      const end = segOff[s] + segSizes[s];
+      for (let tbl = 0; tbl < nTables; tbl++) {
+        const n = relocs[s][tbl];
+        if (tbl >= 2) { pos += n * 4; continue; }
+        let p = segOff[s]; // each table walks the segment from its start
+        for (let i = 0; i < n; i++) {
+          const skip = u16(pos), patch = u16(pos + 2);
+          pos += 4;
+          p += skip * 4;
+          for (let j = 0; j < patch && p < end; j++, p += 4) {
+            const orig = idv.getUint32(p, true);
+            const subType = orig >>> 28;
+            const addr = translate(orig & 0x0FFFFFFF);
+            if (tbl === 0) idv.setUint32(p, addr >>> 0, true);
+            else {
+              const rel = (addr - (BASE + p)) >>> 0;
+              idv.setUint32(p, subType === 1 ? rel & 0x7FFFFFFF : rel, true);
+            }
+          }
+        }
+      }
+    }
+
+    mem.map(BASE, segSizes[0], image, 0, 5, 3, 'code');
+    if (segSizes[1]) mem.map(BASE + segSizes[0], segSizes[1], image, segOff[1], 1, 3, 'rodata');
+    if (segSizes[2]) mem.map(BASE + segSizes[0] + segSizes[1], segSizes[2], image, segOff[2], 3, 3, 'data');
+
+    // Extended header: embedded SMDH (icon/title) and RomFS (level-3 image).
+    let romfs = null, title = null;
+    if (headerSize > 0x20) {
+      const smdhOff = u32(0x20), smdhSize = u32(0x24), romfsOff = u32(0x28);
+      if (smdhSize) title = smdhTitle(bytes.subarray(smdhOff, smdhOff + smdhSize));
+      if (romfsOff && romfsOff < bytes.length) romfs = bytes.subarray(romfsOff);
+    }
+    return { entry: BASE, size: total, format: '3DSX', romfs, title };
+  }
+
+  // English short title from an SMDH icon file.
+  function smdhTitle(smdh) {
+    if (smdh.length < 0x2000 || String.fromCharCode(...smdh.subarray(0, 4)) !== 'SMDH') return null;
+    const dv = new DataView(smdh.buffer, smdh.byteOffset, smdh.byteLength);
+    let s = '';
+    for (let o = 0x208; o < 0x288; o += 2) { const c = dv.getUint16(o, true); if (!c) break; s += String.fromCharCode(c); }
+    return s || null;
+  }
+
+  // Reverse LZSS ("BLZ") used for compressed ExeFS .code sections.
+  function blzDecompress(c) {
+    const dv = new DataView(c.buffer, c.byteOffset, c.byteLength);
+    const n = c.length;
+    const topBottom = dv.getUint32(n - 8, true), extra = dv.getUint32(n - 4, true);
+    const outSize = n + extra;
+    const out = new Uint8Array(outSize);
+    out.set(c);
+    let index = n - (topBottom >>> 24);
+    const stop = n - (topBottom & 0xFFFFFF);
+    let o = outSize;
+    while (index > stop) {
+      let control = c[--index];
+      for (let i = 0; i < 8 && index > stop && o > 0; i++, control <<= 1) {
+        if (control & 0x80) {
+          index -= 2;
+          const v = c[index] | (c[index + 1] << 8);
+          const len = ((v >>> 12) & 15) + 3, disp = (v & 0xFFF) + 2;
+          if (o < len || o + disp >= outSize) throw new EMU.EmuError('Corrupt compressed .code section');
+          for (let j = 0; j < len; j++) { const b = out[o + disp]; out[--o] = b; }
+        } else {
+          out[--o] = c[--index];
+        }
+      }
+    }
+    return out;
+  }
+  EMU.blzDecompress = blzDecompress;
+
+  // NCCH (CXI) executable partition, as found inside .3ds/.cci images or as a bare .cxi.
+  function loadNcch(mem, bytes, mediaUnit = 0x200) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const u32 = (o) => dv.getUint32(o, true);
+    const ascii = (o, n) => String.fromCharCode(...bytes.subarray(o, o + n)).replace(/\0.*$/, '');
+    if (ascii(0x100, 4) !== 'NCCH') throw new EMU.EmuError('Bad NCCH header');
+    const flags = bytes.subarray(0x188, 0x190);
+    if (!(flags[5] & 2)) throw new EMU.EmuError('This NCCH partition has no executable code (it is a data-only archive).');
+    if (!(flags[7] & 4)) {
+      throw new EMU.EmuError('This .3ds/.cxi is encrypted. Only decrypted images are supported. Decrypt your own dump on your 3DS first (e.g. GodMode9: "Decrypt file").');
+    }
+    if (u32(0x180) < 0x400) throw new EMU.EmuError('NCCH has no extended header');
+
+    // Extended header: code set layout, stack size, main thread priority.
+    const ex = 0x200;
+    const seg = (o) => ({ addr: u32(ex + o), pages: u32(ex + o + 4), size: u32(ex + o + 8) });
+    const text = seg(0x10), ro = seg(0x20), data = seg(0x30);
+    const stackSize = u32(ex + 0x1C), bssSize = u32(ex + 0x3C);
+    const compressed = bytes[ex + 0xD] & 1;
+    const priority = bytes[ex + 0x200 + 0xF];
+
+    // ExeFS: find .code (and the icon for the title).
+    const exefs = u32(0x1A0) * mediaUnit;
+    if (!exefs) throw new EMU.EmuError('NCCH has no ExeFS');
+    const files = {};
+    for (let i = 0; i < 10; i++) {
+      const e = exefs + i * 16;
+      const name = ascii(e, 8);
+      if (name) files[name] = bytes.subarray(exefs + 0x200 + u32(e + 8), exefs + 0x200 + u32(e + 8) + u32(e + 12));
+    }
+    if (!files['.code']) throw new EMU.EmuError('ExeFS has no .code section');
+    const code = compressed ? blzDecompress(files['.code']) : files['.code'];
+
+    // Segments in .code are page-aligned; .bss follows .data.
+    const sz = (s) => Math.max(s.pages * 0x1000, align(s.size));
+    const textSz = sz(text), roSz = sz(ro), dataSz = sz(data) + align(bssSize);
+    const image = new Uint8Array(textSz + roSz + dataSz);
+    image.set(code.subarray(0, Math.min(code.length, image.length)));
+    const fileDataEnd = textSz + roSz + data.size;
+    image.fill(0, Math.min(fileDataEnd, image.length));
+    mem.map(text.addr, textSz, image, 0, 5, 3, 'code');
+    if (roSz) mem.map(ro.addr, roSz, image, textSz, 1, 3, 'rodata');
+    if (dataSz) mem.map(data.addr, dataSz, image, textSz + roSz, 3, 3, 'data');
+
+    // RomFS: the FS archive exposes the level-3 image, which starts 0x1000 into the IVFC section.
+    let romfs = null;
+    const romfsOff = u32(0x1B0) * mediaUnit, romfsSize = u32(0x1B4) * mediaUnit;
+    if (romfsOff && romfsSize > 0x1000 && !(flags[7] & 2)) romfs = bytes.subarray(romfsOff + 0x1000, romfsOff + romfsSize);
+
+    // ARM11 kernel capabilities (exheader 0x370): the kernel release version descriptor
+    let kernelVersion = 0;
+    for (let i = 0; i < 28; i++) {
+      const d = u32(ex + 0x370 + i * 4);
+      if ((d & 0xFE000000) >>> 0 === 0xFC000000) kernelVersion = d & 0xFFFF;
+    }
+
+    return {
+      entry: text.addr, size: image.length, format: 'NCCH', romfs, kernelVersion,
+      stackSize, priority: priority || 0x30,
+      title: files.icon ? smdhTitle(files.icon) : null,
+      programId: dv.getBigUint64(0x118, true).toString(16).padStart(16, '0'),
+    };
+  }
+
+  function loadNcsd(mem, bytes) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const mediaUnit = 0x200 << bytes[0x188 + 6];
+    const off = dv.getUint32(0x120, true) * mediaUnit, size = dv.getUint32(0x124, true) * mediaUnit;
+    if (!off || !size || off + 0x200 > bytes.length) throw new EMU.EmuError('.3ds image has no game partition');
+    const info = loadNcch(mem, bytes.subarray(off, Math.min(bytes.length, off + size)), mediaUnit);
+    info.format = 'NCSD (.3ds)';
+    return info;
+  }
+
+  function loadElf(mem, bytes) {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (dv.getUint32(0, false) !== 0x7F454C46) throw new EMU.EmuError('Not an ELF file');
+    if (bytes[4] !== 1 || bytes[5] !== 1) throw new EMU.EmuError('Only 32-bit little-endian ELF files are supported');
+    if (dv.getUint16(18, true) !== 40) throw new EMU.EmuError('ELF is not for ARM');
+    const entry = dv.getUint32(24, true);
+    const phoff = dv.getUint32(28, true), phentsize = dv.getUint16(42, true), phnum = dv.getUint16(44, true);
+    let lo = Infinity, hi = 0;
+    const segs = [];
+    for (let i = 0; i < phnum; i++) {
+      const o = phoff + i * phentsize;
+      if (dv.getUint32(o, true) !== 1) continue; // PT_LOAD
+      const seg = { off: dv.getUint32(o + 4, true), vaddr: dv.getUint32(o + 8, true), filesz: dv.getUint32(o + 16, true), memsz: dv.getUint32(o + 20, true), flags: dv.getUint32(o + 24, true) };
+      if (!seg.memsz) continue;
+      segs.push(seg);
+      lo = Math.min(lo, seg.vaddr & ~0xFFF);
+      hi = Math.max(hi, align(seg.vaddr + seg.memsz));
+    }
+    if (!segs.length) throw new EMU.EmuError('ELF has no loadable segments');
+    const image = new Uint8Array(hi - lo);
+    for (const s of segs) image.set(bytes.subarray(s.off, s.off + s.filesz), s.vaddr - lo);
+    mem.map(lo, hi - lo, image, 0, 7, 3, 'elf');
+    return { entry, size: hi - lo, format: 'ELF' };
+  }
+
+  // Known system data archives (title ID high 0004009B)
+  EMU.SYSTEM_ARCHIVE_NAMES = {
+    '0004009b00010202': 'Mii data',
+    '0004009b00014002': 'shared font (JPN/USA/EUR)',
+  };
+
+  // A system data archive (e.g. Mii data, shared font): the decrypted .app content of a data-only title.
+  EMU.parseSystemArchive = function (bytes) {
+    const ascii = (o, n) => String.fromCharCode(...bytes.subarray(o, o + n));
+    if (bytes.length < 0x200 || ascii(0x100, 4) !== 'NCCH') throw new EMU.EmuError('Not a system data file (expected a decrypted .app containing an NCCH)');
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const flags = bytes.subarray(0x188, 0x190);
+    const titleId = dv.getBigUint64(0x108, true).toString(16).padStart(16, '0');
+    if (!(flags[7] & 4)) throw new EMU.EmuError(`System file ${titleId} is encrypted. Decrypt it on your 3DS first (GodMode9: "NCCH image options" -> "Decrypt file").`);
+    const romfsOff = dv.getUint32(0x1B0, true) * 0x200, romfsSize = dv.getUint32(0x1B4, true) * 0x200;
+    if (!romfsOff || romfsSize <= 0x1000 || (flags[7] & 2) || romfsOff + romfsSize > bytes.length) throw new EMU.EmuError(`System file ${titleId} has no RomFS`);
+    return { titleId, romfs: bytes.slice(romfsOff + 0x1000, romfsOff + romfsSize), executable: !!(flags[5] & 2), name: EMU.SYSTEM_ARCHIVE_NAMES[titleId] || null };
+  };
+
+  EMU.loadExecutable = function (mem, bytes) {
+    if (bytes.length >= 4 && bytes[0] === 0x33 && bytes[1] === 0x44 && bytes[2] === 0x53 && bytes[3] === 0x58) return load3dsx(mem, bytes);
+    if (bytes.length >= 4 && bytes[0] === 0x7F && bytes[1] === 0x45) return loadElf(mem, bytes);
+    const magic = bytes.length > 0x200 ? String.fromCharCode(...bytes.subarray(0x100, 0x104)) : '';
+    if (magic === 'NCSD') return loadNcsd(mem, bytes);
+    if (magic === 'NCCH') return loadNcch(mem, bytes);
+    if (bytes.length > 0x2040 && String.fromCharCode(...bytes.subarray(0, 4)) === ' \0\0\0') {
+      throw new EMU.EmuError('.cia files are not supported. Use a decrypted .3ds/.cxi, or a .3dsx/.elf.');
+    }
+    throw new EMU.EmuError('Unrecognized file format. Expected .3dsx, .elf, or a decrypted .3ds/.cxi.');
+  };
+})(typeof window !== 'undefined' ? window.EMU : globalThis.EMU);

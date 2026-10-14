@@ -1,0 +1,141 @@
+// Ties memory, CPU, kernel and services together; runs frames and renders the two screens.
+(function (EMU) {
+  'use strict';
+
+  const hex = EMU.hex;
+
+  class Emulator {
+    constructor({ onLog = () => {}, onDebug = () => {}, onHalt = () => {} } = {}) {
+      this.onLog = onLog;
+      this.onDebug = onDebug;
+      this.onHalt = onHalt;
+      this.input = { keys: 0, cx: 0, cy: 0, touch: false, tx: 0, ty: 0 };
+      this.loaded = false;
+      this.halted = true;
+      this.systemArchives = new Map(); // title ID (16 hex digits) -> RomFS bytes; kept across loads
+    }
+
+    addSystemArchive(titleId, romfs) { this.systemArchives.set(titleId.toLowerCase(), romfs); }
+
+    log(msg) { this.onLog(msg); }
+
+    debugOutput(s) { this.onDebug(s); }
+
+    halt(reason) {
+      if (this.halted) return;
+      this.halted = true;
+      this.haltReason = reason;
+      this.onHalt(reason);
+    }
+
+    load(bytes, name = 'app') {
+      this.halted = false;
+      this.haltReason = null;
+      this.missingSystemArchive = null;
+      this.insnCount = 0;
+      this.frame = 0;
+      this.name = name;
+      this.mem = new EMU.Memory();
+      this.cpu = new EMU.CPU(this.mem);
+      this.kernel = new EMU.Kernel(this);
+      this.services = new EMU.Services(this);
+      this.gpu = new EMU.Gpu(this);
+      const mem = this.mem;
+
+      const info = EMU.loadExecutable(mem, bytes);
+      // Titles built for kernels before 2.44 expect the old linear heap address
+      if (info.kernelVersion && info.kernelVersion < 0x22C) this.kernel.linearBase = this.kernel.linearNext = 0x14000000;
+      this.codeSize = info.size;
+      this.romfs = info.romfs || null;
+
+      const stackSize = Math.max(0x100000, ((info.stackSize || 0) + 0xFFF) & ~0xFFF);
+      mem.alloc(0x10000000 - stackSize, stackSize, 3, 5, 'stack');
+      mem.alloc(0x1F000000, 0x600000, 3, 6, 'VRAM');
+      mem.alloc(0x1FF00000, 0x80000, 3, 6, 'DSP RAM');
+      mem.alloc(0x1FF82000, 0x8000, 3, 5, 'TLS');
+
+      // Kernel configuration page (read-only to apps).
+      const cfg = new DataView(mem.alloc(0x1FF80000, 0x1000, 1, 3, 'config page').buffer);
+      cfg.setUint32(0x00, 0x02390000, true); // kernel version 2.57
+      cfg.setUint32(0x14, 1, true);          // ENVINFO: retail
+      cfg.setUint32(0x30, 0, true);          // APPMEMTYPE
+      cfg.setUint32(0x40, 0x04000000, true); // APPMEMALLOC: 64 MB
+      cfg.setUint32(0x44, 0x02C00000, true); // SYSMEMALLOC
+      cfg.setUint32(0x48, 0x01400000, true); // BASEMEMALLOC
+      cfg.setUint32(0x60, 0x02390000, true); // FIRM version
+
+      // Shared page (time, 3D slider, ...).
+      const sp = new DataView(mem.alloc(0x1FF81000, 0x1000, 1, 3, 'shared page').buffer);
+      sp.setUint32(0x04, 1, true); // RUNNING_HW: retail
+      const msSince1900 = Date.now() - new Date(Date.UTC(1900, 0, 1)).getTime() + -new Date().getTimezoneOffset() * 60000;
+      for (const off of [0x20, 0x40]) { // osTimeRef_s[2]: value_ms, value_tick, sysclock_hz, drift_ms
+        sp.setUint32(off, msSince1900 % 4294967296, true);
+        sp.setUint32(off + 4, Math.floor(msSince1900 / 4294967296), true);
+        sp.setUint32(off + 0x10, EMU.TICKS_PER_SEC, true);
+      }
+      sp.setFloat32(0x80, 0, true);
+
+      this.kernel.createThread(info.entry, 0, 0x10000000, info.priority || 0x30);
+      this.loaded = true;
+      this.title = info.title || null;
+      const extras = [info.title && `"${info.title}"`, info.programId && `title ID ${info.programId}`, info.romfs && `RomFS ${(info.romfs.length / 1024).toFixed(0)} KB`].filter(Boolean).join(', ');
+      this.log(`Loaded ${name} (${info.format}, code ${(info.size / 1024).toFixed(0)} KB${extras ? ', ' + extras : ''}), entry ${hex(info.entry)}`);
+      return info;
+    }
+
+    runFrame() {
+      if (this.halted) return;
+      try {
+        if (this.services.instances.has('HID')) this.services.hid.update(this.input);
+        this.kernel.runUntil(this.kernel.ticks + EMU.TICKS_PER_FRAME);
+        if (this.services.instances.has('gsp::Gpu')) this.services.gsp.vblank();
+        this.frame++;
+      } catch (e) {
+        if (!(e instanceof EMU.EmuError)) console.error(e);
+        this.halt(`${e.message}\n${this.dumpRegs()}`);
+      }
+    }
+
+    dumpRegs() {
+      const c = this.cpu, r = c.r;
+      const lines = [];
+      for (let i = 0; i < 16; i += 4) {
+        lines.push([0, 1, 2, 3].map((j) => `r${i + j}`.padStart(3) + '=' + hex(i + j === 15 ? c.curPC : r[i + j])).join('  '));
+      }
+      lines.push(`CPSR=${hex(c.getCPSR())} (${c.t ? 'Thumb' : 'ARM'})  thread=${this.kernel.current ? this.kernel.current.id : '-'}`);
+      return lines.join('\n');
+    }
+
+    // Render a screen (0 = top 400x240, 1 = bottom 320x240) into RGBA pixels. Returns false if nothing to show.
+    renderScreen(screen, out) {
+      const W = screen === 0 ? 400 : 320;
+      const gsp = this.services && this.services.instances.get('gsp::Gpu');
+      const info = gsp && gsp.screenInfo(screen);
+      if (!info || !info.fb0) { out.fill(0); for (let i = 3; i < out.length; i += 4) out[i] = 255; return false; }
+      const fmt = info.format & 7, bpp = EMU.FB_BPP[fmt];
+      const stride = info.stride || 240 * bpp;
+      let data;
+      try { data = this.mem.readBytes(info.fb0, stride * (W - 1) + 240 * bpp); }
+      catch (e) { out.fill(0); return false; }
+      for (let x = 0; x < W; x++) {
+        const col = x * stride;
+        for (let y = 0; y < 240; y++) {
+          const o = col + (239 - y) * bpp, p = (y * W + x) * 4;
+          if (fmt === 1) { out[p] = data[o + 2]; out[p + 1] = data[o + 1]; out[p + 2] = data[o]; }
+          else if (fmt === 0) { out[p] = data[o + 3]; out[p + 1] = data[o + 2]; out[p + 2] = data[o + 1]; }
+          else { const c = EMU.decodePixel(fmt, data, o); out[p] = c[0]; out[p + 1] = c[1]; out[p + 2] = c[2]; }
+          out[p + 3] = 255;
+        }
+      }
+      return true;
+    }
+  }
+
+  // 3DS button bits as reported by HID.
+  EMU.KEYS = {
+    A: 1 << 0, B: 1 << 1, SELECT: 1 << 2, START: 1 << 3, DRIGHT: 1 << 4, DLEFT: 1 << 5, DUP: 1 << 6, DDOWN: 1 << 7,
+    R: 1 << 8, L: 1 << 9, X: 1 << 10, Y: 1 << 11, ZL: 1 << 14, ZR: 1 << 15,
+  };
+
+  EMU.Emulator = Emulator;
+})(typeof window !== 'undefined' ? window.EMU : globalThis.EMU);

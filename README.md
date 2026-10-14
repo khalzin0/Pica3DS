@@ -1,7 +1,6 @@
 # Pica3DS
-An experimental Nintendo 3DS emulator written from scratch in JavaScript. It runs homebrew and boots some commercial games into 3D scenes, all in the browser with no build step. Bring your own legally dumped games; no Nintendo files or keys are included.
 
-# 3DS Emulator
+An experimental Nintendo 3DS emulator written from scratch in JavaScript. It runs in the browser with no build step, no install and no server.
 
 It runs homebrew built with devkitARM/libctru, and it boots some commercial games into their menus and 3D scenes, all drawn by a software PICA200 GPU.
 
@@ -85,6 +84,10 @@ node tools/make3ds.js app.elf app.3ds [--from3dsx=app.3dsx] [--compress] [--cxi]
 This builds a decrypted (NoCrypto) cartridge image from a libctru ELF. `--from3dsx` copies the RomFS and icon from the matching `.3dsx`, `--compress` BLZ-compresses the code, and `--cxi` writes a bare NCCH instead of a `.3ds`.
 
 To rebuild the test ROMs or the demo (`demo/source/main.c`), install [devkitPro](https://devkitpro.org/wiki/Getting_Started) with the `3ds-dev` group and use the standard libctru Makefile template.
+
+## License
+
+Pica3DS is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
 
 ## Legal
 
