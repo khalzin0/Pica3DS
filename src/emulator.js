@@ -42,7 +42,10 @@
       this.onHalt(reason);
     }
 
-    load(bytes, name = 'app') {
+    // romfs: optionally the game's RomFS read on demand (an EMU.LazyFile), when bytes holds only the start of a
+    // large game file
+    load(bytes, name = 'app', romfs = null) {
+      this.loadGeneration = (this.loadGeneration || 0) + 1;
       this.halted = false;
       this.haltReason = null;
       this.missingSystemArchive = null;
@@ -59,6 +62,7 @@
       const mem = this.mem;
 
       const info = EMU.loadExecutable(mem, bytes);
+      if (romfs) info.romfs = romfs;
       // Titles built for kernels before 2.44 expect the old linear heap address
       if (info.kernelVersion && info.kernelVersion < 0x22C) this.kernel.linearBase = this.kernel.linearNext = 0x14000000;
       this.codeSize = info.size;
@@ -75,7 +79,8 @@
       cfg.setUint32(0x00, 0x02390000, true); // kernel version 2.57
       cfg.setUint32(0x14, 1, true);          // ENVINFO: retail
       cfg.setUint32(0x30, 0, true);          // APPMEMTYPE
-      cfg.setUint32(0x40, 0x04000000, true); // APPMEMALLOC: 64 MB
+      this.kernel.appMemory = info.appMemory || 0x04000000; // from the game's system mode (64 MB by default)
+      cfg.setUint32(0x40, this.kernel.appMemory, true); // APPMEMALLOC
       cfg.setUint32(0x44, 0x02C00000, true); // SYSMEMALLOC
       cfg.setUint32(0x48, 0x01400000, true); // BASEMEMALLOC
       cfg.setUint32(0x60, 0x02390000, true); // FIRM version

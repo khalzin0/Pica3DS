@@ -59,6 +59,8 @@
       this.state = 'ready';   // ready | waiting | dead
       this.waitObjs = null; this.waitAll = false; this.waitN = false;
       this.waitArb = -1; this.deadline = Infinity; this.timeoutResult = RES_TIMEOUT;
+      this.frameReady = 0;    // ticks this frame the thread ran or was held back by idle skipping
+      this.activity = 0;      // smoothed share of each frame the thread wants to run
     }
     shouldWait() { return this.state !== 'dead'; }
   }
@@ -95,6 +97,15 @@
       this.nextThreadId = 1;
       this.rr = 0;
       this.starve = 0;
+      // Background idle skipping: a thread that is not the main thread, has the lowest priority of all live
+      // threads and wants to run most of the time only uses time the CPU would otherwise spend idle (some
+      // games run such a loop forever, waiting only briefly on locks). It gets up to idleShare of each frame;
+      // the rest is skipped like idle time, which saves host CPU without slowing the threads that do the
+      // game's work.
+      this.idleSkip = true;
+      this.idleShare = 0.1;
+      this.frameStart = 0;
+      this.bgTicks = 0;
       this.process = new KGeneric('Process');
       this.resLimit = new KGeneric('ResourceLimit');
       this.cpu.svcHandler = (n) => this.svc(n);
@@ -157,13 +168,26 @@
     }
 
     // Run threads until the tick counter reaches `target`.
+    // Is t a background thread that has wanted to run for most of recent frames?
+    isBusyBackground(t) {
+      if (t === this.threads[0] || t.activity < 0.6) return false;
+      for (const o of this.threads) if (o !== t && o.state !== 'dead' && o.prio >= t.prio) return false;
+      return true;
+    }
+
     runUntil(target) {
       const cpu = this.cpu;
+      if (this.ticks >= this.frameStart + EMU.TICKS_PER_FRAME || this.ticks < this.frameStart) {
+        for (const t of this.threads) { t.activity = t.activity * 0.8 + Math.min(1, t.frameReady / EMU.TICKS_PER_FRAME) * 0.2; t.frameReady = 0; }
+        this.frameStart = this.ticks; this.bgTicks = 0;
+      }
       while (this.ticks < target && !this.emu.halted) {
         this.processTimeouts();
         const t = this.pickThread();
-        if (!t) {
+        const skip = t && this.idleSkip && this.bgTicks >= EMU.TICKS_PER_FRAME * this.idleShare && this.isBusyBackground(t);
+        if (!t || skip) {
           const next = Math.min(this.nextDeadline(), target);
+          if (skip) t.frameReady += Math.max(0, next - this.ticks);
           this.ticks = Math.max(this.ticks, next);
           continue;
         }
@@ -178,6 +202,8 @@
         }
         this.ticks += n * TICKS_PER_INSN;
         this.emu.insnCount += n;
+        t.frameReady += n * TICKS_PER_INSN;
+        if (this.idleSkip && this.isBusyBackground(t)) this.bgTicks += n * TICKS_PER_INSN;
         if (t.state !== 'dead') cpu.saveContext(t.ctx);
         if (t.state === 'ready' && n >= budget) this.starve++; else this.starve = 0;
         this.rr++;
@@ -457,7 +483,7 @@
           for (let i = 0; i < (r[3] | 0); i++) {
             const name = mem.r32((r[2] + i * 4) >>> 0);
             let v = 0;
-            if (num === 0x39) v = name === 0 ? 0x18 : name === 1 ? 0x04000000 : 0x20;
+            if (num === 0x39) v = name === 0 ? 0x18 : name === 1 ? (this.appMemory || 0x04000000) : 0x20;
             else v = name === 1 ? this.memUsed : name === 2 ? this.threads.length : 0;
             mem.w32((r[0] + i * 8) >>> 0, v); mem.w32((r[0] + i * 8 + 4) >>> 0, 0);
           }

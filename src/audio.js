@@ -86,14 +86,16 @@
       if (this.emu.onAudio) this.emu.onAudio(L, R);
     }
 
+    // DSP configuration: [0] dirty flags, [4] master volume, [8] and [0xC] auxiliary return volumes. Each value
+    // is taken only when its own dirty flag is set (master 16, aux 24 and 25): games set other flags first while
+    // these fields still hold zero.
     parseDspConfig(a) {
       const dirty = this.mem.r32(a >>> 0);
       if (!dirty) return;
       const ok = (v) => Number.isFinite(v) && v >= 0 && v <= 8;
-      const mv = this.rf32(a + 4), a0 = this.rf32(a + 8), a1 = this.rf32(a + 12);
-      if (ok(mv)) this.masterVolume = mv;
-      if (ok(a0)) this.auxVolume[0] = a0;
-      if (ok(a1)) this.auxVolume[1] = a1;
+      if (dirty & (1 << 16)) { const v = this.rf32(a + 4); if (ok(v)) this.masterVolume = v; }
+      if (dirty & (1 << 24)) { const v = this.rf32(a + 8); if (ok(v)) this.auxVolume[0] = v; }
+      if (dirty & (1 << 25)) { const v = this.rf32(a + 12); if (ok(v)) this.auxVolume[1] = v; }
       this.mem.w32(a >>> 0, 0);
     }
 

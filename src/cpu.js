@@ -63,6 +63,29 @@
     return { fn, n, idx, start };
   }
 
+  // Thumb blocks: each instruction runs the interpreter's own Thumb handler, without the main loop's fetch and
+  // dispatch around it; the block ends when control flow changes (or the state leaves Thumb)
+  function compileThumbBlock(cpu, start) {
+    const pages16 = cpu.mem.pages16, idx = start >>> 12, page = pages16[idx];
+    if (page === null || (start & 1)) return null;
+    let code = '', checks = '', n = 0, pc = start;
+    while (n < BLOCK_MAX && (pc >>> 12) === idx) {
+      const insn = page[(pc & 0xFFF) >>> 1];
+      checks += `${n ? ' || ' : ''}P[${(pc & 0xFFF) >>> 1}] !== ${insn}`;
+      code += `c.curPC = ${pc}; c.pc = ${(pc + 2) >>> 0}; r[15] = ${(pc + 4) >>> 0}; c.execThumb(${insn}, ${pc});` +
+        ` if (c.pc !== ${(pc + 2) >>> 0} || c.t === 0 || c.stop) return ${n + 1};
+`;
+      n++;
+      pc = (pc + 2) >>> 0;
+    }
+    code += `return ${n};
+`;
+    const fn = new Function(`return function thumbBlock(c, r, mem, P) {
+if (${checks}) return -1;
+${code}};`)();
+    return { fn, n, idx, start, thumb: true };
+  }
+
   // Specialised code for common instruction forms, or null to use the generic path
   function specialise(insn, PC, R) {
     const op3 = (insn >>> 25) & 7;
@@ -171,6 +194,30 @@
       const ext = { 10: `((v << 24) >> 24)`, 11: `((v << 16) >> 16)`, 14: '(v & 0xFF)', 15: '(v & 0xFFFF)' }[op1];
       return `{ const v = ${v}; r[${rd}] = ${ext}${add}; }`;
     }
+    // ---- other ARMv6 media / SIMD instructions: straight to their handler (no decode switch, no block exit)
+    if (op3 === 3 && (insn & 0x10)) {
+      if (rd === 15 || rn === 15 && ((insn >>> 20) & 0x1F) >= 16) return null; // writes to PC (or Rd=15 multiplies)
+      const op1 = (insn >>> 20) & 0x1F;
+      return `r[15] = ${(PC + 8) >>> 0}; ${op1 < 8 ? `c.parallelAddSub(${insn});` : `c.curPC = ${PC}; c.armMedia(${insn});`}`;
+    }
+    // ---- LDM / STM without PC in a load list: unrolled
+    if (op3 === 4) {
+      const L = insn & 0x00100000, list = insn & 0xFFFF;
+      if (rn === 15 || !list || (L && (list & 0x8000))) return null;
+      const U = insn & 0x00800000, P = insn & 0x01000000, W = insn & 0x00200000;
+      const cnt = popcount16(list);
+      let off = U ? (P ? 4 : 0) : (P ? -cnt * 4 : -cnt * 4 + 4);
+      const newBase = U ? cnt * 4 : -cnt * 4;
+      let s = `{ c.curPC = ${PC}; const base = r[${rn}]; `;
+      if (L && W) s += `r[${rn}] = (base + ${newBase}) >>> 0; `;
+      for (let i = 0; i < 16; i++) {
+        if (!(list & (1 << i))) continue;
+        s += L ? `r[${i}] = mem.r32((base + ${off}) >>> 0); ` : `mem.w32((base + ${off}) >>> 0, ${R(i)}); `;
+        off += 4;
+      }
+      if (!L && W) s += `r[${rn}] = (base + ${newBase}) >>> 0; `;
+      return `${s}}`;
+    }
     return null;
   }
 
@@ -238,22 +285,23 @@
       let i = 0, jumped = true;
       while (i < max && !this.stop) {
         // At a branch target: run a compiled block if there is one and it fits in the budget
-        if (jumped && this.jit && !this.t) {
-          const start = this.pc, slot = (start >>> 2) & (BLOCK_TAB - 1);
+        if (jumped && this.jit) {
+          const start = this.pc, thumb = this.t === 1, slot = ((thumb ? start >>> 1 : start >>> 2) ^ (thumb ? 0x8000 : 0)) & (BLOCK_TAB - 1);
           let b = this.blockTab[slot];
-          if (b === null || b.start !== start) {
+          if (b === null || b.start !== start || b.thumb !== thumb) {
             b = null;
             const n = this.hot[slot] + 1;
             if (n < this.jitThreshold) this.hot[slot] = n;
             else {
               this.hot[slot] = 0;
-              b = compileArmBlock(this, start);
+              b = thumb ? compileThumbBlock(this, start) : compileArmBlock(this, start);
+              if (b && !thumb) b.thumb = false;
               this.blockTab[slot] = b;
               if (b) this.blocksCompiled++;
             }
           }
           if (b !== null && b.n <= max - i) {
-            const P = pages32[b.idx];
+            const P = b.thumb ? mem.pages16[b.idx] : pages32[b.idx];
             const k = P === null ? -1 : b.fn(this, r, mem, P);
             if (k >= 0) { i += k; continue; }
             this.blockTab[slot] = null; // the code changed: compile again once it is hot
@@ -871,16 +919,14 @@
           case 2: r0 = a0 + b1; r1 = a1 - b0; add0 = true; add1 = false; break; // SAX
           default: r0 = a0 - b0; r1 = a1 - b1; add0 = add1 = false; break;    // SUB16
         }
-        const lanes = [[r0, add0], [r1, add1]];
-        for (let i = 0; i < 2; i++) {
-          let [v, isAdd] = lanes[i];
-          if (mode === 1) {
-            if (signed ? v >= 0 : (isAdd ? v >= 0x10000 : v >= 0)) ge |= 3 << (i * 2);
-          } else if (mode === 2) v = signed ? satS(v, 16) : satU(v, 16);
-          else v >>= 1;
-          res |= (v & 0xFFFF) << (i * 16);
-        }
-        if (mode === 1) this.ge = ge;
+        if (mode === 1) {
+          if (signed ? r0 >= 0 : (add0 ? r0 >= 0x10000 : r0 >= 0)) ge |= 3;
+          if (signed ? r1 >= 0 : (add1 ? r1 >= 0x10000 : r1 >= 0)) ge |= 12;
+          this.ge = ge;
+        } else if (mode === 2) {
+          r0 = signed ? satS(r0, 16) : satU(r0, 16); r1 = signed ? satS(r1, 16) : satU(r1, 16);
+        } else { r0 >>= 1; r1 >>= 1; }
+        res = (r0 & 0xFFFF) | ((r1 & 0xFFFF) << 16);
       } else { // 8-bit lanes: op 4 = ADD8, 7 = SUB8
         const isAdd = op === 4;
         for (let i = 0; i < 4; i++) {

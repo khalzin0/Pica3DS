@@ -58,7 +58,7 @@ module.exports = (EMU) => {
         const op1 = [10, 11, 14, 15][R(4)];
         w = c | (0x3 << 25) | (op1 << 20) | (any() << 16) | (dst() << 12) | (R(4) << 10) | (3 << 5) | 0x10 | any();
       } else { // instructions the compiler leaves to the interpreter
-        const g = R(8);
+        const g = R(16);
         if (g === 0) w = c | 0x016F0F10 | (dst() << 12) | any();                       // CLZ
         else if (g === 1) w = c | 0x010F0000 | (dst() << 12);                           // MRS
         else if (g === 2) w = c | 0x0128F000 | any();                                   // MSR CPSR_f, reg
@@ -66,7 +66,17 @@ module.exports = (EMU) => {
         else if (g === 4) w = c | 0x06CF0070 | (dst() << 12) | (R(4) << 10) | any();    // UXTB16
         else if (g === 5) w = c | 0x03000000 | (R(16) << 16) | (dst() << 12) | R(0x1000); // MOVW
         else if (g === 6) w = 0xF5D0F000 | (base() << 16) | R(0x1000);                 // PLD (unconditional space, no-op)
-        else w = 0xFA000000 | (R(2) << 24) | R(0x40);                                   // BLX to Thumb code (leaves the block)
+        else if (g === 7) w = 0xFA000000 | (R(2) << 24) | R(0x40);                      // BLX to Thumb code (leaves the block)
+        else if (g === 8) w = c | 0x06000F10 | ([1, 2, 3, 5, 6, 7][R(6)] << 20) | (any() << 16) | (dst() << 12) | ([0, 1, 2, 3, 4, 7][R(6)] << 5) | any(); // parallel add/sub
+        else if (g === 9) w = c | 0x06800FB0 | (any() << 16) | (dst() << 12) | any(); // SEL
+        else if (g === 10) w = c | ((R(2) ? 0x37 : 0x35) << 21) | (R(32) << 16) | (dst() << 12) | (R(32) << 7) | (R(2) << 6) | 0x10 | any(); // SSAT / USAT
+        else if (g === 11) w = c | (R(2) ? 0x06BF0F30 : 0x06BF0FB0) | (dst() << 12) | any(); // REV / REV16
+        else if (g === 12) w = c | 0x07000010 | (dst() << 16) | (any() << 12) | (any() << 8) | (R(4) << 5) | any(); // SMLAD / SMUAD / SMLSD
+        else if (g === 13) w = c | 0x0780F010 | (dst() << 16) | (any() << 8) | any(); // USAD8
+        else { // LDM / STM (loads never touch the data pointers r8-r12 or PC)
+          const L = R(2), list = L ? (R(0x10000) & 0x60FF) : R(0x10000);
+          w = c | (4 << 25) | (R(2) << 24) | (R(2) << 23) | (R(2) << 21) | (L << 20) | (base() << 16) | (list || 1);
+        }
       }
       words.push(w >>> 0);
     }

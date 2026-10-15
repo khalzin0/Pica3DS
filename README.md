@@ -21,12 +21,12 @@ Open `index.html?demo` to start the demo automatically.
 
 | Works | Partly works | Not yet |
 |---|---|---|
-| Homebrew (libctru, citro2d/citro3d) | Commercial games: tested with *New Super Mario Bros. 2* (plays levels) and *Cut the Rope: Triple Treat* (boots) | Audio effects (reverb, delay) and per-voice filters |
-| 3D graphics (vertex shaders, textures, lighting, fog, blending, depth/stencil) | Speed: homebrew and 2D screens run at full speed, heavy 3D scenes are still slow (see [Performance](#performance)) | Procedural textures, gas rendering |
+| Homebrew (libctru, citro2d/citro3d) | Commercial games: see [Games tested](#games-tested) | Audio effects (reverb, delay) and per-voice filters |
+| 3D graphics on your graphics card (vertex shaders, textures, lighting, fog, blending, depth/stencil) | Speed: most tested scenes run at full speed; video and some busy scenes are slower | Procedural textures, gas rendering |
 | | Geometry shaders: point mode (the mode citro3d uses); variable- and fixed-size primitive modes are not emulated yet | |
 | Save data and extra data (kept in memory) | System applets: the Mii selector picks a stand-in Mii; the keyboard and error display close straight away | Networking, camera, the stereoscopic 3D effect |
 | Sound: 24 DSP voices, PCM8/PCM16/DSP-ADPCM, mixing and volume | Microphone (records silence), video (`y2r` colour conversion) | |
-| System files from your own console, or built-in stand-ins | | `.cia` files, encrypted games, and game files over about 2 GB (read into memory whole) |
+| System files from your own console, or built-in stand-ins | Code modules loaded at run time (`ldr:ro` / CRO) | `.cia` files and encrypted games |
 
 ## How it works
 
@@ -38,32 +38,26 @@ Open `index.html?demo` to start the demo automatically.
 | 3D GPU | `src/gpu.js` | PICA200 in software: command lists, vertex and geometry shaders, clipping, rasterizer, all 14 texture formats including ETC1, texture combiners, fragment lighting, fog, and the output merger. This is also the reference the WebGL renderer is checked against |
 | Audio (HLE) | `src/audio.js` | The DSP's audio pipeline: reads the voices the game sets up in DSP shared memory, plays their buffer queues (PCM8, PCM16, DSP-ADPCM), resamples, mixes with the game's gains and reports playback status back. The browser plays it through an AudioWorklet |
 | WebGL renderer | `src/glrender.js` | Draws with your graphics card: vertex shaders translated to GLSL, texture combiners, lighting and fog as generated fragment shaders, render targets kept on the graphics card and copied to emulated memory only when something reads them, display transfers and screen output without copies |
-| Services (HLE) | `src/services.js` | `srv:`, `APT` (parameters, shared font, library applets), `gsp::Gpu`, `hid`, `fs` (RomFS, save data, extra data, SD card), `dsp` (with `src/audio.js`), `y2r:u` (YUV to RGB for video), `mic:u` (silence), `cfg`, `ptm`, `err:f`. Other services are stubbed |
+| Services (HLE) | `src/services.js` | `srv:`, `APT` (parameters, shared font, library applets), `gsp::Gpu`, `hid`, `fs` (RomFS, save data, extra data, SD card), `dsp` (with `src/audio.js`), `y2r:u` (YUV to RGB for video), `mic:u` (silence), `ldr:ro` (code modules), `cfg`, `ptm`, `err:f`. Other services are stubbed |
 | System data | `src/sysdata.js` | RomFS builder, plus stand-ins for missing system data (Mii data, system fonts, bad word list) and an empty archive for any other |
-| Loader | `src/loader.js` | `.3dsx`, ARM ELF, and decrypted `.3ds`/`.cci` (NCSD) and `.cxi` (NCCH), including compressed code and RomFS |
+| Loader | `src/loader.js` | `.3dsx`, ARM ELF, and decrypted `.3ds`/`.cci` (NCSD) and `.cxi` (NCCH), including compressed code and RomFS. Games over 256 MB (up to 4 GB cartridges) are not read whole: the code is loaded and game data is read from the file in 1 MB chunks as the game asks for it |
 | Front-end | `index.html`, `src/main.js` | Both screens (stacked, side by side or top only; fit to window or fixed size; fullscreen), sound with volume, rebindable keyboard controls, gamepad, performance graph, settings, system files manager, and a log |
 
-## Performance
+## Games tested
 
-By default the **graphics card renderer** (WebGL 2) draws the 3DS graphics; **Software (CPU)** in the Renderer menu uses the reference software renderer instead. Known differences of the graphics card renderer: logic ops other than copy, clear, set and invert are drawn as a copy; the exclusive scissor mode is ignored; depth buffers are not copied back to emulated memory; on vertices shaded by the graphics card, lighting quaternions are not flipped onto the short arc between vertices.
+Tested with dumps of games we own, decrypted on our own console, using the default settings (graphics card renderer, compilers on) in a desktop browser.
 
-Three compilers turn hot code into JavaScript at run time: ARM code blocks (`src/cpu.js`), shader programs, and a rasterizer for each render state (`src/gpu.js`). Each one has an interpreter counterpart that gives the same results, and tests check that they match (see below). They are on by default; untick **Compilers (JIT)** to use the interpreters.
+| Game | Status | Notes |
+|---|---|---|
+| *New Super Mario Bros. 2* (EUR) | Playable | Intro, menus, world map and levels. World 1-1 runs at 60 FPS. Sound works |
+| *Cut the Rope: Triple Treat* (EUR) | Playable | Intro video, menus and levels. Video intros and some menus run below full speed on slower PCs |
+| *Super Mario 3D Land* | Boots | Reaches its menus; selecting a Mii uses a built-in stand-in Mii |
+| *Pokémon Ultra Moon* (USA) | In progress | A 4 GB cartridge: loads, starts up (80 MB memory mode) and loads its code modules (`ldr:ro`); getting in-game is not confirmed yet |
+| Bundled demo and libctru examples | Works | Graphics, input, threads, RomFS |
 
-The **Performance** tab shows game FPS (emulated frames per second), display FPS (screen updates per second), speed (compared with a real 3DS), a live frame-time graph, and the average and 95th-percentile frame time split into CPU, GPU, copies and presenting. **Settings → FPS counter on screen** shows FPS and speed over the game.
+Statuses: **Playable** = can be played through what was tested; **Boots** = starts and shows menus; **In progress** = starts, does not reach gameplay yet.
 
-Measured with Node 24 on a Ryzen 7 5800X (`node tools/bench.js`; time per emulated frame, budget 16.7 ms):
-
-| Scene | Before (avg / p95) | Software renderer, Node (avg / p95) | Graphics card renderer, browser (avg / p95) |
-|---|---|---|---|
-| Bundled demo (CPU-bound homebrew) | 12.4 / 13.8 ms | 2.1 / 2.4 ms | 2.9 ms (60 FPS) |
-| *New Super Mario Bros. 2* intro pages (2D) | 27.8 / 38.6 ms | 12.5 / 15.1 ms | 7.7 / 10.5 ms |
-| *New Super Mario Bros. 2* 3D opening | 210.5 / 300.5 ms | 89.3 / 97.4 ms | 27.9 / 43.6 ms |
-| *New Super Mario Bros. 2* title screen (3D) | about 79 ms | 39 ms | 20.2 / 31.7 ms |
-| *New Super Mario Bros. 2* World 1-1 (foreground Brave window) | 31.4 / 43.3 ms | – | 12.0 / 14.2 ms (60 FPS) |
-
-Levels in *New Super Mario Bros. 2* animate tiles by rewriting small parts of a 1024×1024 ETC1 texture atlas most frames; the texture cache now decodes and uploads only the 8×8 tiles that changed instead of the whole atlas (23 ms per change before). Except for World 1-1, the browser numbers were taken in a background browser pane, which browsers run at lower priority; a foreground window is faster. The software renderer is limited by drawing every pixel on one thread (the opening cutscene draws each pixel of the top screen about ten times per frame).
-
-`tests/gpu/webgl.html` renders the GPU regression scenes with both renderers and shows the differences (serve the folder over http to open it).
+Settings that help with speed: **Settings → Renderer** (graphics card is much faster than software), **Compilers (JIT)**, and **Skip busy background threads**. **Settings → Graphics device** shows whether your browser draws with your graphics card. The **Performance** tab shows FPS, speed and where frame time goes.
 
 ## Controls
 

@@ -559,10 +559,27 @@
       switch (id) {
         case 0x802: { // Read(offset u64, size, buffer)
           const off = ipc.get(1) + ipc.get(2) * 4294967296, size = ipc.get(3), ptr = ipc.get(5);
-          const start = Math.min(off, this.data.length), n = Math.min(size, this.data.length - start);
+          const data = this.data, start = Math.min(off, data.length), n = Math.min(size, data.length - start);
           if (this.emu.traceFs) this.emu.log(`fs: read ${this.name} @${hex(off)} size ${hex(size)}`);
-          if (n > 0) this.mem.writeBytes(ptr, this.data.subarray(start, start + n));
-          ipc.reply(id, [0, n], [(size << 4) | 0xC, ptr]);
+          const done = () => {
+            if (n > 0) {
+              if (data.copy) { const buf = new Uint8Array(n); data.copy(start, n, buf); this.mem.writeBytes(ptr, buf); }
+              else this.mem.writeBytes(ptr, data.subarray(start, start + n));
+            }
+            ipc.reply(id, [0, n], [(size << 4) | 0xC, ptr]);
+          };
+          if (!data.copy || n <= 0 || data.has(start, n) || !ipc.thread) { done(); return true; }
+          // Not loaded yet (a large game read on demand): the calling thread waits while it is fetched
+          const emu = this.emu, k = this.kernel, gen = emu.loadGeneration, ev = new EMU.KEvent(0, 'file read');
+          k.block(ipc.thread, [ev], false, Infinity, false);
+          const finish = () => {
+            if (emu.loadGeneration !== gen || emu.halted) return;
+            if (!data.has(start, n)) { data.load(start, n).then(finish, fail); return; } // dropped meanwhile
+            done();
+            k.signal(ev);
+          };
+          const fail = (e) => { if (emu.loadGeneration === gen) emu.halt(`Could not read the game file: ${e.message}`); };
+          data.load(start, n).then(finish, fail);
           return true;
         }
         case 0x803: ipc.reply(id, [0xE0C046BE, 0]); return true; // Write: read-only
@@ -912,7 +929,7 @@
           return true;
         }
         case 0x849: ipc.reply(id, [0, 0x200, 0x8000, 0x80000, 0x80000]); return true; // GetSdmcArchiveResource
-        case 0x817: case 0x818: ipc.reply(id, [0, 0]); return true; // IsSdmcDetected / IsSdmcWritable
+        case 0x817: case 0x818: ipc.reply(id, [0, 1]); return true; // IsSdmcDetected / IsSdmcWritable: the SD card (kept in memory) is there
       }
       return false;
     }
@@ -1165,14 +1182,17 @@
     // the low byte of each sample.
     readSamples(b, n, step) {
       const out = new Uint8Array(n), mem = this.mem, unit = b.unit || n * step;
-      let o = 0, addr = b.addr, inUnit = 0;
+      let o = 0;
       while (o < n) {
-        out[o++] = mem.r8(addr >>> 0);
-        addr += step; inUnit += step;
-        if (inUnit >= unit) { addr += b.gap; inUnit = 0; }
+        // One transfer unit (or what is left of it) as a single block read
+        const bytes = Math.min(unit - b.inUnit, (n - o) * step);
+        const chunk = mem.readBytes(b.addr >>> 0, bytes);
+        if (step === 1) { out.set(chunk, o); o += bytes; }
+        else for (let i = 0; i < bytes && o < n; i += step) out[o++] = chunk[i];
+        b.addr += bytes; b.inUnit += bytes;
+        if (b.inUnit >= unit) { b.addr += b.gap; b.inUnit = 0; }
       }
-      b.addr = addr; // a strip continues where the previous one ended
-      return out;
+      return out; // a strip continues where the previous one ended
     }
 
     convert() {
@@ -1180,16 +1200,25 @@
       if (!w || !lines) return;
       if (this.rotation && !this.warnedRotation) { this.warnedRotation = true; this.emu.log('y2r: rotated output is not emulated (drawn unrotated)'); }
       const fmt = this.inFmt, step = fmt === 2 || fmt === 3 ? 2 : 1, c = this.coef, alpha = this.alpha;
-      const bpp = [4, 3, 2, 2][this.outFmt], mem = this.mem;
-      const bufs = { y: { ...this.y }, u: { ...this.u }, v: { ...this.v }, yuyv: { ...this.yuyv } };
-      const out = { ...this.out }, outUnit = out.unit || w * 8 * bpp;
-      let outAddr = out.addr, inUnit = 0;
-      const put = (byte) => {
-        mem.w8(outAddr >>> 0, byte);
-        outAddr++;
-        if (++inUnit >= outUnit) { outAddr += out.gap; inUnit = 0; }
-      };
+      const bpp = [4, 3, 2, 2][this.outFmt], outFmt = this.outFmt, mem = this.mem;
+      const copy = (b) => ({ addr: b.addr, unit: b.unit, gap: b.gap, inUnit: 0 });
+      const bufs = { y: copy(this.y), u: copy(this.u), v: copy(this.v), yuyv: copy(this.yuyv) };
+      const out = this.out, outUnit = out.unit || w * 8 * bpp;
+      let outAddr = out.addr, outInUnit = 0;
+      const stripBytes = w * 8 * bpp, buf = new Uint8Array(stripBytes);
       const strip = new Int32Array(w * 8 * 3); // r, g, b per pixel, 8 rows
+      // Pixel order: rows, or 8x8 tiles with texels in Morton order (for use as a texture)
+      const order = new Int32Array(w * 8);
+      if (this.block) {
+        let k = 0;
+        for (let tx = 0; tx < w; tx += 8) {
+          for (let i = 0; i < 64; i++) {
+            let x = 0, y = 0;
+            for (let bit = 0; bit < 3; bit++) { x |= ((i >> (2 * bit)) & 1) << bit; y |= ((i >> (2 * bit + 1)) & 1) << bit; }
+            order[k++] = y * w + tx + x;
+          }
+        }
+      } else for (let i = 0; i < w * 8; i++) order[i] = i;
       const cl = (v) => (v < 0 ? 0 : v > 255 ? 255 : v);
       for (let y0 = 0; y0 < lines; y0 += 8) {
         const rows = Math.min(8, lines - y0);
@@ -1217,26 +1246,27 @@
             strip[o] = cl(r >> 5); strip[o + 1] = cl(gg >> 5); strip[o + 2] = cl(b >> 5);
           }
         }
-        // Pixel order: rows, or 8x8 tiles with texels in Morton order (for use as a texture)
-        const emit = (x, y) => {
-          if (y >= rows) { for (let k = 0; k < bpp; k++) put(0); return; }
-          const o = (y * w + x) * 3, r = strip[o], gg = strip[o + 1], b = strip[o + 2];
-          switch (this.outFmt) {
-            case 0: put(alpha); put(b); put(gg); put(r); break;
-            case 1: put(b); put(gg); put(r); break;
-            case 2: { const v = ((r >> 3) << 11) | ((gg >> 3) << 6) | ((b >> 3) << 1) | (alpha >> 7); put(v & 0xFF); put(v >> 8); break; }
-            default: { const v = ((r >> 3) << 11) | ((gg >> 2) << 5) | (b >> 3); put(v & 0xFF); put(v >> 8); }
+        // Encode the strip into buf in output order (rows past the last line stay zero)
+        buf.fill(0);
+        for (let k = 0, d = 0; k < order.length; k++, d += bpp) {
+          const p = order[k];
+          if (p >= rows * w) continue;
+          const r = strip[p * 3], gg = strip[p * 3 + 1], b = strip[p * 3 + 2];
+          switch (outFmt) {
+            case 0: buf[d] = alpha; buf[d + 1] = b; buf[d + 2] = gg; buf[d + 3] = r; break;
+            case 1: buf[d] = b; buf[d + 1] = gg; buf[d + 2] = r; break;
+            case 2: { const v = ((r >> 3) << 11) | ((gg >> 3) << 6) | ((b >> 3) << 1) | (alpha >> 7); buf[d] = v & 0xFF; buf[d + 1] = v >> 8; break; }
+            default: { const v = ((r >> 3) << 11) | ((gg >> 2) << 5) | (b >> 3); buf[d] = v & 0xFF; buf[d + 1] = v >> 8; }
           }
-        };
-        if (this.block) {
-          for (let tx = 0; tx < w; tx += 8) {
-            for (let i = 0; i < 64; i++) {
-              let x = 0, y = 0;
-              for (let bit = 0; bit < 3; bit++) { x |= ((i >> (2 * bit)) & 1) << bit; y |= ((i >> (2 * bit + 1)) & 1) << bit; }
-              emit(tx + x, y);
-            }
-          }
-        } else for (let y = 0; y < rows; y++) for (let x = 0; x < w; x++) emit(x, y);
+        }
+        // Write it through the output's transfer unit and gap, one block per unit
+        const n = this.block ? stripBytes : rows * w * bpp;
+        for (let o = 0; o < n;) {
+          const bytes = Math.min(outUnit - outInUnit, n - o);
+          mem.writeBytes(outAddr >>> 0, buf.subarray(o, o + bytes));
+          o += bytes; outAddr += bytes; outInUnit += bytes;
+          if (outInUnit >= outUnit) { outAddr += out.gap; outInUnit = 0; }
+        }
       }
       // The output may be a texture or a framebuffer the GPU caches
       if (this.emu.gpu) this.emu.gpu.invalidateVirt(out.addr >>> 0, outAddr - out.addr);
@@ -1310,6 +1340,322 @@
     }
   }
 
+  // ------------------------------------------------------------------ ldr:ro (CRO dynamic modules)
+  // Games can load extra code modules (CROs) at run time. The static module information (CRS) and each CRO are
+  // mapped where the game asks, their tables rebased to absolute addresses, relocations applied, and symbols
+  // linked between all loaded modules. Follows the module format as documented by 3dbrew and implemented by
+  // Citra (cro_helper.cpp).
+  // Header fields: word index into the header from 0x80
+  const H = {
+    Magic: 0, NameOffset: 1, NextCRO: 2, PreviousCRO: 3, FileSize: 4, FixedSize: 6, OnUnresolved: 11,
+    CodeOffset: 12, CodeSize: 13, DataOffset: 14, ModuleNameOffset: 16, ModuleNameSize: 17, SegmentTableOffset: 18, SegmentNum: 19,
+    ExportNamedOffset: 20, ExportNamedNum: 21, ExportIndexedOffset: 22, ExportStringsSize: 25, ExportTreeOffset: 26, ExportTreeNum: 27,
+    ImportModuleOffset: 28, ImportModuleNum: 29, ExtRelocOffset: 30, ExtRelocNum: 31, ImportNamedOffset: 32, ImportNamedNum: 33,
+    ImportIndexedOffset: 34, ImportIndexedNum: 35, ImportAnonOffset: 36, ImportAnonNum: 37, ImportStringsSize: 39,
+    StaticAnonOffset: 40, StaticAnonNum: 41, InternalRelocOffset: 42, InternalRelocNum: 43, Fix0Barrier: 46,
+  };
+  const CRO_ENTRY_SIZE = [1, 1, 1, 12, 8, 4, 1, 8, 20, 12, 8, 8, 8, 1, 8, 12, 12];
+  const FIX_BARRIERS = [46, 40, 28, 20];
+  const MAGIC_CRO0 = 0x304F5243, MAGIC_FIXD = 0x44584946;
+
+  class RoService extends Service {
+    constructor(emu, name) { super(emu, name); this.crs = 0; }
+
+    get(m, f) { return this.mem.r32((m + 0x80 + f * 4) >>> 0) >>> 0; }
+    set(m, f, v) { this.mem.w32((m + 0x80 + f * 4) >>> 0, v >>> 0); }
+    r32(a) { return this.mem.r32(a >>> 0) >>> 0; }
+    w32(a, v) { this.mem.w32(a >>> 0, v >>> 0); }
+    cstr(a, max) {
+      let s = '';
+      for (let i = 0; i < max; i++) { const c = this.mem.r8((a + i) >>> 0); if (!c) break; s += String.fromCharCode(c); }
+      return s;
+    }
+    moduleName(m) { return this.cstr(this.get(m, H.ModuleNameOffset), this.get(m, H.ModuleNameSize)); }
+    segment(m, i) { const a = this.get(m, H.SegmentTableOffset) + i * 12; return { a, offset: this.r32(a), size: this.r32(a + 4), type: this.r32(a + 8) }; }
+
+    tagToAddress(m, tag) {
+      const idx = tag & 15, off = tag >>> 4;
+      if (idx >= this.get(m, H.SegmentNum)) return 0;
+      const s = this.segment(m, idx);
+      return off >= s.size ? 0 : (s.offset + off) >>> 0;
+    }
+
+    relocate(target, type, addend, symbol, future) {
+      switch (type) {
+        case 0: return;
+        case 2: case 38: this.w32(target, symbol + addend); return; // absolute
+        case 3: this.w32(target, symbol + addend - future); return; // relative
+        default:
+          if (!this.warnedType) { this.warnedType = true; this.emu.log(`ldr:ro: relocation type ${type} is not supported`); }
+      }
+    }
+
+    // A batch of relocation entries (12 bytes: target tag, type, batch end, resolved, -, addend)
+    applyBatch(m, batch, symbol, reset = false) {
+      if (!symbol && !reset) return;
+      for (let a = batch; ; a += 12) {
+        const target = this.tagToAddress(m, this.r32(a));
+        if (target) this.relocate(target, this.mem.r8((a + 4) >>> 0), this.r32(a + 8), symbol, target);
+        if (this.mem.r8((a + 5) >>> 0)) break;
+      }
+      this.mem.w8((batch + 6) >>> 0, reset ? 0 : 1);
+    }
+    resolved(batch) { return this.mem.r8((batch + 6) >>> 0) !== 0; }
+
+    // Exported named symbol via the module's binary search tree of names
+    findExport(m, name) {
+      const num = this.get(m, H.ExportTreeNum);
+      if (!num) return 0;
+      const tree = this.get(m, H.ExportTreeOffset), node = (i) => tree + (i & 0x7FFF) * 8;
+      let next = this.mem.r16(node(0) + 2), found;
+      for (let guard = 0; guard < 0x10000; guard++) {
+        const e = node(next);
+        if (next & 0x8000) { found = this.mem.r16(e + 6); break; }
+        const bit = this.mem.r16(e), byte = bit >> 3;
+        next = byte >= name.length ? this.mem.r16(e + 2) : ((name.charCodeAt(byte) >> (bit & 7)) & 1) ? this.mem.r16(e + 4) : this.mem.r16(e + 2);
+      }
+      if (found === undefined || found >= this.get(m, H.ExportNamedNum)) return 0;
+      const ent = this.get(m, H.ExportNamedOffset) + found * 8;
+      if (this.cstr(this.r32(ent), this.get(m, H.ExportStringsSize)) !== name) return 0;
+      return this.tagToAddress(m, this.r32(ent + 4));
+    }
+
+    forEachModule(fn) { for (let cur = this.crs, n = 0; cur && n < 256; cur = this.get(cur, H.NextCRO), n++) if (fn(cur) === false) break; }
+
+    table(m, offF, numF, size, fn) { const base = this.get(m, offF), n = this.get(m, numF); for (let i = 0; i < n; i++) fn(base + i * size, i); }
+    addIf(a, d) { const v = this.r32(a); if (v) this.w32(a, v + d); }
+
+    rebase(m, size, dataAddr, dataSize, bssAddr, bssSize, isCrs) {
+      if (this.get(m, H.Magic) !== MAGIC_CRO0) throw new EMU.EmuError(`ldr:ro: no CRO module at ${hex(m)}`);
+      this.addIf(m + 0x80 + H.NameOffset * 4, m);
+      for (let f = H.CodeOffset; f < H.Fix0Barrier; f += 2) this.addIf(m + 0x80 + f * 4, m);
+      let prevData = 0;
+      if (!isCrs) {
+        for (let i = 0, n = this.get(m, H.SegmentNum); i < n; i++) {
+          const s = this.segment(m, i);
+          if (s.type === 2) { if (s.size) { prevData = s.offset; this.w32(s.a, dataAddr); } }
+          else if (s.type === 3) { if (s.size) this.w32(s.a, bssAddr); }
+          else if (s.offset) this.w32(s.a, s.offset + m);
+        }
+        prevData = (prevData + m) >>> 0;
+      }
+      this.table(m, H.ExportNamedOffset, H.ExportNamedNum, 8, (a) => this.addIf(a, m));
+      this.table(m, H.ImportModuleOffset, H.ImportModuleNum, 20, (a) => { this.addIf(a, m); this.addIf(a + 4, m); this.addIf(a + 12, m); });
+      // External relocations start out pointing at the module's "unresolved symbol" handler
+      const unresolved = this.tagToAddress(m, this.get(m, H.OnUnresolved));
+      let begin = true;
+      this.table(m, H.ExtRelocOffset, H.ExtRelocNum, 12, (a) => {
+        const target = this.tagToAddress(m, this.r32(a));
+        if (target) this.relocate(target, this.mem.r8((a + 4) >>> 0), this.r32(a + 8), unresolved, target);
+        if (begin) this.mem.w8((a + 6) >>> 0, 0);
+        begin = this.mem.r8((a + 5) >>> 0) !== 0;
+      });
+      this.table(m, H.ImportNamedOffset, H.ImportNamedNum, 8, (a) => { this.addIf(a, m); this.addIf(a + 4, m); });
+      this.table(m, H.ImportIndexedOffset, H.ImportIndexedNum, 8, (a) => this.addIf(a + 4, m));
+      this.table(m, H.ImportAnonOffset, H.ImportAnonNum, 8, (a) => this.addIf(a + 4, m));
+      if (!isCrs) { // static anonymous symbols patch the static module
+        this.table(m, H.StaticAnonOffset, H.StaticAnonNum, 8, (a) => this.applyBatch(this.crs, this.r32(a + 4) + m, this.tagToAddress(m, this.r32(a))));
+      }
+      // Internal relocations (relocations into .data are applied in the module image, which the game copies)
+      this.table(m, H.InternalRelocOffset, H.InternalRelocNum, 12, (a) => {
+        const tag = this.r32(a), tB = this.tagToAddress(m, tag);
+        if (!tB) return;
+        const target = this.segment(m, tag & 15).type === 2 ? (prevData + (tag >>> 4)) >>> 0 : tB;
+        const symSeg = this.mem.r8((a + 5) >>> 0);
+        this.relocate(target, this.mem.r8((a + 4) >>> 0), this.r32(a + 8), this.segment(m, symSeg).offset, tB);
+      });
+      if (!isCrs) { // __aeabi_atexit goes to the static module's nnroAeabiAtexit_
+        this.table(m, H.ImportNamedOffset, H.ImportNamedNum, 8, (a) => {
+          if (this.cstr(this.r32(a), this.get(m, H.ImportStringsSize)) !== '__aeabi_atexit') return;
+          this.forEachModule((src) => { const s = this.findExport(src, 'nnroAeabiAtexit_'); if (s) { this.applyBatch(m, this.r32(a + 4), s); return false; } return true; });
+        });
+      }
+    }
+
+    importsFrom(m, src) { // apply m's imports by index / anonymous from module src
+      const want = this.moduleName(src);
+      this.table(m, H.ImportModuleOffset, H.ImportModuleNum, 20, (a) => {
+        if (this.cstr(this.r32(a), this.get(m, H.ImportStringsSize)) !== want) return;
+        for (let j = 0, n = this.r32(a + 8), t = this.r32(a + 4); j < n; j++) {
+          const index = this.r32(t + j * 8), batch = this.r32(t + j * 8 + 4);
+          this.applyBatch(m, batch, this.tagToAddress(src, this.r32(this.get(src, H.ExportIndexedOffset) + index * 4)));
+        }
+        for (let j = 0, n = this.r32(a + 16), t = this.r32(a + 12); j < n; j++) {
+          this.applyBatch(m, this.r32(t + j * 8 + 4), this.tagToAddress(src, this.r32(t + j * 8)));
+        }
+      });
+    }
+
+    link(m, bugFix) {
+      let saved = 0;
+      if (bugFix && this.get(m, H.SegmentNum) >= 2) { const s = this.segment(m, 2); saved = s.offset; this.w32(s.a, this.get(m, H.DataOffset)); }
+      // This module's imports
+      this.table(m, H.ImportNamedOffset, H.ImportNamedNum, 8, (a) => {
+        const batch = this.r32(a + 4);
+        if (this.resolved(batch)) return;
+        const name = this.cstr(this.r32(a), this.get(m, H.ImportStringsSize));
+        this.forEachModule((src) => { const s = this.findExport(src, name); if (s) { this.applyBatch(m, batch, s); return false; } return true; });
+      });
+      this.forEachModule((src) => { this.importsFrom(m, src); return true; });
+      if (bugFix && this.get(m, H.SegmentNum) >= 2) this.w32(this.segment(m, 2).a, saved);
+      // Other modules importing from this one
+      this.forEachModule((t) => {
+        this.table(t, H.ImportNamedOffset, H.ImportNamedNum, 8, (a) => {
+          const batch = this.r32(a + 4);
+          if (this.resolved(batch)) return;
+          const s = this.findExport(m, this.cstr(this.r32(a), this.get(t, H.ImportStringsSize)));
+          if (s) this.applyBatch(t, batch, s);
+        });
+        this.importsFrom(t, m);
+        return true;
+      });
+    }
+
+    unlink(m) {
+      const unresolved = this.tagToAddress(m, this.get(m, H.OnUnresolved));
+      this.table(m, H.ImportNamedOffset, H.ImportNamedNum, 8, (a) => this.applyBatch(m, this.r32(a + 4), unresolved, true));
+      this.table(m, H.ImportIndexedOffset, H.ImportIndexedNum, 8, (a) => this.applyBatch(m, this.r32(a + 4), unresolved, true));
+      this.table(m, H.ImportAnonOffset, H.ImportAnonNum, 8, (a) => this.applyBatch(m, this.r32(a + 4), unresolved, true));
+      const name = this.moduleName(m);
+      this.forEachModule((t) => {
+        const tu = this.tagToAddress(t, this.get(t, H.OnUnresolved));
+        this.table(t, H.ImportNamedOffset, H.ImportNamedNum, 8, (a) => {
+          const batch = this.r32(a + 4);
+          if (this.resolved(batch) && this.findExport(m, this.cstr(this.r32(a), this.get(t, H.ImportStringsSize)))) this.applyBatch(t, batch, tu, true);
+        });
+        this.table(t, H.ImportModuleOffset, H.ImportModuleNum, 20, (a) => {
+          if (this.cstr(this.r32(a), this.get(t, H.ImportStringsSize)) !== name) return;
+          for (let j = 0, n = this.r32(a + 8), tb = this.r32(a + 4); j < n; j++) this.applyBatch(t, this.r32(tb + j * 8 + 4), tu, true);
+          for (let j = 0, n = this.r32(a + 16), tb = this.r32(a + 12); j < n; j++) this.applyBatch(t, this.r32(tb + j * 8 + 4), tu, true);
+        });
+        return true;
+      });
+    }
+
+    register(m, autoLink) {
+      const crs = this.crs, head = autoLink ? this.get(crs, H.NextCRO) : this.get(crs, H.PreviousCRO);
+      if (head) {
+        const tail = this.get(head, H.PreviousCRO);
+        this.set(m, H.PreviousCRO, tail); this.set(tail, H.NextCRO, m); this.set(head, H.PreviousCRO, m);
+      } else {
+        this.set(m, H.PreviousCRO, m);
+        this.set(crs, autoLink ? H.NextCRO : H.PreviousCRO, m);
+      }
+      this.set(m, H.NextCRO, 0);
+    }
+
+    unregister(m) {
+      const crs = this.crs, nextHead = this.get(crs, H.NextCRO), prevHead = this.get(crs, H.PreviousCRO);
+      const next = this.get(m, H.NextCRO), prev = this.get(m, H.PreviousCRO);
+      if (m === nextHead || m === prevHead) {
+        if (next) this.set(next, H.PreviousCRO, prev);
+        this.set(crs, m === prevHead ? H.PreviousCRO : H.NextCRO, next);
+      } else if (next) {
+        this.set(prev, H.NextCRO, next); this.set(next, H.PreviousCRO, prev);
+      } else {
+        this.set(prev, H.NextCRO, 0);
+        if (nextHead && this.get(nextHead, H.PreviousCRO) === m) this.set(nextHead, H.PreviousCRO, prev);
+        else if (prevHead && this.get(prevHead, H.PreviousCRO) === m) this.set(prevHead, H.PreviousCRO, prev);
+      }
+      this.set(m, H.NextCRO, 0); this.set(m, H.PreviousCRO, 0);
+    }
+
+    // Drop the tables a game no longer needs after loading (fix level 1-3); returns the size still needed
+    fix(m, level) {
+      let end = Math.max(0x138, this.get(m, H.CodeOffset) + this.get(m, H.CodeSize));
+      for (let f = H.ModuleNameOffset, i = 2; ; f += 2, i++) {
+        end = Math.max(end, this.get(m, f) + this.get(m, f + 1) * CRO_ENTRY_SIZE[i]);
+        if (f + 2 === FIX_BARRIERS[level]) break;
+      }
+      if (level) {
+        this.set(m, H.Magic, MAGIC_FIXD);
+        for (let f = FIX_BARRIERS[level]; f < H.Fix0Barrier; f += 2) { this.set(m, f, end); this.set(m, f + 1, 0); }
+      }
+      const fixed = ((end + 0xFFF) & ~0xFFF) - m;
+      this.set(m, H.FixedSize, fixed);
+      return fixed >>> 0;
+    }
+
+    unrebase(m, isCrs) {
+      this.table(m, H.ImportAnonOffset, H.ImportAnonNum, 8, (a) => this.addIf(a + 4, -m));
+      this.table(m, H.ImportIndexedOffset, H.ImportIndexedNum, 8, (a) => this.addIf(a + 4, -m));
+      this.table(m, H.ImportNamedOffset, H.ImportNamedNum, 8, (a) => { this.addIf(a, -m); this.addIf(a + 4, -m); });
+      this.table(m, H.ImportModuleOffset, H.ImportModuleNum, 20, (a) => { this.addIf(a, -m); this.addIf(a + 4, -m); this.addIf(a + 12, -m); });
+      this.table(m, H.ExportNamedOffset, H.ExportNamedNum, 8, (a) => this.addIf(a, -m));
+      if (!isCrs) {
+        for (let i = 0, n = this.get(m, H.SegmentNum); i < n; i++) {
+          const s = this.segment(m, i);
+          if (s.type === 3) this.w32(s.a, 0); else if (s.offset) this.w32(s.a, s.offset - m);
+        }
+      }
+      this.set(m, H.NextCRO, 0); this.set(m, H.PreviousCRO, 0); this.set(m, H.FixedSize, 0);
+      this.addIf(m + 0x80 + H.NameOffset * 4, -m);
+      for (let f = H.CodeOffset; f < H.Fix0Barrier; f += 2) this.addIf(m + 0x80 + f * 4, -m);
+    }
+
+    map(dst, src, size) { this.mem.mapPages(dst >>> 0, this.mem.getPages(src >>> 0, size), 3, 6, 'CRO'); }
+
+    handle(ipc, id) {
+      const g = (i) => ipc.get(i) >>> 0;
+      try {
+        switch (id) {
+          case 0x1: { // Initialize(crs buffer, size, mapped address)
+            const buf = g(1), size = g(2), addr = g(3);
+            this.map(addr, buf, size);
+            this.crs = addr;
+            this.rebase(addr, size, 0, 0, 0, 0, true);
+            this.set(addr, H.NextCRO, 0); this.set(addr, H.PreviousCRO, 0);
+            ipc.reply(id, [0]);
+            return true;
+          }
+          case 0x2: case 0x3: ipc.reply(id, [0]); return true; // LoadCRR / UnloadCRR (hash lists: not checked)
+          case 0x4: case 0x9: { // LoadCRO (0x9: the newer form with the link-on-load fix)
+            const buf = g(1), addr = g(2), size = g(3), dataAddr = g(4), dataSize = g(6), bssAddr = g(7), bssSize = g(8);
+            const autoLink = g(9) & 0xFF, fixLevel = g(10) & 3;
+            this.map(addr, buf, size);
+            this.rebase(addr, size, dataAddr, dataSize, bssAddr, bssSize, false);
+            this.link(addr, id === 0x9);
+            this.register(addr, autoLink);
+            const fixed = this.fix(addr, fixLevel);
+            this.emu.log(`ldr:ro: loaded module "${this.moduleName(addr)}" at ${hex(addr)}`);
+            ipc.reply(id, [0, fixed]);
+            return true;
+          }
+          case 0x5: { // UnloadCRO(mapped address, 0, buffer)
+            const addr = g(1);
+            this.unregister(addr);
+            this.unlink(addr);
+            if (this.get(addr, H.Magic) !== MAGIC_FIXD) { // not fixed: clear relocations so it can be loaded again
+              let begin = true;
+              this.table(addr, H.ExtRelocOffset, H.ExtRelocNum, 12, (a) => {
+                const t = this.tagToAddress(addr, this.r32(a)); const ty = this.mem.r8((a + 4) >>> 0);
+                if (t && (ty === 2 || ty === 3 || ty === 38)) this.w32(t, 0);
+                if (begin) this.mem.w8((a + 6) >>> 0, 0);
+                begin = this.mem.r8((a + 5) >>> 0) !== 0;
+              });
+              this.table(addr, H.InternalRelocOffset, H.InternalRelocNum, 12, (a) => {
+                const t = this.tagToAddress(addr, this.r32(a)); const ty = this.mem.r8((a + 4) >>> 0);
+                if (t && (ty === 2 || ty === 3 || ty === 38)) this.w32(t, 0);
+              });
+            }
+            this.unrebase(addr, false);
+            ipc.reply(id, [0]);
+            return true;
+          }
+          case 0x6: this.link(g(1), false); ipc.reply(id, [0]); return true;  // LinkCRO
+          case 0x7: this.unlink(g(1)); ipc.reply(id, [0]); return true;       // UnlinkCRO
+          case 0x8: if (this.crs) this.unrebase(this.crs, true); this.crs = 0; ipc.reply(id, [0]); return true; // Shutdown
+        }
+      } catch (e) {
+        if (!(e instanceof EMU.EmuError)) throw e;
+        this.emu.log(e.message);
+        ipc.reply(id, [0xD9012BF2, 0]); // RO error (invalid argument)
+        return true;
+      }
+      return false;
+    }
+  }
+
   class StubService extends Service {}
 
   // ------------------------------------------------------------------ registry
@@ -1345,6 +1691,7 @@
           case 'dsp::DSP': svc = new DspService(this.emu, name); break;
           case 'y2r:u': svc = new Y2rService(this.emu, name); break;
           case 'mic:u': svc = new MicService(this.emu, name); break;
+          case 'ldr:ro': svc = new RoService(this.emu, name); break;
           default: svc = new StubService(this.emu, name); this.emu.log(`Service "${name}" is stubbed`);
         }
         this.instances.set(key, svc);
@@ -1352,8 +1699,9 @@
       return svc;
     }
 
-    handleRequest(service, addr) {
+    handleRequest(service, addr, thread) {
       const ipc = new Ipc(this.emu.mem, addr);
+      ipc.thread = thread;
       const id = ipc.get(0) >>> 16;
       if (service.handle(ipc, id)) return;
       const key = `${service.name}:${id}`;

@@ -42,53 +42,98 @@
   }
 
   // ------------------------------------------------------------------ sound
-  // Emulated audio frames (stereo, 32728 Hz) are collected during each animation frame and handed to an
-  // AudioWorklet, which keeps a small buffer, resamples to the output rate when needed and plays it.
-  const WORKLET = `
-class PicaAudio extends AudioWorkletProcessor {
-  constructor(options) {
-    super();
-    const o = options.processorOptions;
-    this.inRate = o.inRate; this.ratio = o.inRate / sampleRate;
-    this.cap = o.inRate;                                  // one second of input
-    this.buf = new Float32Array(this.cap * 2);
-    this.r = 0; this.w = 0; this.n = 0; this.frac = 0; this.primed = false;
-    this.target = Math.round(o.inRate * 0.06);            // aim for ~60 ms buffered
-    this.port.onmessage = (e) => {
-      const d = e.data;
-      if (d === 'flush') { this.r = this.w = this.n = 0; this.primed = false; return; }
-      for (let i = 0; i < d.length; i += 2) {
-        this.buf[this.w * 2] = d[i]; this.buf[this.w * 2 + 1] = d[i + 1];
-        this.w = (this.w + 1) % this.cap;
-        if (this.n < this.cap) this.n++; else this.r = (this.r + 1) % this.cap;
+  // Emulated audio (stereo, 32728 Hz) is collected while frames run and, once per animation frame, scheduled
+  // on the audio clock as an AudioBuffer that starts exactly where the previous one ends. The browser's audio
+  // thread plays scheduled buffers on time however busy this page is (and this works on pages opened from a
+  // file, where audio worklets are not allowed).
+  //
+  // When emulation runs slower than real time there is less than a second of sound per second. Instead of
+  // gaps, the sound is time-stretched (WSOLA: overlapping windowed grains, each placed where it best matches
+  // the previous one) so it plays continuously at the right pitch. At full speed the stretcher passes the
+  // input through unchanged.
+  class TimeStretcher {
+    constructor() {
+      this.N = 1024;          // grain length (31 ms)
+      this.H = 512;           // output hop (half a grain: Hann windows at this overlap sum to 1)
+      this.tol = 256;         // how far a grain may move to line up with the previous one
+      this.win = new Float32Array(this.N).map((_, i) => 0.5 - 0.5 * Math.cos(2 * Math.PI * i / this.N));
+      this.L = new Float32Array(1 << 16); this.R = new Float32Array(1 << 16);
+      this.len = 0;           // input samples held
+      this.pos = 0;           // nominal input position of the next grain
+      this.natural = -1;      // where the previous grain would naturally continue (-1: none yet)
+      this.tailL = new Float32Array(this.H); this.tailR = new Float32Array(this.H);
+    }
+
+    clear() { this.len = 0; this.pos = 0; this.natural = -1; this.tailL.fill(0); this.tailR.fill(0); }
+
+    write(L, R) {
+      if (this.len + L.length > this.L.length) { // grow
+        const n = Math.max(this.L.length * 2, this.len + L.length);
+        const nl = new Float32Array(n), nr = new Float32Array(n);
+        nl.set(this.L.subarray(0, this.len)); nr.set(this.R.subarray(0, this.len));
+        this.L = nl; this.R = nr;
       }
-      const max = this.target * 3; // emulation ran ahead: drop the oldest audio to keep latency low
-      while (this.n > max) { this.r = (this.r + 1) % this.cap; this.n--; }
-    };
-  }
-  process(inputs, outputs) {
-    const out = outputs[0], L = out[0], R = out[1] || out[0];
-    if (!this.primed) {
-      if (this.n < this.target) { L.fill(0); R.fill(0); return true; }
-      this.primed = true;
+      this.L.set(L, this.len); this.R.set(R, this.len);
+      this.len += L.length;
     }
-    // Play slightly faster or slower to stay near the target fill level
-    const step = this.ratio * (1 + Math.max(-0.005, Math.min(0.005, (this.n - this.target) / this.target * 0.01)));
-    for (let i = 0; i < L.length; i++) {
-      if (this.n < 2) { L[i] = R[i] = 0; this.primed = false; continue; }
-      const a = this.r * 2, b = ((this.r + 1) % this.cap) * 2, f = this.frac;
-      L[i] = this.buf[a] + (this.buf[b] - this.buf[a]) * f;
-      R[i] = this.buf[a + 1] + (this.buf[b + 1] - this.buf[a + 1]) * f;
-      this.frac += step;
-      while (this.frac >= 1) { this.frac -= 1; this.r = (this.r + 1) % this.cap; this.n--; }
+
+    // Input samples not yet played (approximately)
+    pending() { return Math.max(0, this.len - this.pos); }
+
+    // Best start for the next grain near `want`: the offset whose samples look most like the natural
+    // continuation of the previous grain (cross-correlation on a decimated mono mix)
+    align(want) {
+      if (this.natural < 0 || want === this.natural) return want;
+      const { L, R, tol } = this, span = this.H, nat = this.natural;
+      let best = want, bestScore = -Infinity;
+      for (let d = -tol; d <= tol; d += 2) {
+        const s = want + d;
+        if (s < 0 || s + this.N > this.len) continue;
+        let score = 0;
+        for (let i = 0; i < span; i += 4) score += (L[s + i] + R[s + i]) * (L[nat + i] + R[nat + i]);
+        if (score > bestScore) { bestScore = score; best = s; }
+      }
+      return best;
     }
-    return true;
+
+    // Produce output at `stretch` (output time / input time); returns [L, R] or null if not enough input
+    read(stretch) {
+      const { N, H } = this, outL = [], outR = [];
+      let produced = 0;
+      for (;;) {
+        const want = Math.round(this.pos);
+        if (want + N + this.tol > this.len) break;
+        const s = stretch === 1 && this.natural === want ? want : this.align(want);
+        const gl = new Float32Array(H), gr = new Float32Array(H);
+        for (let i = 0; i < H; i++) {
+          gl[i] = this.tailL[i] + this.L[s + i] * this.win[i];
+          gr[i] = this.tailR[i] + this.R[s + i] * this.win[i];
+        }
+        for (let i = 0; i < H; i++) {
+          this.tailL[i] = this.L[s + H + i] * this.win[H + i];
+          this.tailR[i] = this.R[s + H + i] * this.win[H + i];
+        }
+        outL.push(gl); outR.push(gr); produced += H;
+        this.natural = s + H;
+        this.pos += H / stretch;
+      }
+      // Drop input that no grain can use any more
+      const keep = Math.max(0, Math.min(Math.floor(this.pos), this.natural < 0 ? Infinity : this.natural) - this.tol);
+      if (keep > 0) {
+        this.L.copyWithin(0, keep, this.len); this.R.copyWithin(0, keep, this.len);
+        this.len -= keep; this.pos -= keep; if (this.natural >= 0) this.natural -= keep;
+      }
+      if (!produced) return null;
+      const L = new Float32Array(produced), R = new Float32Array(produced);
+      outL.forEach((g, i) => L.set(g, i * H)); outR.forEach((g, i) => R.set(g, i * H));
+      return [L, R];
+    }
   }
-}
-registerProcessor('pica-audio', PicaAudio);`;
 
   const audio = {
-    ctx: null, node: null, gain: null, failed: false, pending: [], pendingLen: 0,
+    ctx: null, gain: null, failed: false,
+    stretcher: new TimeStretcher(), stretch: 1, next: 0,
+    TARGET: 0.1,   // seconds of sound to keep scheduled ahead
     enabled: store.get('audio', '1') !== '0',
     volume: Math.max(0, Math.min(100, parseInt(store.get('volume', '80'), 10) || 0)),
     muted: store.get('muted', '0') === '1',
@@ -98,34 +143,51 @@ registerProcessor('pica-audio', PicaAudio);`;
       if (this.failed || !this.enabled) return;
       if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
       const Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx || !window.AudioWorkletNode) { this.fail('this browser does not support AudioWorklet'); return; }
+      if (!Ctx) { this.fail('this browser has no Web Audio'); return; }
       try { this.ctx = new Ctx({ sampleRate: EMU.AUDIO_RATE, latencyHint: 'interactive' }); }
       catch (e) { try { this.ctx = new Ctx({ latencyHint: 'interactive' }); } catch (e2) { this.fail(e2.message); return; } }
-      const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
-      this.ctx.audioWorklet.addModule(url).then(() => {
-        this.node = new AudioWorkletNode(this.ctx, 'pica-audio', { numberOfInputs: 0, outputChannelCount: [2], processorOptions: { inRate: EMU.AUDIO_RATE } });
-        this.gain = this.ctx.createGain();
-        this.node.connect(this.gain).connect(this.ctx.destination);
-        this.applyVolume();
-      }).catch((e) => this.fail(e.message)).finally(() => URL.revokeObjectURL(url));
+      this.gain = this.ctx.createGain();
+      this.gain.connect(this.ctx.destination);
+      this.applyVolume();
     },
     fail(msg) { this.failed = true; logLine(`Sound is unavailable: ${msg}`, 'err'); },
 
     push(L, R) {
-      if (!this.node || !this.enabled) return;
-      const b = new Float32Array(L.length * 2);
-      for (let i = 0; i < L.length; i++) { b[i * 2] = L[i]; b[i * 2 + 1] = R[i]; }
-      this.pending.push(b); this.pendingLen += b.length;
+      if (!this.ctx || !this.enabled || this.ctx.state !== 'running') return;
+      this.stretcher.write(L, R);
     },
+
+    // Once per animation frame: stretch what was produced and schedule it after what is already queued
     flush() {
-      if (!this.pendingLen) return;
-      const all = new Float32Array(this.pendingLen);
-      let o = 0;
-      for (const b of this.pending) { all.set(b, o); o += b.length; }
-      this.pending = []; this.pendingLen = 0;
-      if (this.node) this.node.port.postMessage(all, [all.buffer]);
+      const ctx = this.ctx;
+      if (!ctx || ctx.state !== 'running') return;
+      const now = ctx.currentTime, rate = EMU.AUDIO_RATE;
+      if (this.next < now + 0.005) { // ran dry (or first sound): build a cushion, then start a little ahead
+        if (this.stretcher.pending() < rate * this.TARGET * 0.6) return;
+        this.next = now + 0.02;
+        this.stretch = 1;
+      }
+      // Seconds of sound already scheduled plus what is waiting in the stretcher
+      const ahead = this.next - now + this.stretcher.pending() / rate;
+      // Speed control: stretch when running low (emulation slower than real time), play slightly faster when
+      // too much has built up, and leave the sound untouched near the target
+      let want = 1;
+      if (ahead < this.TARGET * 0.75) want = Math.min(3, 1 + (this.TARGET - ahead) / this.TARGET * 2.5);
+      else if (ahead > this.TARGET * 2.5) want = 0.85;
+      else if (ahead > this.TARGET * 1.6) want = 0.95;
+      this.stretch = want === 1 && Math.abs(this.stretch - 1) < 0.03 ? 1 : this.stretch * 0.7 + want * 0.3;
+      if (ahead > 0.5) { this.stretcher.clear(); this.next = now + 0.03; return; } // far behind: resynchronise
+      const out = this.stretcher.read(this.stretch);
+      if (!out) return;
+      const buf = ctx.createBuffer(2, out[0].length, rate);
+      buf.copyToChannel(out[0], 0); buf.copyToChannel(out[1], 1);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(this.gain);
+      src.start(this.next);
+      this.next += out[0].length / rate;
     },
-    clear() { this.pending = []; this.pendingLen = 0; if (this.node) this.node.port.postMessage('flush'); },
+    clear() { this.stretcher.clear(); this.next = 0; this.stretch = 1; },
     applyVolume() {
       if (this.gain) this.gain.gain.value = this.muted || !this.enabled ? 0 : Math.pow(this.volume / 100, 2);
       $('vol-waves').toggleAttribute('hidden', this.muted || this.volume === 0);
@@ -160,7 +222,7 @@ registerProcessor('pica-audio', PicaAudio);`;
   emu.onAudio = (L, R) => audio.push(L, R);
 
   // ------------------------------------------------------------------ UI state
-  let romBytes = null, romName = '';
+  let romBytes = null, romName = '', romFs = null; // romFs: RomFS read on demand for large games
   let paused = false;
   let layout = store.get('layout', 'stacked'); // stacked, side, top-only
 
@@ -209,13 +271,18 @@ registerProcessor('pica-audio', PicaAudio);`;
     emu.gpu.state = null; // rebuild the render state with the chosen rasterizer
   }
 
-  function start(bytes, name) {
-    romBytes = bytes; romName = name;
+  // Background idle skipping in the scheduler (see Kernel.idleSkip)
+  let idleSkip = store.get('idle-skip', '1') !== '0';
+  function applyIdleSkip() { if (emu.loaded) emu.kernel.idleSkip = idleSkip; }
+
+  function start(bytes, name, romfs = null) {
+    romBytes = bytes; romName = name; romFs = romfs;
     audio.clear();
     try {
       applyRenderer();
-      emu.load(bytes, name);
+      emu.load(bytes, name, romfs);
       applyJit();
+      applyIdleSkip();
     } catch (e) {
       logLine(e.message, 'err');
       showMessage('Could not load this file', e.message);
@@ -233,8 +300,11 @@ registerProcessor('pica-audio', PicaAudio);`;
   function loadFile(file) {
     audio.unlock();
     setStatus('', `Loading ${file.name}…`);
-    file.arrayBuffer().then((buf) => start(new Uint8Array(buf), file.name))
-      .catch((e) => { showMessage('Could not read this file', `${file.name}: ${e.message}. Very large files (over about 2 GB) cannot be loaded yet.`); setStatus('halted', 'Load failed'); });
+    // Large games: only the headers and code are read now; game data is read from the file as it is needed
+    EMU.readGameFile(file).then(({ bytes, romfs }) => {
+      if (romfs) logLine(`${file.name} is ${(file.size / 1073741824).toFixed(1)} GB: game data is read from the file as needed.`);
+      start(bytes, file.name, romfs);
+    }).catch((e) => { showMessage('Could not read this file', `${file.name}: ${e.message}`); setStatus('halted', 'Load failed'); });
   }
 
   function runDemo() {
@@ -247,8 +317,8 @@ registerProcessor('pica-audio', PicaAudio);`;
 
   $('file').addEventListener('change', (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); e.target.value = ''; });
   $('ov-demo').addEventListener('click', runDemo);
-  $('reset').addEventListener('click', () => { audio.unlock(); if (romBytes) start(romBytes, romName); });
-  $('ov-reset').addEventListener('click', () => { audio.unlock(); if (romBytes) start(romBytes, romName); });
+  $('reset').addEventListener('click', () => { audio.unlock(); if (romBytes) start(romBytes, romName, romFs); });
+  $('ov-reset').addEventListener('click', () => { audio.unlock(); if (romBytes) start(romBytes, romName, romFs); });
   $('ov-log').addEventListener('click', () => { showPanel(true); selectTab('log'); });
   $('pause').addEventListener('click', () => { audio.unlock(); setPaused(!paused); });
 
@@ -359,6 +429,24 @@ registerProcessor('pica-audio', PicaAudio);`;
     store.set('renderer', useGL ? 'webgl' : 'software');
     applyRenderer();
   });
+  $('idle-skip').checked = idleSkip;
+  $('idle-skip').addEventListener('change', () => { idleSkip = $('idle-skip').checked; store.set('idle-skip', idleSkip ? '1' : '0'); applyIdleSkip(); });
+
+  // Hardware acceleration: show the graphics device and warn when the browser draws WebGL on the CPU
+  if (glRenderer) {
+    $('gpu-name').textContent = glRenderer.deviceName;
+    $('gpu-accel').textContent = glRenderer.softwareDevice ? 'Not accelerated' : 'Hardware accelerated';
+    $('gpu-accel').className = 'pill ' + (glRenderer.softwareDevice ? 'halted' : 'running');
+    $('gpu-accel').insertAdjacentHTML('afterbegin', '<i></i>');
+    if (glRenderer.softwareDevice) {
+      const msg = 'Your browser is drawing WebGL without your graphics card, which makes games much slower. Turn on hardware acceleration in your browser settings (Brave/Chrome: Settings → System → "Use graphics acceleration when available"), then restart the browser.';
+      logLine(msg, 'err');
+      setTimeout(() => toast(msg, true, 12000), 500);
+    }
+  } else {
+    $('gpu-name').textContent = 'WebGL 2 unavailable';
+    $('gpu-accel').innerHTML = '<i></i>Not accelerated'; $('gpu-accel').className = 'pill halted';
+  }
   $('jit').checked = useJit;
   $('jit').addEventListener('change', () => { useJit = $('jit').checked; store.set('jit', useJit ? '1' : '0'); applyJit(); });
 

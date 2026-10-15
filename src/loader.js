@@ -129,6 +129,10 @@
     const stackSize = u32(ex + 0x1C), bssSize = u32(ex + 0x3C);
     const compressed = bytes[ex + 0xD] & 1;
     const priority = bytes[ex + 0x200 + 0xF];
+    // Memory the application gets: the Old 3DS system mode in exheader flag0 bits 4-7 (0 = 64 MB, 2 = 96 MB,
+    // 3 = 80 MB "extended memory", 4 = 72 MB, 5 = 32 MB); New 3DS-only modes in flag2 bits 0-3 (124/178 MB)
+    const o3dsMode = bytes[ex + 0x200 + 0xE] >>> 4, n3dsMode = bytes[ex + 0x200 + 0xD] & 15;
+    const appMemory = Math.max({ 2: 96, 3: 80, 4: 72, 5: 32 }[o3dsMode] || 64, { 1: 124, 2: 178, 3: 124 }[n3dsMode] || 0) * 0x100000;
 
     // ExeFS: find .code (and the icon for the title).
     const exefs = u32(0x1A0) * mediaUnit;
@@ -166,7 +170,7 @@
     }
 
     return {
-      entry: text.addr, size: image.length, format: 'NCCH', romfs, kernelVersion,
+      entry: text.addr, size: image.length, format: 'NCCH', romfs, kernelVersion, appMemory,
       stackSize, priority: priority || 0x30,
       title: files.icon ? smdhTitle(files.icon) : null,
       programId: dv.getBigUint64(0x118, true).toString(16).padStart(16, '0'),
@@ -230,6 +234,73 @@
     const romfsOff = dv.getUint32(0x1B0, true) * 0x200, romfsSize = dv.getUint32(0x1B4, true) * 0x200;
     if (!romfsOff || romfsSize <= 0x1000 || (flags[7] & 2) || romfsOff + romfsSize > bytes.length) throw new EMU.EmuError(`System file ${titleId} has no RomFS`);
     return { titleId, romfs: bytes.slice(romfsOff + 0x1000, romfsOff + romfsSize), executable: !!(flags[5] & 2), name: EMU.SYSTEM_ARCHIVE_NAMES[titleId] || null };
+  };
+
+  // Part of a large file read on demand (games too big to load whole): 1 MB chunks of a Blob fetched
+  // asynchronously and kept in a bounded cache (least recently used chunks are dropped first).
+  const CHUNK = 1 << 20, MAX_CHUNKS = 384, READ_AHEAD = 4 << 20;
+  class LazyFile {
+    constructor(blob, start, length) { this.blob = blob; this.start = start; this.length = length; this.chunks = new Map(); this.pending = new Map(); }
+
+    // Are bytes [off, off + n) in memory?
+    has(off, n) {
+      for (let c = Math.floor(off / CHUNK), last = Math.floor((off + n - 1) / CHUNK); c <= last; c++) if (!this.chunks.has(c)) return false;
+      return true;
+    }
+
+    // Copy [off, off + n) into dest; every chunk must be loaded
+    copy(off, n, dest) {
+      for (let o = 0; o < n;) {
+        const p = off + o, c = Math.floor(p / CHUNK), within = p - c * CHUNK, chunk = this.chunks.get(c);
+        this.chunks.delete(c); this.chunks.set(c, chunk); // most recently used
+        const k = Math.min(n - o, chunk.length - within);
+        dest.set(chunk.subarray(within, within + k), o);
+        o += k;
+      }
+    }
+
+    // Fetch the chunks covering [off, off + n) and a little beyond (reads are mostly sequential)
+    load(off, n) {
+      const lastChunk = Math.floor((this.length - 1) / CHUNK);
+      const first = Math.floor(off / CHUNK), last = Math.min(lastChunk, Math.floor((off + Math.max(1, n) - 1 + READ_AHEAD) / CHUNK));
+      const jobs = [];
+      for (let c = first; c <= last; c++) if (!this.chunks.has(c)) jobs.push(this.fetch(c));
+      return Promise.all(jobs);
+    }
+
+    fetch(c) {
+      if (this.pending.has(c)) return this.pending.get(c);
+      const a = this.start + c * CHUNK, b = Math.min(this.start + this.length, a + CHUNK);
+      const p = this.blob.slice(a, b).arrayBuffer().then((buf) => {
+        this.pending.delete(c);
+        this.chunks.set(c, new Uint8Array(buf));
+        while (this.chunks.size > MAX_CHUNKS) this.chunks.delete(this.chunks.keys().next().value);
+      });
+      this.pending.set(c, p);
+      return p;
+    }
+  }
+  EMU.LazyFile = LazyFile;
+
+  // Game files bigger than this are not read whole: the start of the file (headers and code) is read, and the
+  // RomFS is read on demand. Returns { bytes, romfs } (romfs null when the file is read whole).
+  EMU.LARGE_GAME = 256 * 1024 * 1024;
+  EMU.readGameFile = async function (file) {
+    const whole = async () => ({ bytes: new Uint8Array(await file.arrayBuffer()), romfs: null });
+    if (file.size <= EMU.LARGE_GAME) return whole();
+    const head = new Uint8Array(await file.slice(0, 0x200).arrayBuffer());
+    const ascii = (b, o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+    let part = 0, mu = 0x200;
+    if (ascii(head, 0x100) === 'NCSD') {
+      mu = 0x200 << head[0x188 + 6];
+      part = new DataView(head.buffer).getUint32(0x120, true) * mu;
+    } else if (ascii(head, 0x100) !== 'NCCH') return whole(); // not a cartridge image: the loader reports it
+    const ncch = new DataView(await file.slice(part, part + 0x200).arrayBuffer());
+    const exefsEnd = (ncch.getUint32(0x1A0, true) + ncch.getUint32(0x1A4, true)) * mu;
+    const romfsOff = ncch.getUint32(0x1B0, true) * mu, romfsSize = ncch.getUint32(0x1B4, true) * mu;
+    const bytes = new Uint8Array(await file.slice(0, part + Math.max(exefsEnd, 0xC00)).arrayBuffer());
+    const romfs = romfsOff && romfsSize > 0x1000 ? new LazyFile(file, part + romfsOff + 0x1000, romfsSize - 0x1000) : null;
+    return { bytes, romfs };
   };
 
   EMU.loadExecutable = function (mem, bytes) {

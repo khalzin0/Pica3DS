@@ -391,6 +391,11 @@ void main() {
       if (!gl) throw new Error('WebGL 2 is not available');
       this.gl = gl;
       this.canvas = canvas;
+      // Which graphics device WebGL runs on. Browsers fall back to a CPU implementation (SwiftShader, llvmpipe,
+      // WARP) when hardware acceleration is off or the driver is blocked: that works but is much slower.
+      const info = gl.getExtension('WEBGL_debug_renderer_info');
+      this.deviceName = String((info && gl.getParameter(info.UNMASKED_RENDERER_WEBGL)) || gl.getParameter(gl.RENDERER) || 'unknown');
+      this.softwareDevice = /swiftshader|llvmpipe|softpipe|software|microsoft basic render|warp/i.test(this.deviceName);
       this.gpu = null;
       this.batch = new Float32Array(VTX * 3 * 8192);
       this.count = 0;           // vertices in the batch
@@ -837,7 +842,17 @@ void main() {
     memoryWritten(phys, size, fill) {
       for (const s of this.surfaces) {
         if (s.phys >= phys + size || s.phys + s.bytes <= phys) continue;
-        if (s.dirty && !fill) this.warn('overwrite', 'GPU (WebGL): memory written over a render target that had not been read back');
+        if (s.dirty && !fill && (phys > s.phys || phys + size < s.phys + s.bytes)) {
+          // Part of a surface the host GPU drew was overwritten: keep the new bytes and the GPU's other pixels by
+          // writing the surface back to memory, then putting the newly written bytes on top again
+          const lo = Math.max(phys, s.phys), hi = Math.min(phys + size, s.phys + s.bytes);
+          const mem = this.gpu.mem, virt = this.gpu.toVirt(lo);
+          let saved = null;
+          try { saved = mem.readBytes(virt, hi - lo); } catch (e) { /* not mapped */ }
+          if (this.count) this.flush(); // queued triangles first
+          this.writeBack(s);
+          if (saved) mem.writeBytes(virt, saved);
+        }
         s.dirty = false; s.stale = true;
         // A fill covering the whole surface with a pattern that lines up with its pixels: every pixel is the same
         const covers = fill && s.phys >= phys && s.phys + s.bytes <= phys + size;
