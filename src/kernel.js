@@ -302,6 +302,7 @@
           return [0, addr];
         }
         case 1: // FREE
+          this.mem.release(addr0, size);
           this.mem.unmap(addr0, size);
           this.memUsed -= size;
           return [0, addr0];
@@ -400,7 +401,7 @@
           const size = ((r[2] + 0xFFF) & ~0xFFF) >>> 0;
           let pages;
           if (r[1]) pages = mem.getPages(r[1], size);
-          else { const buf = new Uint8Array(size); pages = []; for (let i = 0; i < size; i += 0x1000) pages.push(buf.subarray(i, i + 0x1000)); }
+          else { const buf = mem.newBuffer(size); pages = []; for (let i = 0; i < size; i += 0x1000) pages.push(buf.subarray(i, i + 0x1000)); }
           r[0] = 0; r[1] = this.createHandle(new KMemBlock(pages, size));
           return;
         }

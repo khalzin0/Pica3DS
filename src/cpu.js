@@ -43,17 +43,19 @@
         ` if (c.pc !== ${(PC + 4) >>> 0} || c.t || c.stop) return done + ${n + 1};`;
       let body = null;
       const op3 = (insn >>> 25) & 7;
-      if (cond === 15) body = generic();
+      if (cond === 15) {
+        if ((insn & 0x0E000000) === 0x0A000000) body = generic(); // BLX immediate: switches to Thumb
+        else body = (insn >>> 0) === 0xF57FF01F ? 'c.excl = -1;' : ''; // CLREX; PLD, DMB/DSB/ISB, ...: nothing
+      }
       else if (op3 === 5) { // B / BL ends the block
         const target = (PC + 8 + ((insn << 8) >> 6)) >>> 0;
         // A loop back to this block's start runs again right here while the budget lasts, instead of going back
         // through the dispatcher (and re-checking the code) on every pass
         const loop = target === start && !(insn & 0x01000000);
         const taken = loop ? `done += ${n + 1}; if (done + ${n + 1} <= budget) continue; c.pc = ${target}; return done;`
-          : `${insn & 0x01000000 ? `r[14] = ${(PC + 4) >>> 0}; ` : ''}c.pc = ${target};`;
+          : `${insn & 0x01000000 ? `r[14] = ${(PC + 4) >>> 0}; ` : ''}c.pc = ${target}; return done + ${n + 1};`;
         code += `c.curPC = ${PC}; r[15] = ${(PC + 8) >>> 0};\n`;
-        code += cond === 14 ? `${taken}\n` : `if (${COND_EXPR[cond]}) { ${taken} } else c.pc = ${(PC + 4) >>> 0};\n`;
-        code += `return done + ${n + 1};\n`;
+        code += cond === 14 ? `${taken}\n` : `if (${COND_EXPR[cond]}) { ${taken} } else { c.pc = ${(PC + 4) >>> 0}; return done + ${n + 1}; }\n`;
         n++; ended = true;
         break;
       } else body = specialise(insn, PC, R) || generic();
@@ -61,11 +63,12 @@
       n++;
       pc = (pc + 4) >>> 0;
     }
-    if (!ended) code += `c.pc = ${pc}; c.curPC = ${(pc - 4) >>> 0}; r[15] = ${(pc + 4) >>> 0}; return done + ${n};\n`;
+    if (!ended) code += `c.curPC = ${(pc - 4) >>> 0}; r[15] = ${(pc + 4) >>> 0}; c.pc = ${pc}; return done + ${n};\n`;
     // budget: instructions the caller allows; a block is only entered when one pass fits
-    const src = `return function block(c, r, mem, P, budget) {\nif (${checks}) return -1;\nlet done = 0;\nfor (;;) {\n${code}}\n};`;
+    const vfp = /\b(fs|fd|fu)\[/.test(code) ? 'const fs = c.fs, fd = c.fd, fu = c.fu;\n' : '';
+    const src = `return function block(c, r, mem, P, budget) {\nif (${checks}) return -1;\n${vfp}let done = 0;\nfor (;;) {\n${code}}\n};`;
     const fn = new Function(src)();
-    return { fn, n, idx, start };
+    return { fn, n, idx, start, thumb: false, uses: 0, w: undefined };
   }
 
   // Thumb blocks: each instruction runs the interpreter's own Thumb handler, without the main loop's fetch and
@@ -97,6 +100,82 @@ for (;;) {
 ${code.split('@N').join(String(n))}}
 };`)();
     return { fn, n, idx, start, thumb: true };
+  }
+
+  // VLDR / VSTR / VLDM / VSTM and VMOV (two core registers): the same steps as CPU.armCoprocLS, unrolled
+  function vfpLoadStore(insn, PC) {
+    const dbl = ((insn >>> 8) & 15) === 11;
+    if ((insn & 0x0FE00000) === 0x0C400000) {
+      const rt2 = (insn >>> 16) & 15, rt = (insn >>> 12) & 15;
+      if (rt === 15 || rt2 === 15) return null;
+      const m = dbl ? ((insn & 15) | (((insn >>> 5) & 1) << 4)) * 2 : ((insn & 15) << 1) | ((insn >>> 5) & 1);
+      return insn & 0x00100000 ? `r[${rt}] = fu[${m}]; r[${rt2}] = fu[${m + 1}];` : `fu[${m}] = r[${rt}]; fu[${m + 1}] = r[${rt2}];`;
+    }
+    const P = insn & 0x01000000, U = insn & 0x00800000, D = (insn >>> 22) & 1, W = insn & 0x00200000, L = insn & 0x00100000;
+    const rn = (insn >>> 16) & 15, vd = (insn >>> 12) & 15, imm8 = insn & 0xFF;
+    if (!P && !U && !W) return null; // not a load/store encoding handled here
+    if (rn === 15 && W) return null;
+    const first = dbl ? ((vd | (D << 4)) * 2) : ((vd << 1) | D);
+    const base = rn === 15 ? `${((PC + 8) & ~3) >>> 0}` : `r[${rn}]`;
+    let s = `{ c.curPC = ${PC}; const base = ${base}; `, words, addr;
+    if (P && !W) { addr = `((base ${U ? '+' : '-'} ${imm8 * 4}) >>> 0)`; words = dbl ? 2 : 1; }
+    else {
+      words = dbl ? imm8 & ~1 : imm8;
+      addr = P ? `((base - ${imm8 * 4}) >>> 0)` : 'base';
+      if (words > 32) return null;
+    }
+    s += `const a = ${addr}; `;
+    if (W && !(P && !W)) s += `r[${rn}] = (base ${U ? '+' : '-'} ${imm8 * 4}) >>> 0; `;
+    for (let i = 0; i < words; i++) {
+      const idx = (first + i) & 31, at = i ? `((a + ${i * 4}) >>> 0)` : 'a';
+      s += L ? `fu[${idx}] = mem.r32(${at}); ` : `mem.w32(${at}, fu[${idx}]); `;
+    }
+    return `${s}}`;
+  }
+
+  // VFP data processing as straight-line code: the same arithmetic as CPU.vfpDataProc with the registers fixed.
+  // Null for forms left to the handler.
+  function vfpData(insn) {
+    const dbl = (insn >>> 8) & 1;
+    const D = (insn >>> 22) & 1, N = (insn >>> 7) & 1, M = (insn >>> 5) & 1;
+    const Vd = (insn >>> 12) & 15, Vn = (insn >>> 16) & 15, Vm = insn & 15;
+    const vd = dbl ? Vd | (D << 4) : (Vd << 1) | D;
+    const vn = dbl ? Vn | (N << 4) : (Vn << 1) | N;
+    const vm = dbl ? Vm | (M << 4) : (Vm << 1) | M;
+    const F = dbl ? 'fd' : 'fs', rnd = (x) => (dbl ? `(${x})` : `Math.fround(${x})`);
+    const s = (insn >>> 6) & 1, op7 = (insn >>> 7) & 1;
+    const opc = (((insn >>> 23) & 1) << 2) | ((insn >>> 20) & 3);
+    const d = `${F}[${vd}]`, n = `${F}[${vn}]`, m = `${F}[${vm}]`;
+    switch (opc) {
+      case 0: return `{ const p = ${rnd(`${n} * ${m}`)}; ${d} = ${d} + (${s ? '-p' : 'p'}); }`;
+      case 1: return `{ const p = ${rnd(`${n} * ${m}`)}; ${d} = -${d} + (${s ? '-p' : 'p'}); }`;
+      case 2: return s ? `${d} = -${rnd(`${n} * ${m}`)};` : `${d} = ${n} * ${m};`;
+      case 3: return `${d} = ${n} ${s ? '-' : '+'} ${m};`;
+      case 4: return s ? null : `${d} = ${n} / ${m};`;
+      case 7: break;
+      default: return null;
+    }
+    if (!s) return null; // VMOV immediate: handler
+    switch (Vn) {
+      case 0: case 1: {
+        if (Vn === 1 && op7) return `${d} = Math.sqrt(${m});`;
+        const hi = (w) => (Vn === 0 ? (op7 ? `(${w} & 0x7FFFFFFF) >>> 0` : w) : `(${w} ^ 0x80000000) >>> 0`);
+        return dbl ? `{ const lo = fu[${vm * 2}], h = fu[${vm * 2 + 1}]; fu[${vd * 2}] = lo; fu[${vd * 2 + 1}] = ${hi('h')}; }`
+          : `fu[${vd}] = ${hi(`fu[${vm}]`)};`;
+      }
+      case 4: return `c.setFPFlags(${d}, ${m});`;
+      case 5: return `c.setFPFlags(${d}, 0);`;
+      case 7: return dbl ? `fs[${(Vd << 1) | D}] = fd[${vm}];` : `fd[${Vd | (D << 4)}] = fs[${vm}];`;
+      case 8: { const sm = (Vm << 1) | M; return `${d} = ${op7 ? `(fu[${sm}] | 0)` : `fu[${sm}]`};`; }
+      case 12: case 13: {
+        const sd = (Vd << 1) | D;
+        const conv = `const x = ${m}; let v = x !== x ? 0 : ${op7 ? 'Math.trunc(x)' : 'c.fpRound(x)'}; `;
+        return Vn === 13
+          ? `{ ${conv}v = v > 2147483647 ? 2147483647 : v < -2147483648 ? -2147483648 : v; fu[${sd}] = v | 0; }`
+          : `{ ${conv}v = v > 4294967295 ? 4294967295 : v < 0 ? 0 : v; fu[${sd}] = v >>> 0; }`;
+      }
+    }
+    return null;
   }
 
   // Specialised code for common instruction forms, or null to use the generic path
@@ -213,6 +292,15 @@ ${code.split('@N').join(String(n))}}
       const op1 = (insn >>> 20) & 0x1F;
       return `r[15] = ${(PC + 8) >>> 0}; ${op1 < 8 ? `c.parallelAddSub(${insn});` : `c.curPC = ${PC}; c.armMedia(${insn});`}`;
     }
+    // ---- VFP loads/stores and register moves (coprocessors 10 and 11)
+    if (op3 === 6 && ((insn >>> 8) & 14) === 10) return vfpLoadStore(insn, PC);
+    // ---- VFP data processing and VFP/CP15 register transfers: inline, or the handler without a block exit
+    if (op3 === 7 && !(insn & 0x01000000)) {
+      const cp = (insn >>> 8) & 15;
+      if (cp === 10 || cp === 11) return (!(insn & 0x10) && vfpData(insn)) || `c.curPC = ${PC}; r[15] = ${(PC + 8) >>> 0}; c.armCoproc(${insn});`;
+      if (cp === 15) return `c.curPC = ${PC}; r[15] = ${(PC + 8) >>> 0}; c.armCoproc(${insn});`;
+      return null;
+    }
     // ---- LDM / STM without PC in a load list: unrolled
     if (op3 === 4) {
       const L = insn & 0x00100000, list = insn & 0xFFFF;
@@ -237,7 +325,14 @@ ${code.split('@N').join(String(n))}}
   class CPU {
     constructor(mem) {
       this.mem = mem;
-      this.r = new Uint32Array(16);
+      // With an arena the registers live in it, where WebAssembly blocks read and write them
+      const arena = mem.arena;
+      this.r = arena ? new Uint32Array(arena.buffer, EMU.WASM_REGS, 16) : new Uint32Array(16);
+      this.wstate = arena ? new Int32Array(arena.buffer, EMU.WASM_STATE, 8) : null; // n z c v pc curPC
+      this.wasm = !!arena;      // run WebAssembly blocks (needs the arena)
+      this.wasmQueue = [];      // JavaScript blocks waiting to be compiled to WebAssembly
+      this.wasmThreshold = 1024; // runs of a JavaScript block before it is compiled again, to WebAssembly
+      this.wasmBlocks = 0;
       this.pc = 0;          // address of the next instruction
       this.t = 0;           // Thumb state
       this.n = 0; this.z = 0; this.c = 0; this.v = 0; this.q = 0; this.ge = 0;
@@ -266,7 +361,10 @@ ${code.split('@N').join(String(n))}}
     }
 
     // Forget compiled code (after loading a save state)
-    resetJit() { this.blockTab = new Array(BLOCK_TAB).fill(null); this.hot = new Uint16Array(BLOCK_TAB); }
+    resetJit() { this.blockTab = new Array(BLOCK_TAB).fill(null); this.hot = new Uint16Array(BLOCK_TAB); this.wasmQueue = []; }
+
+    // Compile the blocks waiting for WebAssembly (called between frames, and when enough are waiting)
+    flushWasm() { if (this.wasmQueue.length && EMU.wasmCompileQueued) EMU.wasmCompileQueued(this); }
 
     // ---------------------------------------------------------------- context
     newContext() {
@@ -317,9 +415,29 @@ ${code.split('@N').join(String(n))}}
             }
           }
           if (b !== null && b.n <= max - i) {
-            const P = b.thumb ? mem.pages16[b.idx] : pages32[b.idx];
-            const k = P === null ? -1 : b.fn(this, r, mem, P, max - i);
-            if (k >= 0) { i += k; continue; }
+            let k;
+            if (b.w && this.wasm) { // WebAssembly: flags in, run, flags and PC out (registers are shared)
+              const S = this.wstate;
+              S[0] = this.n; S[1] = this.z; S[2] = this.c; S[3] = this.v;
+              k = b.w(max - i);
+              if (k >= 0) {
+                this.n = S[0]; this.z = S[1]; this.c = S[2]; this.v = S[3];
+                this.pc = S[4] >>> 0; this.curPC = S[5] >>> 0;
+                i += k; continue;
+              }
+            } else {
+              const P = b.thumb ? mem.pages16[b.idx] : pages32[b.idx];
+              k = P === null ? -1 : b.fn(this, r, mem, P, max - i);
+              if (k >= 0) {
+                i += k;
+                // Stayed hot as JavaScript: queue it for WebAssembly
+                if (this.wasm && b.w === undefined && !b.thumb && ++b.uses >= this.wasmThreshold) {
+                  b.w = null; this.wasmQueue.push(b);
+                  if (this.wasmQueue.length >= 64) this.flushWasm();
+                }
+                continue;
+              }
+            }
             this.blockTab[slot] = null; // the code changed: compile again once it is hot
           }
           jumped = false;

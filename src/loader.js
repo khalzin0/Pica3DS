@@ -169,7 +169,7 @@
     // Segments in .code are page-aligned; .bss follows .data.
     const sz = (s) => Math.max(s.pages * 0x1000, align(s.size));
     const textSz = sz(text), roSz = sz(ro), dataSz = sz(data) + align(bssSize);
-    const image = new Uint8Array(textSz + roSz + dataSz);
+    const image = mem.newBuffer ? mem.newBuffer(textSz + roSz + dataSz) : new Uint8Array(textSz + roSz + dataSz);
     image.set(code.subarray(0, Math.min(code.length, image.length)));
     const fileDataEnd = textSz + roSz + data.size;
     image.fill(0, Math.min(fileDataEnd, image.length));

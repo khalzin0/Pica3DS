@@ -12,11 +12,33 @@
   const PAGE_SIZE = 0x1000;
 
   class Memory {
-    constructor() {
+    // arena: an EMU.Arena (one WebAssembly memory) for the RAM, or null for ordinary arrays
+    constructor(arena = null) {
       this.pages = new Array(0x100000).fill(null);
       this.pages16 = new Array(0x100000).fill(null); // Uint16Array views for aligned fast paths
       this.pages32 = new Array(0x100000).fill(null); // Uint32Array views for aligned fast paths
       this.regions = []; // { base, size, perm, state, name }
+      this.arena = arena;
+      // Page table the WebAssembly CPU reads: arena offset of each page, or 0 when the page is not in the arena
+      this.ptab = arena ? new Int32Array(arena.buffer, EMU.WASM_PTAB, 0x100000) : null;
+    }
+
+    // New zeroed RAM: from the arena when there is room, else an ordinary array (still correct, only slower
+    // for the WebAssembly CPU, which then goes through mem.r32 and friends for it)
+    newBuffer(size) { return (this.arena && this.arena.alloc(size)) || new Uint8Array(size); }
+
+    // Give the arena RAM behind [vaddr, vaddr + size) back (the kernel freeing heap), before it is unmapped
+    release(vaddr, size) {
+      if (!this.arena) return;
+      let runStart = -1, runLen = 0;
+      const flush = () => { if (runLen) this.arena.release(runStart, runLen); runStart = -1; runLen = 0; };
+      for (let i = 0; i < size; i += PAGE_SIZE) {
+        const p = this.pages[(vaddr + i) >>> 12];
+        if (!p || p.buffer !== this.arena.buffer) { flush(); continue; }
+        if (runLen && p.byteOffset === runStart + runLen) runLen += PAGE_SIZE;
+        else { flush(); runStart = p.byteOffset; runLen = PAGE_SIZE; }
+      }
+      flush();
     }
 
     // Map `size` bytes at `vaddr` onto `backing` (a Uint8Array) starting at `offset`.
@@ -38,6 +60,7 @@
       this.pages[idx] = page;
       this.pages16[idx] = page && new Uint16Array(page.buffer, page.byteOffset, PAGE_SIZE / 2);
       this.pages32[idx] = page && new Uint32Array(page.buffer, page.byteOffset, PAGE_SIZE / 4);
+      if (this.ptab) this.ptab[idx] = page && page.buffer === this.arena.buffer ? page.byteOffset : 0;
     }
 
     getPages(vaddr, size) {
@@ -51,7 +74,7 @@
     }
 
     alloc(vaddr, size, perm = 3, state = 5, name = '') {
-      const buf = new Uint8Array(size);
+      const buf = this.newBuffer(size);
       this.map(vaddr, size, buf, 0, perm, state, name);
       return buf;
     }

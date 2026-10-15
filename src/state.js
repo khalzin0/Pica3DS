@@ -10,7 +10,8 @@
     'halted', 'haltReason', 'loaded', 'loadGeneration', 'name', 'savesDirty', 'traceFs', 'pendingReads', 'titleKey']);
   // Per-class fields rebuilt after loading (caches, compiled code, host GPU objects, callbacks)
   const SKIP = {
-    CPU: ['blockTab', 'hot', 'svcHandler'],
+    CPU: ['blockTab', 'hot', 'svcHandler', 'wasmQueue'],
+    Arena: ['wmem', 'buffer', 'u8'],
     Memory: ['pages16', 'pages32'],
     Gpu: ['gl', 'texCache', 'texBytes', 'fullViews', 'state', 'outMap'],
     ShaderUnit: ['compiled', 'compiledBySpec', 'decoded', 'onEmit'],
@@ -22,6 +23,7 @@
   // ------------------------------------------------------------------ write
   function encode(emu) {
     const reg = classes(), ids = new Map(), table = [], buffers = [];
+    const arena = emu.arena || null; // the WebAssembly memory holding the RAM: stored up to its highest allocation
     // Things that stay outside the state: the emulator itself and the game's files
     const ext = new Map(), extBuf = new Map();
     ext.set(emu, 'emu');
@@ -49,6 +51,7 @@
     };
     const entry = (o) => {
       if (ext.has(o)) return { t: 'x', k: ext.get(o) };
+      if (arena && o === arena.buffer) { buffers.push(new Uint8Array(o, 0, arena.top)); return { t: 'b', i: buffers.length - 1, n: o.byteLength, arena: 1 }; }
       if (o instanceof ArrayBuffer) { buffers.push(new Uint8Array(o)); return { t: 'b', i: buffers.length - 1, n: o.byteLength }; }
       if (ArrayBuffer.isView(o)) {
         const ty = o.constructor.name;
@@ -133,6 +136,7 @@
     const { doc, bufs } = await unpack(blob);
     if (doc.meta.game && emu.titleKey && doc.meta.game !== emu.titleKey) throw new Error(`this save state is for another game (${doc.meta.title || doc.meta.game})`);
     const reg = classes(), table = doc.table, objs = new Array(table.length);
+    let arenaMem = null;
     const extern = (k) => {
       if (k === 'emu') return emu;
       if (k === 'romfs') return emu.romfs;
@@ -144,7 +148,13 @@
     table.forEach((e, i) => {
       switch (e.t) {
         case 'x': { const o = extern(e.k); if (o === undefined) throw new Error(`save state needs ${e.k}, which is not loaded`); objs[i] = o; break; }
-        case 'b': objs[i] = bufs[e.i]; break;
+        case 'b':
+          if (e.arena) { // a fresh WebAssembly memory of the same size, with the saved part copied in
+            try { arenaMem = EMU.Arena.newMemory(e.n); } catch (err) { throw new Error('not enough memory on this device to load this state'); }
+            new Uint8Array(arenaMem.buffer).set(new Uint8Array(bufs[e.i]));
+            objs[i] = arenaMem.buffer;
+          } else objs[i] = bufs[e.i];
+          break;
         case 'w': objs[i] = e.s ? new WeakSet() : new WeakMap(); break;
         case 'm': objs[i] = new Map(); break;
         case 's': objs[i] = new Set(); break;
@@ -186,6 +196,7 @@
     emu.pendingReads = 0;
     emu.halted = false; emu.haltReason = null; emu.loaded = true;
     const mem = emu.mem, cpu = emu.cpu, gpu = emu.gpu, kernel = emu.kernel;
+    if (emu.arena && arenaMem) emu.arena.attach(arenaMem);
     mem.pages16 = new Array(mem.pages.length).fill(null);
     mem.pages32 = new Array(mem.pages.length).fill(null);
     for (let i = 0; i < mem.pages.length; i++) if (mem.pages[i]) mem._setPage(i, mem.pages[i]);

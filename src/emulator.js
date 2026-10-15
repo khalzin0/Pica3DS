@@ -56,7 +56,9 @@
       this.insnCount = 0;
       this.frame = 0;
       this.name = name;
-      this.mem = new EMU.Memory();
+      // RAM in one WebAssembly memory when the WebAssembly CPU is on (and the device allows the size)
+      this.arena = this.wasmCpu === true && EMU.Arena ? EMU.Arena.create() : null;
+      this.mem = new EMU.Memory(this.arena);
       this.cpu = new EMU.CPU(this.mem);
       this.kernel = new EMU.Kernel(this);
       this.services = new EMU.Services(this);
@@ -135,6 +137,7 @@
       try {
         if (this.services.instances.has('HID')) this.services.hid.update(this.input);
         this.kernel.runUntil(this.kernel.ticks + EMU.TICKS_PER_FRAME);
+        this.cpu.flushWasm();
         if (this.services.instances.has('gsp::Gpu')) this.services.gsp.vblank();
         if (this.gpu.gl) this.gpu.gl.endFrame();
         this.frame++;

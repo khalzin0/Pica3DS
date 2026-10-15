@@ -3,11 +3,11 @@
 // Each request goes to the network first (so updates arrive straight away) and falls back to the cache when the
 // network is slow or missing.
 'use strict';
-const CACHE = 'pica3ds-v8';
+const CACHE = 'pica3ds-v10';
 const APP = [
   './', 'index.html', 'manifest.webmanifest',
   'assets/icon.svg', 'assets/icon-180.png', 'assets/icon-192.png', 'assets/icon-512.png', 'assets/icon-maskable-512.png',
-  'src/memory.js', 'src/cpu.js', 'src/kernel.js', 'src/services.js', 'src/gpu.js', 'src/glrender.js', 'src/audio.js',
+  'src/memory.js', 'src/wasmjit.js', 'src/cpu.js', 'src/kernel.js', 'src/services.js', 'src/gpu.js', 'src/glrender.js', 'src/audio.js',
   'src/sysdata.js', 'src/loader.js', 'src/emulator.js', 'src/state.js', 'src/demo-rom.js', 'src/main.js',
 ];
 const NETWORK_WAIT_MS = 3000;

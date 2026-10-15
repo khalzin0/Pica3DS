@@ -7,7 +7,7 @@ const vm = require('vm');
 const zlib = require('zlib');
 
 const SRC = path.join(__dirname, '..', 'src');
-for (const f of ['memory.js', 'cpu.js', 'kernel.js', 'services.js', 'gpu.js', 'audio.js', 'sysdata.js', 'loader.js', 'emulator.js']) {
+for (const f of ['memory.js', 'wasmjit.js', 'cpu.js', 'kernel.js', 'services.js', 'gpu.js', 'audio.js', 'sysdata.js', 'loader.js', 'emulator.js']) {
   vm.runInThisContext(fs.readFileSync(path.join(SRC, f), 'utf8'), { filename: f });
 }
 const EMU = globalThis.EMU;

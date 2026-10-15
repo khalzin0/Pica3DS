@@ -290,9 +290,30 @@
 
   // Compilers for ARM code, shaders and rasterization (on by default; off = interpreters, same output, slower)
   let useJit = store.get('jit', '1') !== '0';
+  // Low-power mode: present every other frame, lower display resolution, no performance graph
+  var lowPower = store.get('low-power', '0') === '1', presentTick = 0; // var: read by layoutDisplay, which may run first
+  $('low-power').checked = lowPower;
+  $('low-power').addEventListener('change', () => {
+    lowPower = $('low-power').checked;
+    store.set('low-power', lowPower ? '1' : '0');
+    queueFit(); // display size
+  });
+
+  // WebAssembly CPU: chosen before a game loads (its RAM is then set up in a WebAssembly memory)
+  let useWasm = store.get('wasm-cpu', '0') === '1';
+  emu.wasmCpu = useWasm;
+  $('wasm-cpu').checked = useWasm;
+  $('wasm-cpu').addEventListener('change', () => {
+    useWasm = $('wasm-cpu').checked; emu.wasmCpu = useWasm;
+    store.set('wasm-cpu', useWasm ? '1' : '0');
+    applyJit();
+    if (useWasm && emu.loaded && !emu.arena) toast('Restart the game to use the WebAssembly CPU');
+  });
+
   function applyJit() {
     if (!emu.loaded) return;
     emu.cpu.jit = useJit;
+    emu.cpu.wasm = useJit && useWasm && !!emu.arena; // off at once; on needs a game started with it
     emu.gpu.vs.jit = useJit;
     emu.gpu.rasterJit = useJit;
     emu.gpu.state = null; // rebuild the render state with the chosen rasterizer
@@ -729,7 +750,8 @@
   // sits (those stay underneath for layout and touch)
   function layoutDisplay() {
     if (!display) return;
-    const dev = $('device'), dpr = window.devicePixelRatio || 1;
+    // Pixel density capped: phones report up to 3x, far more pixels than a 400x240 picture needs
+    const dev = $('device'), dpr = Math.min(window.devicePixelRatio || 1, lowPower ? 1.5 : 2);
     glCanvas.style.width = dev.clientWidth + 'px'; glCanvas.style.height = dev.clientHeight + 'px';
     const cr = glCanvas.getBoundingClientRect();
     display.w = Math.max(1, Math.round(cr.width * dpr)); display.h = Math.max(1, Math.round(cr.height * dpr));
@@ -1105,7 +1127,7 @@
       $('bar-' + k).style.width = Math.min(100, parts[k] / 16.7 * 100) + '%';
       $('val-' + k).textContent = n ? parts[k].toFixed(1) + ' ms' : '–';
     }
-    drawGraph();
+    if (!lowPower) drawGraph();
   }
 
   function loop(now) {
@@ -1132,7 +1154,7 @@
     }
     if (acc > FRAME_MS) acc = FRAME_MS; // behind: keep at most one frame due instead of building up a backlog
     audio.flush();
-    if (ran) present();
+    if (ran && (!lowPower || (presentTick++ & 1) === 0)) present();
   }
   requestAnimationFrame(loop);
 

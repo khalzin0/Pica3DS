@@ -21,7 +21,7 @@ Open [pica3ds.netlify.app](https://pica3ds.netlify.app/), or run it locally:
 
 Open `index.html?demo` to start the demo automatically.
 
-**On a phone or tablet:** on-screen controls appear automatically (Circle Pad or D-Pad, A/B/X/Y, L/R, ZL/ZR, Start/Select), in portrait or landscape. For the most screen space, install it: *Add to Home Screen* on iPhone and iPad (Share menu), or *Install app* on Android. It then opens full screen like an app and works offline (the emulator's own files are cached; games stay on your device). Speed depends heavily on the phone; recent high-end phones do best.
+**On a phone or tablet:** on-screen controls appear automatically (Circle Pad or D-Pad, A/B/X/Y, L/R, ZL/ZR, Start/Select), in portrait or landscape. For the most screen space, install it: *Add to Home Screen* on iPhone and iPad (Share menu), or *Install app* on Android. It then opens full screen like an app and works offline (the emulator's own files are cached; games stay on your device). Speed depends heavily on the phone; recent high-end phones do best. On slower phones, turn on **Settings → Low-power mode** (the game keeps full speed; the screens update 30 times a second at a lower resolution).
 
 ## Status
 
@@ -38,16 +38,18 @@ Open `index.html?demo` to start the demo automatically.
 
 | Part | File | Notes |
 |---|---|---|
-| ARM11 CPU | `src/cpu.js` | ARMv6K interpreter: ARM and Thumb instructions, ARMv6 media/SIMD instructions, exclusive loads/stores, and VFPv2 floating point, plus a compiler for hot ARM code |
+| ARM11 CPU | `src/cpu.js` | ARMv6K interpreter: ARM and Thumb instructions, ARMv6 media/SIMD instructions, exclusive loads/stores, and VFPv2 floating point, plus a compiler that turns hot ARM code into JavaScript (including floating point; loops run inside their compiled block) |
+| WebAssembly CPU (experimental) | `src/wasmjit.js` | Optional second compiler tier (**Settings → WebAssembly CPU**): ARM blocks that stay hot are compiled again, to WebAssembly, with the console's RAM in one WebAssembly memory and a page table the generated code reads directly. Off by default: not faster than the JavaScript compiler yet |
 | Memory | `src/memory.js` | 4 KB page table with aligned fast paths |
+| Save states | `src/state.js` | Writes the whole emulated console (memory, CPU, threads, kernel objects, services, GPU and sound state) to a compressed file and reads it back into the same game |
 | Kernel (HLE) | `src/kernel.js` | Threads with a priority scheduler, mutexes, semaphores, events, timers, address arbiters, shared memory, and heap/linear memory (old and new linear heap layouts) |
 | 3D GPU | `src/gpu.js` | PICA200 in software: command lists, vertex and geometry shaders, clipping, rasterizer, all 14 texture formats including ETC1, texture combiners, fragment lighting, fog, and the output merger. This is also the reference the WebGL renderer is checked against |
-| Audio (HLE) | `src/audio.js` | The DSP's audio pipeline: reads the voices the game sets up in DSP shared memory, plays their buffer queues (PCM8, PCM16, DSP-ADPCM), resamples, mixes with the game's gains and reports playback status back. The browser plays it through an AudioWorklet |
-| WebGL renderer | `src/glrender.js` | Draws with your graphics card: vertex shaders translated to GLSL, texture combiners, lighting and fog as generated fragment shaders, render targets kept on the graphics card and copied to emulated memory only when something reads them, display transfers without copies, and both screens drawn straight onto the page (no WebGL-to-2D-canvas copies, which are slow in Safari) |
+| Audio (HLE) | `src/audio.js` | The DSP's audio pipeline: reads the voices the game sets up in DSP shared memory, plays their buffer queues (PCM8, PCM16, DSP-ADPCM), resamples, mixes with the game's gains and reports playback status back. The browser plays it as scheduled buffers, time-stretched (WSOLA) when the game runs below full speed so the pitch stays right |
+| WebGL renderer | `src/glrender.js` | Draws with your graphics card: vertex shaders translated to GLSL, texture combiners, lighting and fog as generated fragment shaders, render targets kept on the graphics card and copied to emulated memory only when something reads them, display transfers without copies, and both screens drawn straight onto the page (no WebGL-to-2D-canvas copies, which are slow in Safari). A per-game shader cache is kept in the browser and built in the background when the game starts again, so effects do not stutter the first time they appear |
 | Services (HLE) | `src/services.js` | `srv:`, `APT` (parameters, shared font, library applets), `gsp::Gpu`, `hid`, `fs` (RomFS, save data, extra data, SD card), `dsp` (with `src/audio.js`), `y2r:u` (YUV to RGB for video), `mic:u` (silence), `ldr:ro` (code modules), `cfg`, `ptm`, `err:f`. Other services are stubbed |
 | System data | `src/sysdata.js` | RomFS builder, plus stand-ins for missing system data (Mii data, system fonts, bad word list) and an empty archive for any other |
-| Loader | `src/loader.js` | `.3dsx`, ARM ELF, and decrypted `.3ds`/`.cci` (NCSD) and `.cxi` (NCCH), including compressed code and RomFS. Games over 256 MB (up to 4 GB cartridges) are not read whole: the code is loaded and game data is read from the file in 1 MB chunks as the game asks for it |
-| Front-end | `index.html`, `src/main.js` | Both screens (stacked, side by side or top only; fit to window or fixed size; fullscreen), sound with volume, rebindable keyboard controls, on-screen touch controls for phones, gamepad, performance graph, settings, system files manager, and a log |
+| Loader | `src/loader.js` | `.3dsx`, ARM ELF, and decrypted `.3ds`/`.cci` (NCSD) and `.cxi` (NCCH), including compressed code and RomFS. Decryption is judged by the contents, so dumps whose header still says "encrypted" load too. Games over 256 MB (up to 4 GB cartridges) are not read whole: the code is loaded and game data is read from the file in 1 MB chunks as the game asks for it |
+| Front-end | `index.html`, `src/main.js` | Both screens (stacked, side by side or top only; fit to window or fixed size; fullscreen), sound with volume, rebindable keyboard controls, on-screen touch controls for phones, gamepad, save states and game saves (**Saves** tab), low-power mode, performance graph, settings, system files manager, and a log. Installable as an app with offline support (`manifest.webmanifest`, `sw.js`) |
 
 ## Games tested
 
@@ -64,7 +66,7 @@ Tested with dumps of games we own, decrypted on our own console, using the defau
 
 Statuses: **Playable** = can be played through what was tested; **Boots** = starts and shows menus; **In progress** = starts, does not reach gameplay yet.
 
-Settings that help with speed: **Settings → Renderer** (graphics card is much faster than software), **Compilers (JIT)**, and **Skip busy background threads**. **Settings → Graphics device** shows whether your browser draws with your graphics card. The **Performance** tab shows FPS, speed and where frame time goes.
+Settings that help with speed: **Settings → Renderer** (graphics card is much faster than software), **Compilers (JIT)**, **Skip busy background threads**, and **Low-power mode** on slower phones. **Settings → Graphics device** shows whether your browser draws with your graphics card. The **Performance** tab shows FPS, speed and where frame time goes.
 
 ## Controls
 
@@ -78,7 +80,14 @@ Settings that help with speed: **Settings → Renderer** (graphics card is much 
 | ZL / ZR | 1 / 2 |
 | Touch screen | Mouse or finger on the bottom screen |
 
-Keys can be changed in the **Controls** tab. Gamepads use the standard browser mapping. Shortcuts: **P** pause, **F** fullscreen, **M** mute (when the key is not bound to a button). Browsers start sound only after a click or key press on the page.
+Keys can be changed in the **Controls** tab. Gamepads use the standard browser mapping. Shortcuts: **P** pause, **F** fullscreen, **M** mute, **Shift+F1–F4** / **F1–F4** save / load a state (when the key is not bound to a button). Browsers start sound only after a click or key press on the page.
+
+## Saves and save states
+
+The **Saves** tab has both:
+
+- **Game saves:** what the game saves itself (save data, extra data, SD card files) is kept in your browser automatically and comes back the next time you open the game. You can download them as a file, restore them from one, or delete them.
+- **Save states:** a snapshot of the whole game at one moment. Four slots per game, plus download/open as a `.p3ds` file. Keyboard: **Shift+F1–F4** saves, **F1–F4** loads. A state loads into the same game only.
 
 ## Games and system files
 
@@ -110,7 +119,7 @@ The tests cover:
 - **GPU regression scenes** (`tests/gpu/regress.js`): seeded random scenes at 400×240 (all texture formats and wrap modes, NaN and huge texture coordinates, blending and logic ops in every color format, stencil, scissor, fog, lighting, clipping). Each scene must give identical bytes from the reference and compiled rasterizers and match a recorded hash.
 - **Texture cache:** partial re-decoding of changed tiles matches a full decode in every tested format.
 - **Stand-in system data:** the bad word list, the shared font archives (LZ11) and the empty fallback archive.
-- **Compilers against interpreters:** random shader programs (`tests/gpu/shaderfuzz.js`) and random ARM instruction sequences (`tests/cpu/armfuzz.js`), plus whole test programs run in lockstep with and without the ARM compiler, comparing registers, flags, screens and memory after every frame.
+- **Compilers against interpreters:** random shader programs (`tests/gpu/shaderfuzz.js`) and random ARM instruction sequences including VFP (`tests/cpu/armfuzz.js`; `--wasm` checks the WebAssembly compiler the same way), plus whole test programs run in lockstep with and without the ARM compiler, comparing registers, flags, screens and memory after every frame.
 
 ### Packaging homebrew as .3ds
 

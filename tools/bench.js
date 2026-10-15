@@ -9,7 +9,7 @@ const path = require('path');
 const vm = require('vm');
 
 const SRC = path.join(__dirname, '..', 'src');
-for (const f of ['memory.js', 'cpu.js', 'kernel.js', 'services.js', 'gpu.js', 'audio.js', 'sysdata.js', 'loader.js', 'emulator.js']) {
+for (const f of ['memory.js', 'wasmjit.js', 'cpu.js', 'kernel.js', 'services.js', 'gpu.js', 'audio.js', 'sysdata.js', 'loader.js', 'emulator.js']) {
   vm.runInThisContext(fs.readFileSync(path.join(SRC, f), 'utf8'), { filename: f });
 }
 const EMU = globalThis.EMU;
@@ -31,6 +31,7 @@ function summarize(times) {
 // Run `rom` and collect per-frame timings. Exported for tools that compare runs.
 function bench(rom, { frames = 600, skip = 0, keys = [], filter = null, present = false, jit = {} } = {}) {
   const emu = new EMU.Emulator({ onLog: () => {}, onHalt: (r) => console.log('[halt]', r.split('\n')[0]) });
+  emu.wasmCpu = process.env.WASM === '1'; // WASM=1: the WebAssembly CPU
   emu.load(new Uint8Array(fs.readFileSync(rom)), path.basename(rom));
   // Each compiler can be switched off (the interpreters give the same results, slower)
   if (jit.cpu === false) emu.cpu.jit = false;

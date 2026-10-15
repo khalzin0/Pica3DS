@@ -444,6 +444,7 @@
           </select>
         </div>
         <div class="field"><label for="smooth">Smooth scaling<small>Blend pixels instead of keeping them sharp</small></label><span class="switch"><input type="checkbox" id="smooth"><i></i></span></div>
+        <div class="field"><label for="low-power">Low-power mode<small>For slower phones and tablets: the game still runs at full speed, but the screens update 30 times a second at a lower resolution, and the performance graph pauses</small></label><span class="switch"><input type="checkbox" id="low-power"><i></i></span></div>
         <div class="field"><label for="show-hud">FPS counter on screen</label><span class="switch"><input type="checkbox" id="show-hud"><i></i></span></div>
       </div>
       <div class="section">
@@ -455,6 +456,7 @@
           </select>
         </div>
         <div class="field"><label for="jit">Compilers (JIT)<small>Turn off only to troubleshoot: same output, slower</small></label><span class="switch"><input type="checkbox" id="jit" checked><i></i></span></div>
+        <div class="field"><label for="wasm-cpu">WebAssembly CPU (experimental)<small>Runs hot game code as WebAssembly instead of JavaScript. Takes effect when a game starts. Not faster than the default yet</small></label><span class="switch"><input type="checkbox" id="wasm-cpu"><i></i></span></div>
         <div class="field"><label for="idle-skip">Skip busy background threads<small>Saves CPU when a game keeps a low-priority thread busy (e.g. Cut the Rope menus). Turn off if something in a game runs too slowly</small></label><span class="switch"><input type="checkbox" id="idle-skip" checked><i></i></span></div>
         <div class="field"><label for="pause-hidden">Pause in the background<small>Pause when you switch tabs or apps, and carry on when you come back</small></label><span class="switch"><input type="checkbox" id="pause-hidden" checked><i></i></span></div>
         <div class="field"><label for="audio-on">Sound</label><span class="switch"><input type="checkbox" id="audio-on" checked><i></i></span></div>
@@ -565,6 +567,7 @@
 })();
 </script>
 <script src="src/memory.js"></script>
+<script src="src/wasmjit.js"></script>
 <script src="src/cpu.js"></script>
 <script src="src/kernel.js"></script>
 <script src="src/services.js"></script>
