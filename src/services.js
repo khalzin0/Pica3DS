@@ -149,7 +149,13 @@
       if (this.font) return this.font;
       const SIZE = 0x332000, ADDR = 0x18000000; // old linear heap address, as on hardware
       const buf = new Uint8Array(SIZE);
-      const cfnt = EMU.buildStandinFont(ADDR + 0x80);
+      // The user's own font when added (per region: JPN/USA/EUR, CHN, KOR, TWN), else a stand-in
+      const fontId = { 4: '0004009b00014102', 5: '0004009b00014202', 6: '0004009b00014302' }[this.emu.region] || '0004009b00014002';
+      const archive = this.emu.systemArchives.get(fontId);
+      let real = null;
+      try { real = archive && EMU.loadSystemFont(archive, ADDR + 0x80); } catch (e) { real = null; }
+      if (real && real.length > SIZE - 0x80) real = null;
+      const cfnt = real || EMU.buildStandinFont(ADDR + 0x80);
       const dv = new DataView(buf.buffer);
       dv.setUint32(0, 2, true);            // status: loaded
       dv.setUint32(4, 1, true);            // font type: JPN/USA/EUR
@@ -159,22 +165,41 @@
       for (let o = 0; o < SIZE; o += 0x1000) pages.push(buf.subarray(o, o + 0x1000));
       // The app converts the address to physical as old linear heap (+0x0C000000); let the GPU find it.
       this.emu.gpuAliases = (this.emu.gpuAliases || []).concat([{ phys: ADDR + 0x0C000000, virt: ADDR, size: SIZE }]);
-      this.emu.log('APT: using a built-in stand-in system font');
+      this.emu.log(real ? `APT: using your system font (${fontId.toUpperCase()})` : 'APT: using a built-in stand-in system font');
       this.font = { addr: ADDR, block: new EMU.KMemBlock(pages, SIZE, ADDR) };
       return this.font;
+    }
+
+    // Is this applet running (1) or not (0)? Under a game: the game, the HOME Menu behind it, and library applets
+    // (started on demand). When the HOME Menu itself runs, no application is.
+    registered(appId) {
+      const self = this.appId || 0x300;
+      if (appId === self) return 1;
+      if (self === 0x300) return appId === 0x101 || (appId >= 0x200 && appId < 0x300) ? 1 : 0;
+      return 0;
     }
 
     handle(ipc, id) {
       const k = this.kernel;
       switch (id) {
         case 0x1: ipc.reply(id, [0, 0, 0], [0x04000000, k.createHandle(this.lock)]); return true; // GetLockHandle
-        case 0x2: // Initialize
+        case 0x2: // Initialize(appId, attributes)
+          this.appId = ipc.get(1); // 0x300 for applications, 0x101 when the HOME Menu itself runs
           ipc.reply(id, [0], [0x04000000, k.createHandle(this.notifEvent), k.createHandle(this.paramEvent)]);
           this.sendToApp({ sender: 0x101, signal: 1, buffer: new Uint8Array(0), object: null }); // HOME menu: wakeup
+          // The HOME Menu reads a wake-up twice at start: in its start-up code, then in its message handler, which
+          // only accepts touch and buttons after receiving a wake-up there (else it stays as if in the background)
+          if (this.appId === 0x101) this.sendToApp({ sender: 0x101, signal: 1, buffer: new Uint8Array(0), object: null });
           return true;
         case 0x3: ipc.reply(id, [0]); return true; // Enable
-        case 0x6: ipc.reply(id, [0, 0, 0, 0, 1, 1, 0]); return true; // GetAppletInfo
-        case 0x9: ipc.reply(id, [0, 1]); return true; // IsRegistered
+        case 0x6: { // GetAppletInfo(appId) -> title ID, media type, registered, loaded, attributes; "not found" if not running
+          const appId = ipc.get(1);
+          if (!this.registered(appId)) { ipc.reply(id, [0xC8E0CFFA]); return true; }
+          const tid = appId === (this.appId || 0x300) && this.emu.titleKey && /^[0-9a-f]{16}$/.test(this.emu.titleKey) ? this.emu.titleKey : '0000000000000000';
+          ipc.reply(id, [0, parseInt(tid.slice(8), 16) >>> 0, parseInt(tid.slice(0, 8), 16) >>> 0, 0, 1, 1, 0]);
+          return true;
+        }
+        case 0x9: ipc.reply(id, [0, this.registered(ipc.get(1))]); return true; // IsRegistered
         case 0xB: ipc.reply(id, [0, 0]); return true; // InquireNotification
         case 0xD: case 0xE: { // ReceiveParameter / GlanceParameter(appId, bufferSize)
           const p = this.params[0];
@@ -184,7 +209,9 @@
           const n = Math.min(max, p.buffer.length);
           if (n) this.mem.writeBytes(dst, p.buffer.subarray(0, n));
           ipc.reply(id, [0, p.sender, p.signal, n], [0, p.object ? k.createHandle(p.object) : 0, (n << 14) | 2, dst]);
-          if (this.params.length) k.signal(this.paramEvent);
+          // More waiting after one was received: signal again. Not after a glance (the parameter is still there, and
+          // a second signal would wake the applet with nothing to read: the HOME Menu then turns its input off)
+          if (id === 0xD && this.params.length) k.signal(this.paramEvent);
           return true;
         }
         case 0x0C: { // SendParameter(src, dst, signal, size, handle, buffer)
@@ -202,6 +229,9 @@
           return true;
         }
         case 0x3B: ipc.reply(id, [0]); return true; // CancelLibraryApplet
+        // PrepareToStartNewestHomeMenu: the running HOME Menu is the newest ("already exists"); any other answer
+        // makes it restart the system to switch to a newer one
+        case 0x1A: ipc.reply(id, [0xC8A0CCBE]); return true;
         case 0xF: ipc.reply(id, [0, 1]); return true; // CancelParameter
         case 0x27: case 0x28: // CloseApplication
           ipc.reply(id, [0]);
@@ -521,11 +551,14 @@
     }
 
     update(input) {
-      const dv = this.dv, tick = Math.floor(this.kernel.ticks);
+      const dv = this.dv, tick = Math.floor(this.kernel.ticks), prevTick = this.lastTick || 0;
+      this.lastTick = tick;
       const idx = this.index = (this.index + 1) & 7;
+      // 64-bit tick counts (the clock passes 2^32 after 16 s): this update's, and the previous update's. Readers that
+      // use them (the HOME Menu) count new entries from them, so they must be real and keep increasing.
+      const put64 = (o, v) => { dv.setUint32(o, v % 4294967296, true); dv.setUint32(o + 4, Math.floor(v / 4294967296), true); };
       // PAD section (words 0..41)
-      dv.setUint32(0x00, tick >>> 0, true); dv.setUint32(0x04, 0, true);
-      dv.setUint32(0x08, (tick - 1000) >>> 0, true); dv.setUint32(0x0C, 0, true);
+      put64(0x00, tick); put64(0x08, prevTick);
       dv.setUint32(0x10, idx, true);
       let keys = input.keys;
       const cx = input.cx, cy = input.cy;
@@ -538,15 +571,19 @@
       dv.setUint32(e + 4, (keys & ~prev) >>> 0, true);
       dv.setUint32(e + 8, (prev & ~keys) >>> 0, true);
       dv.setInt16(e + 12, cx, true); dv.setInt16(e + 14, cy, true);
+      // The current state outside the history (the HOME Menu reads these; games read the entries)
+      dv.setUint32(0x1C, keys >>> 0, true);
+      dv.setInt16(0x20, cx, true); dv.setInt16(0x22, cy, true);
       this.prevKeys = keys;
       // Touch section (words 42..)
       const tb = 42 * 4;
-      dv.setUint32(tb, tick >>> 0, true); dv.setUint32(tb + 4, 0, true);
-      dv.setUint32(tb + 8, (tick - 1000) >>> 0, true); dv.setUint32(tb + 12, 0, true);
+      put64(tb, tick); put64(tb + 8, prevTick);
       dv.setUint32(tb + 16, idx, true);
       const te = tb + 32 + idx * 8;
       dv.setUint16(te, input.touch ? input.tx : 0, true); dv.setUint16(te + 2, input.touch ? input.ty : 0, true);
       dv.setUint32(te + 4, input.touch ? 1 : 0, true);
+      dv.setUint16(tb + 0x18, input.touch ? input.tx : 0, true); dv.setUint16(tb + 0x1A, input.touch ? input.ty : 0, true); // current
+      dv.setUint32(tb + 0x1C, input.touch ? 1 : 0, true);
       for (const ev of this.events.slice(0, 2)) this.kernel.signalEvent(ev);
     }
   }
@@ -805,7 +842,30 @@
         case 0x803: { // OpenFileDirectly(transaction, archiveId, archPath, filePath, flags)
           const aid = ipc.get(2);
           if (aid === 3 || (aid === 0x2345678A && ipc.get(3) === 1)) return this.openRomfs(ipc, id);
-          if (aid === 0x2345678A) { // another title's RomFS (system data such as Mii data or fonts)
+          if (aid === 0x2345678A) { // another title's RomFS (system data such as Mii data or fonts) or ExeFS
+            // Binary file path (0x14 bytes): [u32 open type, u32 content index, u32 kind (0 RomFS, 1 code, 2 ExeFS),
+            // ExeFS file name (8 bytes)]
+            const fp = ipc.get(12), wide = ipc.get(5) === 2 && ipc.get(6) >= 0x14;
+            const kind = wide ? this.mem.r32((fp + 8) >>> 0) : 0;
+            if (kind === 2) {
+              const name = this.mem.readCString((fp + 12) >>> 0, 8);
+              const ap = ipc.get(10);
+              const tid = (this.mem.r32((ap + 4) >>> 0).toString(16).padStart(8, '0') + this.mem.r32(ap >>> 0).toString(16).padStart(8, '0')).toLowerCase();
+              // A title added from the user's console (see Settings -> System files), else a stand-in icon. Other
+              // files (such as the start-up logo, which the HOME Menu checks is signed) only come from added titles.
+              const added = this.emu.titleExefs && this.emu.titleExefs.get(tid);
+              const data = added && added[name] ? added[name] : name === 'icon' ? EMU.buildStandinSmdh(tid) : null;
+              if (!data) {
+                this.emu.log(`fs: title ${tid.toUpperCase()} is needed (its "${name}" file). Dump it from your 3DS and add it with "System files…".`);
+                this.emu.missingSystemArchive = { id: tid, name: EMU.SYSTEM_ARCHIVE_NAMES[tid] || null, empty: true };
+                ipc.reply(id, [ERR_NOT_FOUND, 0, 0]);
+                return true;
+              }
+              if (!added) this.emu.log(`fs: ${name} of title ${tid.toUpperCase()} requested; using a stand-in`);
+              const h = this.kernel.createHandle(new EMU.KSession(new FileService(this.emu, `${name} ${tid}`, data)));
+              ipc.reply(id, [0], [0x10, h]);
+              return true;
+            }
             const romfs = this.systemArchive(ipc.get(10));
             if (!romfs) { ipc.reply(id, [ERR_NOT_FOUND, 0, 0]); return true; }
             const h = this.kernel.createHandle(new EMU.KSession(new FileService(this.emu, 'system RomFS', romfs)));
@@ -1083,14 +1143,15 @@
           }
           else if (blk === 0x70001) data[0] = 1;                  // sound output: stereo
           else if (blk === 0xD0000 && size >= 2) { data[0] = 0x7F; data[1] = 0x7F; } // accepted EULA version
+          else if (blk === 0x110000) data[0] = 1;                // initial setup done (0: the HOME Menu runs System Settings' setup)
           else if (blk === 0xA0002) data[0] = 1;                  // language: English
-          else if (blk === 0xB0000 && size >= 4) { data[2] = 1; data[3] = 49; } // country: USA
+          else if (blk === 0xB0000 && size >= 4) { data[2] = 1; data[3] = { 0: 1, 2: 110, 4: 160, 5: 136, 6: 128 }[this.emu.region] || 49; } // country: Japan, USA, UK, China, Korea, Taiwan
           else if (blk === 0xA0000) { const n = 'Emu'; for (let i = 0; i < n.length; i++) data[i * 2] = n.charCodeAt(i); }
           try { this.mem.writeBytes(ptr, data); } catch (e) { /* ignore bad buffers */ }
           ipc.reply(id, [0], [(size << 4) | 0xC, ptr]);
           return true;
         }
-        case 0x2: ipc.reply(id, [0, 1]); return true;          // SecureInfoGetRegion: USA
+        case 0x2: ipc.reply(id, [0, this.emu.region == null ? 1 : this.emu.region]); return true; // SecureInfoGetRegion
         case 0x3: ipc.reply(id, [0, 0x12345678, 0x9ABC]); return true;
         case 0x4: case 0x5: ipc.reply(id, [0, 0]); return true; // GetRegionCanadaUSA, GetSystemModel (CTR)
         case 0x6: ipc.reply(id, [0, 1]); return true;          // GetModelNintendo2DS: not a 2DS
@@ -1304,8 +1365,9 @@
         this.put(offset + i, silent & 0xFF);
         if (pcm16) this.put(offset + i + 1, silent >>> 8);
       }
-      // The last word of the shared memory holds the current write position: the buffer is full
-      const end = this.blockSize - 4, pos = size;
+      // The last word of the shared memory holds the write position: an offset inside the sample buffer (readers
+      // walk from their last position up to it, wrapping at the end, so a value of size or more never ends)
+      const end = this.blockSize - 4, pos = 0;
       for (let b = 0; b < 4; b++) this.put(end + b, (pos >>> (b * 8)) & 0xFF);
       // Signal "buffer full" each time the buffer would have filled at the sample rate
       const bytesPerSec = MIC_RATES[rate & 3] * (1 + pcm16), k = this.kernel;
@@ -1672,6 +1734,12 @@
   const STUB_EVENTS = {
     'cecd:u': [0x0F, 0x10], 'cecd:s': [0x0F, 0x10], // GetCecInfoEventHandle, GetChangeStateEventHandle
     'ir:USER': [0x0C, 0x0D, 0x0E],                // GetReceiveEvent, GetSendEvent, GetConnectionStatusEvent
+    'nim:u': [0x05, 0x06],                        // GetBackgroundEventForMenu, GetBackgroundEventForNews
+  };
+  // Commands that start an asynchronous task and hand out its "done" event: the task finishes at once (signalled),
+  // with nothing to do (no network)
+  const STUB_ASYNC = {
+    'nim:u': [0x11, 0x12], // UpdateAutoTitleDownloadTasksAsync, StartPendingAutoTitleDownloadTasksAsync
   };
 
   class StubService extends Service {
@@ -1683,6 +1751,14 @@
         ipc.reply(id, [0], [0, this.kernel.createHandle(map.get(id))]);
         return true;
       }
+      const asyncCmds = STUB_ASYNC[this.name];
+      if (asyncCmds && asyncCmds.includes(id)) {
+        const done = new EMU.KEvent(1, `${this.name} task ${hex(id, 4)}`);
+        done.signaled = true;
+        ipc.reply(id, [0], [0, this.kernel.createHandle(done)]);
+        return true;
+      }
+      if (this.name === 'nim:u' && id === 0x13) { ipc.reply(id, [0, 0, 0]); return true; } // GetAsyncResult: success
       if (this.name.startsWith('cecd:') && id === 0x0E) { ipc.reply(id, [0, 1]); return true; } // GetCecStateAbbreviated: idle
       return false;
     }

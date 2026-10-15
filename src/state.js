@@ -7,7 +7,7 @@
   const MAGIC = 'P3DS-STATE', VERSION = 1;
   // Emulator fields that belong to the page or the current load, not to the console
   const EMU_SKIP = new Set(['onLog', 'onDebug', 'onHalt', 'onAudio', 'glRenderer', 'systemArchives', 'romfs', 'perf', 'input',
-    'halted', 'haltReason', 'loaded', 'loadGeneration', 'name', 'savesDirty', 'traceFs', 'pendingReads', 'titleKey']);
+    'halted', 'haltReason', 'loaded', 'loadGeneration', 'name', 'savesDirty', 'traceFs', 'pendingReads', 'titleKey', 'titleExefs']);
   // Per-class fields rebuilt after loading (caches, compiled code, host GPU objects, callbacks)
   const SKIP = {
     CPU: ['blockTab', 'hot', 'svcHandler', 'wasmQueue'],

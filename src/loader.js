@@ -80,6 +80,15 @@
     return s || null;
   }
 
+  // Console region a title is made for (0 JPN, 1 USA, 2 EUR, 4 CHN, 5 KOR, 6 TWN), from its SMDH region lockout;
+  // null for titles sold in several of them
+  function smdhRegion(smdh) {
+    if (!smdh || smdh.length < 0x2020 || String.fromCharCode(...smdh.subarray(0, 4)) !== 'SMDH') return null;
+    const lock = new DataView(smdh.buffer, smdh.byteOffset, smdh.byteLength).getUint32(0x2018, true) & 0x7F;
+    const regions = [[1, 0], [2, 1], [4 | 8, 2], [0x10, 4], [0x20, 5], [0x40, 6]].filter(([bits]) => lock & bits);
+    return regions.length === 1 ? regions[0][1] : null;
+  }
+
   // Reverse LZSS ("BLZ") used for compressed ExeFS .code sections.
   function blzDecompress(c) {
     const dv = new DataView(c.buffer, c.byteOffset, c.byteLength);
@@ -193,6 +202,7 @@
       entry: text.addr, size: image.length, format: 'NCCH', romfs, kernelVersion, appMemory,
       stackSize, priority: priority || 0x30,
       title: files.icon ? smdhTitle(files.icon) : null,
+      region: smdhRegion(files.icon),
       programId: dv.getBigUint64(0x118, true).toString(16).padStart(16, '0'),
       cryptoFlagUnset: flagMismatch,
     };
@@ -205,6 +215,53 @@
     if (!off || !size || off + 0x200 > bytes.length) throw new EMU.EmuError('.3ds image has no game partition');
     const info = loadNcch(mem, bytes.subarray(off, Math.min(bytes.length, off + size)), mediaUnit);
     info.format = 'NCSD (.3ds)';
+    return info;
+  }
+
+  // CIA (installable title): header, certificate chain, ticket, title metadata (TMD), then the contents. Content 0
+  // is the title's NCCH. Only decrypted CIAs can be used (e.g. GodMode9 "Decrypt file" on a CIA built from your own
+  // console); contents encrypted with the title key need Nintendo's keys, which this emulator does not have.
+  // head: at least the bytes up to the end of the TMD. Returns { offset, size, titleId } of content 0.
+  const align64 = (v) => Math.ceil(v / 64) * 64;
+  const SIG_SIZE = { 0x10000: 0x240, 0x10001: 0x140, 0x10002: 0x7C, 0x10003: 0x240, 0x10004: 0x140, 0x10005: 0x7C };
+  function isCia(bytes) {
+    return bytes.length >= 0x20 && bytes[0] === 0x20 && bytes[1] === 0x20 && bytes[2] === 0 && bytes[3] === 0 && bytes[4] === 0 && bytes[5] === 0;
+  }
+  function ciaLayout(head) {
+    const dv = new DataView(head.buffer, head.byteOffset, head.byteLength);
+    const hdr = dv.getUint32(0, true), certs = dv.getUint32(8, true), ticket = dv.getUint32(0xC, true), tmd = dv.getUint32(0x10, true);
+    const tmdOff = align64(hdr) + align64(certs) + align64(ticket);
+    const contentOff = tmdOff + align64(tmd);
+    if (tmdOff + 0x200 > head.length) return { need: tmdOff + tmd };
+    const sig = SIG_SIZE[dv.getUint32(tmdOff, false)];
+    if (!sig) throw new EMU.EmuError('Bad CIA: unknown TMD signature type');
+    const h = tmdOff + sig;
+    if (h + 0x9C4 + 0x30 > head.length) return { need: tmdOff + tmd };
+    const titleId = dv.getBigUint64(h + 0x4C, false).toString(16).padStart(16, '0');
+    const count = dv.getUint16(h + 0x9E, false);
+    // Contents follow each other in TMD order; content 0 (the NCCH) comes first when present
+    let off = contentOff;
+    for (let i = 0; i < count; i++) {
+      const c = h + 0x9C4 + i * 0x30;
+      if (c + 0x30 > head.length) return { need: c + 0x30 };
+      const index = dv.getUint16(c + 4, false), type = dv.getUint16(c + 6, false), size = Number(dv.getBigUint64(c + 8, false));
+      if (index === 0) {
+        if (type & 1) throw new EMU.EmuError('This .cia is encrypted. Only decrypted CIAs can be used: decrypt it on your 3DS first (GodMode9: select the .cia, then "CIA image options" -> "Decrypt file"), or use a decrypted .3ds/.cxi.');
+        return { offset: off, size, titleId };
+      }
+      off += size;
+    }
+    throw new EMU.EmuError('This .cia has no main program (content 0)');
+  }
+  EMU.ciaLayout = ciaLayout;
+
+  function loadCia(mem, bytes) {
+    const c = ciaLayout(bytes);
+    if (c.need || c.offset + 0x200 > bytes.length) throw new EMU.EmuError('Bad CIA: file is cut short');
+    const content = bytes.subarray(c.offset, Math.min(bytes.length, c.offset + c.size));
+    if (String.fromCharCode(...content.subarray(0x100, 0x104)) !== 'NCCH') throw new EMU.EmuError('This .cia is encrypted. Only decrypted CIAs can be used.');
+    const info = loadNcch(mem, content);
+    info.format = 'CIA';
     return info;
   }
 
@@ -246,6 +303,7 @@
 
   // A system data archive (e.g. Mii data, shared font): the decrypted .app content of a data-only title.
   EMU.parseSystemArchive = function (bytes) {
+    if (isCia(bytes)) { const c = ciaLayout(bytes); if (!c.need) bytes = bytes.subarray(c.offset, c.offset + c.size); }
     const ascii = (o, n) => String.fromCharCode(...bytes.subarray(o, o + n));
     if (bytes.length < 0x200 || ascii(0x100, 4) !== 'NCCH') throw new EMU.EmuError('Not a system data file (expected a decrypted .app containing an NCCH)');
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -254,9 +312,27 @@
     const romfsOff = dv.getUint32(0x1B0, true) * 0x200, romfsSize = dv.getUint32(0x1B4, true) * 0x200;
     // Judged by the contents (a plain RomFS starts with "IVFC"), as some tools leave the "no crypto" flag unset
     const plainRomfs = romfsOff && romfsOff + 4 <= bytes.length && ascii(romfsOff, 4) === 'IVFC';
-    if (!(flags[7] & 4) && !plainRomfs) throw new EMU.EmuError(`System file ${titleId} is encrypted. Decrypt it on your 3DS first (GodMode9: "NCCH image options" -> "Decrypt file").`);
-    if (!romfsOff || romfsSize <= 0x1000 || (flags[7] & 2) || romfsOff + romfsSize > bytes.length) throw new EMU.EmuError(`System file ${titleId} has no RomFS`);
-    return { titleId, romfs: bytes.slice(romfsOff + 0x1000, romfsOff + romfsSize), executable: !!(flags[5] & 2), name: EMU.SYSTEM_ARCHIVE_NAMES[titleId] || null };
+    const executable = !!(flags[5] & 2);
+    // ExeFS files other titles may read (icon, start-up logo, banner)
+    const exefs = {}, exefsOff = dv.getUint32(0x1A0, true) * 0x200;
+    let plainExefs = false;
+    if (exefsOff && exefsOff + 0x200 <= bytes.length) {
+      for (let i = 0; i < 10; i++) {
+        const e = exefsOff + i * 16, name = ascii(e, 8).replace(/\0.*$/, '');
+        if (!name) continue;
+        if (!/^[ -~]+$/.test(name)) { plainExefs = false; break; }
+        plainExefs = true;
+        const off = exefsOff + 0x200 + dv.getUint32(e + 8, true), size = dv.getUint32(e + 12, true);
+        if ((name === 'icon' || name === 'logo' || name === 'banner') && off + size <= bytes.length) exefs[name] = bytes.slice(off, off + size);
+      }
+    }
+    // Titles built for firmware 5.0 and later keep the start-up logo in the NCCH logo region instead of the ExeFS
+    const logoOff = dv.getUint32(0x198, true) * 0x200, logoSize = dv.getUint32(0x19C, true) * 0x200;
+    if (!exefs.logo && logoOff && logoSize && logoOff + logoSize <= bytes.length) exefs.logo = bytes.slice(logoOff, logoOff + logoSize);
+    if (!(flags[7] & 4) && !plainRomfs && !(executable && plainExefs)) throw new EMU.EmuError(`System file ${titleId} is encrypted. Decrypt it on your 3DS first (GodMode9: "NCCH image options" -> "Decrypt file").`);
+    const hasRomfs = romfsOff && romfsSize > 0x1000 && !(flags[7] & 2) && romfsOff + romfsSize <= bytes.length;
+    if (!hasRomfs && !executable) throw new EMU.EmuError(`System file ${titleId} has no RomFS`);
+    return { titleId, romfs: hasRomfs ? bytes.slice(romfsOff + 0x1000, romfsOff + romfsSize) : null, exefs, executable, name: EMU.SYSTEM_ARCHIVE_NAMES[titleId] || null };
   };
 
   // Part of a large file read on demand (games too big to load whole): 1 MB chunks of a Blob fetched
@@ -319,6 +395,15 @@
     if (ascii(head, 0x100) === 'NCSD') {
       mu = 0x200 << head[0x188 + 6];
       part = new DataView(head.buffer).getUint32(0x120, true) * mu;
+    } else if (isCia(head)) { // header and TMD first, to find the NCCH
+      let n = 0x4000, c;
+      for (;;) {
+        c = ciaLayout(new Uint8Array(await file.slice(0, n).arrayBuffer()));
+        if (!c.need) break;
+        if (n >= c.need || n > 0x100000) throw new EMU.EmuError('Bad CIA header');
+        n = c.need + 0x1000;
+      }
+      part = c.offset;
     } else if (ascii(head, 0x100) !== 'NCCH') return whole(); // not a cartridge image: the loader reports it
     const ncch = new DataView(await file.slice(part, part + 0x200).arrayBuffer());
     const exefsEnd = (ncch.getUint32(0x1A0, true) + ncch.getUint32(0x1A4, true)) * mu;
@@ -334,9 +419,7 @@
     const magic = bytes.length > 0x200 ? String.fromCharCode(...bytes.subarray(0x100, 0x104)) : '';
     if (magic === 'NCSD') return loadNcsd(mem, bytes);
     if (magic === 'NCCH') return loadNcch(mem, bytes);
-    if (bytes.length > 0x2040 && String.fromCharCode(...bytes.subarray(0, 4)) === ' \0\0\0') {
-      throw new EMU.EmuError('.cia files are not supported. Use a decrypted .3ds/.cxi, or a .3dsx/.elf.');
-    }
-    throw new EMU.EmuError('Unrecognized file format. Expected .3dsx, .elf, or a decrypted .3ds/.cxi.');
+    if (isCia(bytes)) return loadCia(mem, bytes);
+    throw new EMU.EmuError('Unrecognized file format. Expected .3dsx, .elf, or a decrypted .3ds/.cci/.cxi/.cia.');
   };
 })(typeof window !== 'undefined' ? window.EMU : globalThis.EMU);

@@ -285,5 +285,74 @@
   // Any other system data archive: an empty one, so games that only check for it carry on. A game that reads a
   // file from it gets "not found".
   EMU.buildEmptyArchive = () => buildRomfs({});
+
+  // LZ11 decompression (type 0x11 header: 24-bit size, or 0 followed by a 32-bit size)
+  function lz11Decompress(src) {
+    let n = src[1] | (src[2] << 8) | (src[3] << 16), i = 4;
+    if (!n) { n = (src[4] | (src[5] << 8) | (src[6] << 16) | (src[7] << 24)) >>> 0; i = 8; }
+    const out = new Uint8Array(n);
+    let o = 0;
+    while (o < n && i < src.length) {
+      const flags = src[i++];
+      for (let bit = 7; bit >= 0 && o < n; bit--) {
+        if (!(flags & (1 << bit))) { out[o++] = src[i++]; continue; }
+        const b0 = src[i++];
+        let len, disp;
+        switch (b0 >>> 4) {
+          case 0: { const b1 = src[i++], b2 = src[i++]; len = (((b0 & 0xF) << 4) | (b1 >>> 4)) + 0x11; disp = (((b1 & 0xF) << 8) | b2) + 1; break; }
+          case 1: { const b1 = src[i++], b2 = src[i++], b3 = src[i++]; len = (((b0 & 0xF) << 12) | (b1 << 4) | (b2 >>> 4)) + 0x111; disp = (((b2 & 0xF) << 8) | b3) + 1; break; }
+          default: { const b1 = src[i++]; len = (b0 >>> 4) + 1; disp = (((b0 & 0xF) << 8) | b1) + 1; }
+        }
+        for (let k = 0; k < len && o < n; k++, o++) out[o] = out[o - disp];
+      }
+    }
+    return out;
+  }
+  EMU.lz11Decompress = lz11Decompress;
+
+  // The real system font from the user's shared font archive, ready to be placed at address base: the BCFNT's
+  // section pointers become addresses (base + file offset) and the magic becomes "CFNU", as the system does when it
+  // loads the font. Null when the archive has no font.
+  EMU.loadSystemFont = function (romfs, base) {
+    const f = listRomfs(romfs).find((e) => /\.bcfnt(\.lz)?$/.test(e.path));
+    if (!f) return null;
+    let font = romfs.slice(f.offset, f.offset + f.size);
+    if (font[0] === 0x11) font = lz11Decompress(font);
+    const ascii = (o) => String.fromCharCode(font[o], font[o + 1], font[o + 2], font[o + 3]);
+    if (ascii(0) !== 'CFNT' && ascii(0) !== 'CFNU') return null;
+    const dv = new DataView(font.buffer, font.byteOffset, font.byteLength);
+    // Where the pointers point now: TGLP's pointer in FINF minus TGLP's real position (+8 past its header)
+    const finf = dv.getUint16(6, true);
+    let tglp = -1;
+    for (let o = finf; o + 4 <= font.length; o += 4) if (ascii(o) === 'TGLP') { tglp = o; break; }
+    if (ascii(finf) !== 'FINF' || tglp < 0) return null;
+    const delta = (base - (dv.getUint32(finf + 0x10, true) - (tglp + 8))) >>> 0;
+    const fix = (o) => { const v = dv.getUint32(o, true); if (v) dv.setUint32(o, (v + delta) >>> 0, true); };
+    const off = (p) => ((p - base) >>> 0); // address -> file offset (after fixing)
+    fix(finf + 0x10); fix(finf + 0x14); fix(finf + 0x18);
+    fix(tglp + 0x1C); // sheet data
+    for (let p = dv.getUint32(finf + 0x14, true); p; ) { const o = off(p) - 8; fix(o + 0x0C); p = dv.getUint32(o + 0x0C, true); } // CWDH chain
+    for (let p = dv.getUint32(finf + 0x18, true); p; ) { const o = off(p) - 8; fix(o + 0x10); p = dv.getUint32(o + 0x10, true); } // CMAP chain
+    font.set([0x43, 0x46, 0x4E, 0x55]); // "CFNU"
+    return font;
+  };
+
+  // Stand-in SMDH (a title's icon and names, the ExeFS "icon" file) for titles that are not added: the HOME Menu
+  // reads these for the system applications it shows. Names for known system titles (any region), else the ID.
+  const SYSTEM_APP_NAMES = { 0x00020000: 'System Settings', 0x00020700: 'Mii Maker' };
+  EMU.buildStandinSmdh = function (titleId) {
+    const smdh = new Uint8Array(0x36C0), dv = new DataView(smdh.buffer);
+    smdh.set([0x53, 0x4D, 0x44, 0x48]); // "SMDH"
+    const low = parseInt(titleId.slice(8), 16);
+    const name = SYSTEM_APP_NAMES[(low & ~0xF000) >>> 0] || `Title ${titleId.toUpperCase()}`;
+    const put = (off, max, s) => { for (let i = 0; i < Math.min(s.length, max / 2 - 1); i++) dv.setUint16(off + i * 2, s.charCodeAt(i), true); };
+    for (let lang = 0; lang < 16; lang++) { // short name, long name, publisher
+      const t = 0x8 + lang * 0x200;
+      put(t, 0x80, name); put(t + 0x80, 0x100, name); put(t + 0x180, 0x80, 'Nintendo');
+    }
+    dv.setUint32(0x2018, 0x7FFFFFFF, true); // region lock: all regions
+    for (let o = 0x2040; o < 0x36C0; o += 2) dv.setUint16(o, 0x7BEF, true); // icons: plain grey (RGB565)
+    return smdh;
+  };
   EMU.lz11Literal = lz11Literal;
 })(typeof window !== 'undefined' ? window.EMU : globalThis.EMU);

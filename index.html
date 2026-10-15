@@ -300,7 +300,7 @@
     <span class="pill" id="status"><i></i><span id="status-text">Idle</span></span>
   </div>
   <div class="toolbar">
-    <label class="btn primary" for="file" title="Open a game (.3ds, .cci, .cxi, .3dsx, .elf)">
+    <label class="btn primary" for="file" title="Open a game (.3ds, .cci, .cxi, .cia, .3dsx, .elf)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span class="lbl">Open</span>
     </label>
     <button class="btn icon" id="pause" disabled title="Pause (P)" aria-label="Pause">
@@ -324,7 +324,7 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>
     </button>
   </div>
-  <input type="file" id="file" accept=".3dsx,.elf,.axf,.3ds,.cci,.cxi">
+  <input type="file" id="file" accept=".3dsx,.elf,.axf,.3ds,.cci,.cxi,.cia,.app">
   <input type="file" id="sysfiles" multiple>
 </header>
 
@@ -364,10 +364,11 @@
           <div class="row">
             <label class="btn primary" for="file">Open a game…</label>
             <button class="btn" id="ov-demo">Run the demo</button>
+            <button class="btn" id="ov-home" hidden>Start HOME Menu</button>
           </div>
         </div>
-        <div class="formats"><span>.3ds</span><span>.cci</span><span>.cxi</span><span>.3dsx</span><span>.elf</span></div>
-        <p class="note">Games must be decrypted on your own console. Encrypted dumps and .cia files are not supported.</p>
+        <div class="formats"><span>.3ds</span><span>.cci</span><span>.cxi</span><span>.cia</span><span>.3dsx</span><span>.elf</span></div>
+        <p class="note">Games must be decrypted on your own console (this includes .cia files). Encrypted dumps are not supported.</p>
         <div class="install" id="install" hidden>
           <button class="btn" id="install-btn" hidden>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>Install as an app
@@ -465,8 +466,9 @@
       <div class="section">
         <h4>System files</h4>
         <p class="note" id="sys-status">System files: none</p>
-        <p class="note" style="margin-top:6px">Mii data, fonts and the bad word list have built-in stand-ins. Real files dumped and decrypted from your own 3DS (GodMode9) can be added here.</p>
+        <p class="note" style="margin-top:6px">Mii data, fonts and the bad word list have built-in stand-ins. Real files dumped and decrypted from your own 3DS (GodMode9) can be added here: system data, built-in apps (System Settings, Mii Maker…) and the HOME Menu (.app or .cia).</p>
         <div class="row" style="justify-content:flex-start;margin-top:10px">
+          <button class="btn small primary" id="sys-home" hidden>Start HOME Menu</button>
           <label class="btn small" for="sysfiles">Add system files…</label>
           <button class="btn small" id="sys-clear" disabled>Remove all</button>
         </div>

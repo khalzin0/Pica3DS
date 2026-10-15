@@ -4,6 +4,16 @@
 
   const hex = EMU.hex;
 
+  // Region of a system title from its ID (their icons list every region): HOME Menu IDs per region, and system
+  // applications (0004001x) numbered 0x2x000 with x = 0 Japan, 1 USA, 2 Europe. USA when unknown.
+  const HOME_MENU_REGIONS = { '0004003000008202': 0, '0004003000008f02': 1, '0004003000009802': 2, '000400300000a102': 4, '000400300000a902': 5, '000400300000b102': 6 };
+  function regionFromTitleId(id) {
+    if (!id) return 1;
+    if (id in HOME_MENU_REGIONS) return HOME_MENU_REGIONS[id];
+    const low = parseInt(id.slice(8), 16), r = (low >>> 12) & 0xF;
+    return /^0004001[0-9a-f]/.test(id) && (low & 0xFFF00000) === 0 && r <= 2 ? r : 1;
+  }
+
   class Emulator {
     constructor({ onLog = () => {}, onDebug = () => {}, onHalt = () => {} } = {}) {
       this.onLog = onLog;
@@ -19,6 +29,9 @@
     }
 
     addSystemArchive(titleId, romfs) { this.systemArchives.set(titleId.toLowerCase(), romfs); }
+
+    // ExeFS files of a title added from the user's console ({ icon, logo, banner }), read by other titles
+    addTitleExefs(titleId, files) { (this.titleExefs || (this.titleExefs = new Map())).set(titleId.toLowerCase(), files); }
 
     // Draw with the host GPU (an EMU.GLRenderer) or, with null, the software rasterizer. Can change while running.
     setRenderer(renderer) {
@@ -105,6 +118,8 @@
       this.loaded = true;
       if (info.cryptoFlagUnset) this.log('This game is marked as encrypted in its header, but its contents are decrypted: loading it anyway.');
       this.title = info.title || null;
+      // Console region: the one the title is made for (a European HOME Menu needs a European console), else USA
+      this.region = info.region != null ? info.region : regionFromTitleId(info.programId);
       this.titleKey = info.programId || name; // which game: saves and save states are kept per game
       const extras = [info.title && `"${info.title}"`, info.programId && `title ID ${info.programId}`, info.romfs && `RomFS ${(info.romfs.length / 1024).toFixed(0)} KB`].filter(Boolean).join(', ');
       this.log(`Loaded ${name} (${info.format}, code ${(info.size / 1024).toFixed(0)} KB${extras ? ', ' + extras : ''}), entry ${hex(info.entry)}`);

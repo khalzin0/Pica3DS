@@ -16,7 +16,7 @@ Open [pica3ds.netlify.app](https://pica3ds.netlify.app/), or run it locally:
 
 1. Download or clone this repository.
 2. Open `index.html` in a browser. Double-clicking it usually works; if your browser blocks something when opened from a file, serve the folder instead (for example `npx serve` or `python -m http.server`) and open the address it prints.
-3. Click **Open** and choose a `.3dsx`, `.elf`, or decrypted `.3ds` / `.cci` / `.cxi` file, drag a file onto the page, or press **Run the demo**.
+3. Click **Open** and choose a `.3dsx`, `.elf`, or decrypted `.3ds` / `.cci` / `.cxi` / `.cia` file, drag a file onto the page, or press **Run the demo**.
 4. Click anywhere on the page once to let the browser start sound.
 
 Open `index.html?demo` to start the demo automatically.
@@ -32,7 +32,7 @@ Open `index.html?demo` to start the demo automatically.
 | | Geometry shaders: point mode (the mode citro3d uses); variable- and fixed-size primitive modes are not emulated yet | |
 | Save data and extra data (kept in the browser), save states | System applets: the Mii selector picks a stand-in Mii; the keyboard and error display close straight away | Networking, camera, the stereoscopic 3D effect |
 | Sound: 24 DSP voices, PCM8/PCM16/DSP-ADPCM, mixing and volume | Microphone (records silence), video (`y2r` colour conversion) | |
-| System files from your own console, or built-in stand-ins | Code modules loaded at run time (`ldr:ro` / CRO) | `.cia` files and encrypted games |
+| System files from your own console, or built-in stand-ins | Code modules loaded at run time (`ldr:ro` / CRO); the HOME Menu (see below) | Encrypted games and encrypted `.cia` files |
 
 ## How it works
 
@@ -48,7 +48,7 @@ Open `index.html?demo` to start the demo automatically.
 | WebGL renderer | `src/glrender.js` | Draws with your graphics card: vertex shaders translated to GLSL, texture combiners, lighting and fog as generated fragment shaders, render targets kept on the graphics card and copied to emulated memory only when something reads them, display transfers without copies, and both screens drawn straight onto the page (no WebGL-to-2D-canvas copies, which are slow in Safari). A per-game shader cache is kept in the browser and built in the background when the game starts again, so effects do not stutter the first time they appear |
 | Services (HLE) | `src/services.js` | `srv:`, `APT` (parameters, shared font, library applets), `gsp::Gpu`, `hid`, `fs` (RomFS, save data, extra data, SD card), `dsp` (with `src/audio.js`), `y2r:u` (YUV to RGB for video), `mic:u` (silence), `ldr:ro` (code modules), `cfg`, `ptm`, `err:f`. Other services are stubbed |
 | System data | `src/sysdata.js` | RomFS builder, plus stand-ins for missing system data (Mii data, system fonts, bad word list) and an empty archive for any other |
-| Loader | `src/loader.js` | `.3dsx`, ARM ELF, and decrypted `.3ds`/`.cci` (NCSD) and `.cxi` (NCCH), including compressed code and RomFS. Decryption is judged by the contents, so dumps whose header still says "encrypted" load too. Games over 256 MB (up to 4 GB cartridges) are not read whole: the code is loaded and game data is read from the file in 1 MB chunks as the game asks for it |
+| Loader | `src/loader.js` | `.3dsx`, ARM ELF, and decrypted `.3ds`/`.cci` (NCSD), `.cxi` (NCCH) and `.cia` (installable titles: the main program is taken from content 0), including compressed code and RomFS. Decryption is judged by the contents, so dumps whose header still says "encrypted" load too. Games over 256 MB (up to 4 GB cartridges) are not read whole: the code is loaded and game data is read from the file in 1 MB chunks as the game asks for it |
 | Front-end | `index.html`, `src/main.js` | Both screens (stacked, side by side or top only; fit to window or fixed size; fullscreen), sound with volume, rebindable keyboard controls, on-screen touch controls for phones, gamepad, save states and game saves (**Saves** tab), low-power mode, performance graph, settings, system files manager, and a log. Installable as an app with offline support (`manifest.webmanifest`, `sw.js`) |
 
 ## Games tested
@@ -63,6 +63,7 @@ Tested with dumps of games we own, decrypted on our own console, using the defau
 | *Super Mario 3D Land* | Boots | Reaches its menus; selecting a Mii uses a built-in stand-in Mii |
 | *Pokémon Ultra Moon* (USA) | In progress | A 4 GB cartridge: loads, starts up (80 MB memory mode) and loads its code modules (`ldr:ro`); getting in-game is not confirmed yet |
 | Bundled demo and libctru examples | Works | Graphics, input, threads, RomFS |
+| *HOME Menu* (EUR, from our own console) | In progress | Starts at full speed with the real system font; touch and buttons work; first-run tips. Launching apps and the installed-title list are not done yet, and the first-time "Creating HOME Menu management information" screen runs very slowly |
 
 Statuses: **Playable** = can be played through what was tested; **Boots** = starts and shows menus; **In progress** = starts, does not reach gameplay yet.
 
@@ -91,13 +92,28 @@ The **Saves** tab has both:
 
 ## Games and system files
 
-**Games** must be decrypted. Retail dumps are usually encrypted, and this emulator does not include console keys. Decrypt your own dump on your 3DS, for example with GodMode9 ("Decrypt file").
+**Games** must be decrypted. Retail dumps are usually encrypted, and this emulator does not include console keys. Decrypt your own dump on your 3DS, for example with GodMode9 ("Decrypt file"; for a `.cia`: "CIA image options" → "Decrypt file").
 
 **System files.** Some games read data that ships with the console, such as Mii data or the system font. If one is missing, the emulator uses a built-in stand-in where it has one (Mii data, system fonts, bad word list) and an empty archive for any other, so games are not stopped just because a file is missing. The log names each file that was replaced, and if a game stops after reading from an empty one, the error screen names it. To use the real files from your own console:
 
 1. On your 3DS, in GodMode9, open `[1:] SYSNAND CTRNAND/title/0004009b/<title>/content/`.
-2. Select the `.app` file and choose **NCCH image options → Decrypt file**. The decrypted copy goes to `gm9/out/` on your SD card.
+2. Select the `.app` file and choose **NCCH image options → Decrypt file**. The decrypted copy goes to `gm9/out/` on your SD card. (A decrypted `.cia` built with GodMode9 works too.)
 3. In the emulator, open **Settings → System files → Add system files…** (or drag the `.app` onto the page). Files are saved in your browser, so you only add them once.
+
+The real shared system font is used when its archive (`0004009B00014002`, or the Chinese/Korean/Taiwanese one) is added. The console region follows the game (or, for system titles, their title ID).
+
+## HOME Menu (experimental)
+
+The 3DS HOME Menu can be started from your own console's files:
+
+1. Dump and decrypt these from your 3DS with GodMode9 (as `.app` with **NCCH image options → Decrypt file**, or as a CIA with **Build CIA from this file**, then **CIA image options → Decrypt file**), all from `[1:] SYSNAND CTRNAND/title/`:
+   - the HOME Menu: `00040030/00009802` (Europe), `00008f02` (USA) or `00008202` (Japan);
+   - the built-in apps in `00040010/` (System Settings, Download Play, Activity Log, Health and Safety, Camera, Sound, Mii Maker, StreetPass Mii Plaza, eShop);
+   - the system data in `0004009b/` and `000400db/` (Mii data, country list, fonts, bad word list).
+2. Add them all at once with **Settings → System files → Add system files…**.
+3. Press **Start HOME Menu** (on the welcome screen or in Settings → System files).
+
+First-time setup is reported as done, so the HOME Menu goes straight to its menus. It runs, draws, plays its first-run tips and reacts to touch and buttons. Starting apps from it, the list of installed games and online features (SpotPass, StreetPass, eShop) are not emulated yet. The HOME Menu checks that each app's start-up logo is signed by Nintendo, so apps it shows must be added from your console (stand-in icons are used for the rest).
 
 ## Development
 
@@ -114,11 +130,12 @@ The tests cover:
 
 - **CPU:** 64-bit integer math, VFP float/double, libm, printf/scanf, qsort, CRC32 and setjmp/longjmp, compared against output computed independently in Python, plus hand-written Thumb assembly with ARM↔Thumb interworking.
 - **Programs:** the libctru hello-world and thread examples, and the bundled demo.
-- **RomFS and loading:** the libctru RomFS example in four formats (`.3dsx`, `.3ds`, compressed `.3ds`, `.cxi`), rejection of encrypted images, reading system data files, and the RomFS builder.
+- **RomFS and loading:** the libctru RomFS example in four formats (`.3dsx`, `.3ds`, compressed `.3ds`, `.cxi`), rejection of encrypted images, decrypted `.cia` files (also read on demand like large cartridges), reading system data files, and the RomFS builder.
 - **GPU:** hand-built command lists and shader binaries rendered and checked pixel by pixel. They cover fill rules, color interpolation, depth, textures, ETC1, shader math and flow control, geometry shaders, immediate mode, culling, scissor, stencil, blending, alpha test and texture combiners.
 - **GPU regression scenes** (`tests/gpu/regress.js`): seeded random scenes at 400×240 (all texture formats and wrap modes, NaN and huge texture coordinates, blending and logic ops in every color format, stencil, scissor, fog, lighting, clipping). Each scene must give identical bytes from the reference and compiled rasterizers and match a recorded hash.
 - **Texture cache:** partial re-decoding of changed tiles matches a full decode in every tested format.
 - **Stand-in system data:** the bad word list, the shared font archives (LZ11) and the empty fallback archive.
+- **Formats:** decrypted `.cia` files (also read on demand like large cartridges), encrypted ones rejected, and decrypted dumps whose header still says "encrypted".
 - **Compilers against interpreters:** random shader programs (`tests/gpu/shaderfuzz.js`) and random ARM instruction sequences including VFP (`tests/cpu/armfuzz.js`; `--wasm` checks the WebAssembly compiler the same way), plus whole test programs run in lockstep with and without the ARM compiler, comparing registers, flags, screens and memory after every frame.
 
 ### Packaging homebrew as .3ds

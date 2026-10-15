@@ -27,6 +27,30 @@ function screenHasContent(emu, screen) {
   return false;
 }
 
+// A CIA around an NCCH (no certificates or ticket; one content). encrypted: mark content 0 as encrypted.
+function makeCia(content, encrypted = false) {
+  const a64 = (v) => Math.ceil(v / 64) * 64;
+  const tmdSize = 0x140 + 0xC4 + 0x900 + 0x30; // RSA-2048 signature, header, content info records, one chunk record
+  const b = new Uint8Array(a64(0x2020) + a64(tmdSize) + content.length), dv = new DataView(b.buffer);
+  dv.setUint32(0, 0x2020, true); dv.setUint32(0x10, tmdSize, true); dv.setBigUint64(0x18, BigInt(content.length), true);
+  b[0x20] = 0x80; // content index 0 present
+  const t = a64(0x2020), h = t + 0x140, c = h + 0x9C4;
+  dv.setUint32(t, 0x10004, false);
+  dv.setBigUint64(h + 0x4C, 0x0004000000123400n, false); dv.setUint16(h + 0x9E, 1, false);
+  dv.setUint16(c + 6, encrypted ? 1 : 0, false); dv.setBigUint64(c + 8, BigInt(content.length), false);
+  b.set(content, a64(0x2020) + a64(tmdSize));
+  return b;
+}
+
+// Lit pixels on the top screen of the RomFS test program (its text shows it read the files)
+function romfsTextShown(emu) {
+  const px = new Uint8ClampedArray(400 * 240 * 4);
+  emu.renderScreen(0, px);
+  let lit = 0;
+  for (let i = 0; i < px.length; i += 4) if (px[i]) lit++;
+  return lit > 1500;
+}
+
 const tests = [
   ['CPU test (-O2) matches reference output', () => {
     const { debug } = run('tests/roms/cpu-O2.3dsx', 30);
@@ -63,8 +87,41 @@ const tests = [
   }]),
   ['rejects encrypted .3ds images with a clear error', () => {
     const bytes = new Uint8Array(fs.readFileSync(path.join(ROOT, 'tests/roms/romfs.3ds')));
-    bytes[0x4000 + 0x188 + 7] &= ~4; // clear the NoCrypto flag of partition 0
+    const ncch = 0x4000, dv = new DataView(bytes.buffer);
+    bytes[ncch + 0x188 + 7] &= ~4; // clear the NoCrypto flag of partition 0
+    const exefs = ncch + dv.getUint32(ncch + 0x1A0, true) * 0x200;
+    for (let i = 0; i < 0x200; i++) bytes[exefs + i] = (Math.imul(i + 1, 2654435761) >>> 24) | 0x80; // contents look encrypted
     try { new EMU.Emulator().load(bytes); return false; } catch (e) { return /encrypted/.test(e.message); }
+  }],
+  ['loads decrypted dumps whose header still says "encrypted"', () => {
+    const bytes = new Uint8Array(fs.readFileSync(path.join(ROOT, 'tests/roms/romfs.3ds')));
+    bytes[0x4000 + 0x188 + 7] &= ~4; // only the flag: the contents are plain
+    const emu = new EMU.Emulator({ onDebug: () => {}, onLog: () => {} });
+    emu.load(bytes);
+    for (let f = 0; f < 30 && !emu.halted; f++) emu.runFrame();
+    return !emu.halted && romfsTextShown(emu);
+  }],
+  ['decrypted .cia loads and reads its RomFS', () => {
+    const emu = new EMU.Emulator({ onDebug: () => {} });
+    const info = emu.load(makeCia(new Uint8Array(fs.readFileSync(path.join(ROOT, 'tests/roms/romfs.cxi')))), 'romfs.cia');
+    for (let f = 0; f < 30 && !emu.halted; f++) emu.runFrame();
+    return info.format === 'CIA' && !emu.halted && romfsTextShown(emu);
+  }],
+  ['large .cia is read on demand (header, code, then RomFS chunks)', async () => {
+    const cia = makeCia(new Uint8Array(fs.readFileSync(path.join(ROOT, 'tests/roms/romfs.cxi'))));
+    const large = EMU.LARGE_GAME;
+    EMU.LARGE_GAME = 0; // treat the small test file as a large one
+    let got;
+    try { got = await EMU.readGameFile(new Blob([cia])); } finally { EMU.LARGE_GAME = large; }
+    if (!got.romfs || got.bytes.length >= cia.length) return false;
+    const emu = new EMU.Emulator({ onDebug: () => {} });
+    emu.load(got.bytes, 'romfs.cia', got.romfs);
+    for (let f = 0; f < 60 && !emu.halted; f++) { emu.runFrame(); await new Promise((r) => setTimeout(r, 0)); } // let chunk reads finish
+    return !emu.halted && romfsTextShown(emu);
+  }],
+  ['rejects encrypted .cia files with a clear error', () => {
+    try { new EMU.Emulator().load(makeCia(new Uint8Array(fs.readFileSync(path.join(ROOT, 'tests/roms/romfs.cxi'))), true)); return false; }
+    catch (e) { return /encrypted/.test(e.message) && /\.cia/.test(e.message); }
   }],
   ['rejects non-homebrew files with a clear error', () => {
     const emu = new EMU.Emulator();
@@ -80,6 +137,8 @@ const tests = [
     game.load(new Uint8Array(fs.readFileSync(path.join(ROOT, 'tests/roms/romfs.cxi'))));
     const sameRomfs = info.romfs.length === game.romfs.length && info.romfs.every((b, i) => b === game.romfs[i]);
     bytes[0x188 + 7] &= ~4;
+    const romfsOff = new DataView(bytes.buffer).getUint32(0x1B0, true) * 0x200;
+    bytes.fill(0x5A, romfsOff, romfsOff + 4); // RomFS no longer starts with "IVFC": looks encrypted
     let rejected = false;
     try { EMU.parseSystemArchive(bytes); } catch (e) { rejected = /encrypted/.test(e.message); }
     return info.titleId === '0004009b00010202' && info.name === 'Mii data' && !info.executable && sameRomfs && rejected;
@@ -177,12 +236,14 @@ function lockstep(rom, frames, keys) {
   }
 }
 
-let failed = 0;
-for (const [name, fn] of tests) {
-  let ok = false, err = '';
-  try { ok = fn(); } catch (e) { err = ` (${e.message})`; }
-  if (!ok) failed++;
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${err}`);
-}
-console.log(failed ? `\n${failed} test(s) failed` : '\nAll tests passed');
-process.exit(failed ? 1 : 0);
+(async () => {
+  let failed = 0;
+  for (const [name, fn] of tests) {
+    let ok = false, err = '';
+    try { ok = await fn(); } catch (e) { err = ` (${e.message})`; }
+    if (!ok) failed++;
+    console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${err}`);
+  }
+  console.log(failed ? `\n${failed} test(s) failed` : '\nAll tests passed');
+  process.exit(failed ? 1 : 0);
+})();

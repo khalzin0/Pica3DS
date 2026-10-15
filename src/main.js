@@ -559,26 +559,51 @@
   updateStates();
 
   function updateSysStatus() {
-    const names = [...emu.systemArchives.keys()].map((id) => EMU.SYSTEM_ARCHIVE_NAMES[id] || id.toUpperCase());
-    $('sys-status').textContent = names.length ? `Added: ${names.join(', ')}` : 'None added (built-in stand-ins are used).';
+    const ids = new Set([...emu.systemArchives.keys(), ...(emu.titleExefs ? emu.titleExefs.keys() : [])]);
+    const names = [...ids].map((id) => EMU.SYSTEM_ARCHIVE_NAMES[id] || id.toUpperCase());
+    if (homeMenu) names.unshift('HOME Menu');
+    $('sys-status').textContent = names.length ? `Added (${names.length}): ${names.join(', ')}` : 'None added (built-in stand-ins are used).';
     $('sys-clear').disabled = !names.length;
   }
 
   // Adds the bytes if they are a decrypted system data file.
-  function tryAddSystemFile(bytes, name) {
+  // The HOME Menu (any region), when added with the system files: started with the "Start HOME Menu" buttons
+  const HOME_MENU_IDS = ['0004003000008202', '0004003000008f02', '0004003000009802', '000400300000a102', '000400300000a902', '000400300000b102'];
+  let homeMenu = null; // { id, bytes }
+  function showHomeButtons() {
+    $('ov-home').hidden = $('sys-home').hidden = !homeMenu;
+    if (homeMenu) $('sys-home').title = `HOME Menu ${homeMenu.id.toUpperCase()}`;
+  }
+  function startHomeMenu() {
+    if (!homeMenu) return;
+    audio.unlock();
+    start(homeMenu.bytes, 'HOME Menu');
+  }
+  $('ov-home').addEventListener('click', startHomeMenu);
+  $('sys-home').addEventListener('click', startHomeMenu);
+
+  // allowTitles: also programs (e.g. System Settings for the HOME Menu); dropped files that are programs are run instead
+  function tryAddSystemFile(bytes, name, allowTitles = false) {
     let info;
     try { info = EMU.parseSystemArchive(bytes); } catch (e) { return { ok: false, error: e.message }; }
-    if (info.executable) return { ok: false };
-    emu.addSystemArchive(info.titleId, info.romfs);
-    dbDo('readwrite', (s) => s.put(info.romfs, info.titleId));
-    logLine(`Added system file ${info.titleId.toUpperCase()}${info.name ? ` (${info.name})` : ''} from ${name}`);
+    if (info.executable && !allowTitles) return { ok: false };
+    if (HOME_MENU_IDS.includes(info.titleId)) { // kept whole, to be started
+      homeMenu = { id: info.titleId, bytes };
+      dbDo('readwrite', (s) => s.put(bytes, 'home:' + info.titleId));
+      logLine(`Added the HOME Menu (${info.titleId.toUpperCase()}) from ${name}. Start it with "Start HOME Menu".`);
+      showHomeButtons();
+      return { ok: true };
+    }
+    if (info.romfs) { emu.addSystemArchive(info.titleId, info.romfs); dbDo('readwrite', (s) => s.put(info.romfs, info.titleId)); }
+    if (Object.keys(info.exefs).length) { emu.addTitleExefs(info.titleId, info.exefs); dbDo('readwrite', (s) => s.put(info.exefs, info.titleId + ':exefs')); }
+    logLine(`Added ${info.executable ? 'title' : 'system file'} ${info.titleId.toUpperCase()}${info.name ? ` (${info.name})` : ''} from ${name}`);
     return { ok: true };
   }
 
   async function addSystemFiles(files) {
     let added = 0;
     for (const f of files) {
-      const r = tryAddSystemFile(new Uint8Array(await f.arrayBuffer()), f.name);
+      const r = tryAddSystemFile(new Uint8Array(await f.arrayBuffer()), f.name, true);
       if (r.ok) added++;
       else { logLine(`${f.name}: ${r.error || 'not a system data file'}`, 'err'); toast(`${f.name}: ${r.error || 'not a system data file'}`, true, 5000); }
     }
@@ -589,6 +614,8 @@
   $('sysfiles').addEventListener('change', (e) => { addSystemFiles([...e.target.files]); e.target.value = ''; });
   $('sys-clear').addEventListener('click', () => {
     emu.systemArchives.clear();
+    if (emu.titleExefs) emu.titleExefs.clear();
+    homeMenu = null; showHomeButtons();
     dbDo('readwrite', (s) => s.clear());
     updateSysStatus();
     toast('Removed all system files.');
@@ -598,7 +625,10 @@
     req.onsuccess = () => {
       const c = req.result;
       if (!c) { updateSysStatus(); return; }
-      emu.addSystemArchive(String(c.key), new Uint8Array(c.value));
+      const key = String(c.key);
+      if (key.startsWith('home:')) { homeMenu = { id: key.slice(5), bytes: new Uint8Array(c.value) }; showHomeButtons(); updateSysStatus(); }
+      else if (key.endsWith(':exefs')) emu.addTitleExefs(key.slice(0, -6), c.value);
+      else emu.addSystemArchive(key, new Uint8Array(c.value));
       c.continue();
     };
   });
@@ -655,7 +685,9 @@
 
   // Hardware acceleration: show the graphics device and warn when the browser draws WebGL on the CPU
   if (glRenderer) {
-    $('gpu-name').textContent = glRenderer.deviceName;
+    // Privacy protections (Brave Shields, Firefox resistFingerprinting, Safari) hide the real name
+    const hidden = !glRenderer.deviceName || /^(brave|webkit webgl|mozilla|apple gpu|unknown)$/i.test(glRenderer.deviceName.trim());
+    $('gpu-name').textContent = hidden ? `Name hidden by the browser's privacy protection (${glRenderer.deviceName || 'none'})` : glRenderer.deviceName;
     $('gpu-accel').textContent = glRenderer.softwareDevice ? 'Not accelerated' : 'Hardware accelerated';
     $('gpu-accel').className = 'pill ' + (glRenderer.softwareDevice ? 'halted' : 'running');
     $('gpu-accel').insertAdjacentHTML('afterbegin', '<i></i>');
