@@ -254,5 +254,7 @@
   }
 
   EMU.DspAudio = DspAudio;
+  // Classes a save state can hold (see state.js)
+  Object.assign(EMU.classes || (EMU.classes = {}), { DspAudio });
   EMU.AUDIO_RATE = 32728;
 })(typeof window !== 'undefined' ? window.EMU : globalThis.EMU);

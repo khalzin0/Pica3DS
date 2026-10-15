@@ -193,17 +193,18 @@
         }
         this.switchTo(t);
         this.running = t;
-        const budget = Math.min(SLICE, Math.max(1, Math.ceil((target - this.ticks) / TICKS_PER_INSN)));
+        const tpi = TICKS_PER_INSN;
+        const budget = Math.min(SLICE, Math.max(1, Math.ceil((target - this.ticks) / tpi)));
         let n;
         try {
           n = cpu.run(budget);
         } finally {
           this.running = null;
         }
-        this.ticks += n * TICKS_PER_INSN;
+        this.ticks += n * tpi;
         this.emu.insnCount += n;
-        t.frameReady += n * TICKS_PER_INSN;
-        if (this.idleSkip && this.isBusyBackground(t)) this.bgTicks += n * TICKS_PER_INSN;
+        t.frameReady += n * tpi;
+        if (this.idleSkip && this.isBusyBackground(t)) this.bgTicks += n * tpi;
         if (t.state !== 'dead') cpu.saveContext(t.ctx);
         if (t.state === 'ready' && n >= budget) this.starve++; else this.starve = 0;
         this.rr++;
@@ -225,7 +226,7 @@
           if (tm.next !== Infinity && tm.next <= now) tm.next = now + tm.interval;
           this.signal(tm);
           if (tm.resetType === 2) tm.signaled = false;
-          if (tm.onFire) tm.onFire();
+          if (tm.owner) tm.owner.onTimer(tm); // a service's own timer (kept as data so save states can hold it)
         }
       }
       for (const t of this.threads) {
@@ -533,4 +534,6 @@
   }
 
   EMU.Kernel = Kernel;
+  // Classes a save state can hold (see state.js)
+  Object.assign(EMU.classes || (EMU.classes = {}), { KObject, KEvent, KTimer, KMutex, KSemaphore, KThread, KMemBlock, KSession, KGeneric, Kernel });
 })(typeof window !== 'undefined' ? window.EMU : globalThis.EMU);

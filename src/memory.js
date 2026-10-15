@@ -250,4 +250,6 @@
   }
 
   EMU.Memory = Memory;
+  // Classes a save state can hold (see state.js)
+  Object.assign(EMU.classes || (EMU.classes = {}), { Memory });
 })(typeof window !== 'undefined' ? (window.EMU = window.EMU || {}) : (globalThis.EMU = globalThis.EMU || {}));

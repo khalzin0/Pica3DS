@@ -50,6 +50,9 @@
       this.haltReason = null;
       this.missingSystemArchive = null;
       this.standinArchives = null; // title ID -> stand-in RomFS built for this load
+      this.fsVolumes = null;       // the game's save data, extdata and SD card (see setSaves)
+      this.savesDirty = false;
+      this.pendingReads = 0;       // game file reads in flight (a save state waits for them)
       this.insnCount = 0;
       this.frame = 0;
       this.name = name;
@@ -99,9 +102,29 @@
       this.kernel.createThread(info.entry, 0, 0x10000000, info.priority || 0x30);
       this.loaded = true;
       this.title = info.title || null;
+      this.titleKey = info.programId || name; // which game: saves and save states are kept per game
       const extras = [info.title && `"${info.title}"`, info.programId && `title ID ${info.programId}`, info.romfs && `RomFS ${(info.romfs.length / 1024).toFixed(0)} KB`].filter(Boolean).join(', ');
       this.log(`Loaded ${name} (${info.format}, code ${(info.size / 1024).toFixed(0)} KB${extras ? ', ' + extras : ''}), entry ${hex(info.entry)}`);
       return info;
+    }
+
+    // The game's saves (save data, extdata, SD card files) as plain data: { key: { files: [[path, bytes]], dirs } }
+    getSaves() {
+      const out = {};
+      if (this.fsVolumes) for (const [key, vol] of this.fsVolumes) out[key] = { files: [...vol.files], dirs: [...vol.dirs] };
+      return out;
+    }
+
+    // Put saves back before the game runs (or between frames)
+    setSaves(saves) {
+      const store = new Map();
+      for (const key of Object.keys(saves || {})) {
+        const vol = new EMU.Volume(), s = saves[key];
+        for (const [p, bytes] of s.files) vol.files.set(p, new Uint8Array(bytes));
+        vol.dirs = new Set(s.dirs);
+        store.set(key, vol);
+      }
+      this.fsVolumes = store.size ? store : null;
     }
 
     runFrame() {

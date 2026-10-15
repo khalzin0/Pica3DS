@@ -83,6 +83,15 @@
       this.D = new Float32Array(4);
     }
 
+    // Drop compiled programs (after loading a save state)
+    resetCompiled() {
+      this.decoded = null;
+      this.codeVersion++;
+      this.compiled = new Map();
+      this.compiled.verified = new Map();
+      this.compiledBySpec = new Map([[`${this.b}|${this.i.join(',')}`, this.compiled]]);
+    }
+
     // Program words or swizzles changed. Compiled programs are kept: each is checked against the words it was
     // built from before its next use (games switch between a few programs many times per frame).
     invalidate() {
@@ -2279,5 +2288,7 @@ ${code}
   EMU.SHADER_OP = OP;
   EMU.f24 = f24;
   EMU.decodeTexture = decodeTexture;
+  // Classes a save state can hold (see state.js)
+  Object.assign(EMU.classes || (EMU.classes = {}), { ShaderUnit, Gpu });
   EMU.gpuDebug = { genRaster, rasterKey, genShade, genWrite }; // for inspecting generated code
 })(typeof window !== 'undefined' ? window.EMU : globalThis.EMU);

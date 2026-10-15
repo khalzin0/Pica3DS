@@ -572,13 +572,15 @@
           // Not loaded yet (a large game read on demand): the calling thread waits while it is fetched
           const emu = this.emu, k = this.kernel, gen = emu.loadGeneration, ev = new EMU.KEvent(0, 'file read');
           k.block(ipc.thread, [ev], false, Infinity, false);
+          emu.pendingReads = (emu.pendingReads || 0) + 1;
           const finish = () => {
             if (emu.loadGeneration !== gen || emu.halted) return;
             if (!data.has(start, n)) { data.load(start, n).then(finish, fail); return; } // dropped meanwhile
+            emu.pendingReads--;
             done();
             k.signal(ev);
           };
-          const fail = (e) => { if (emu.loadGeneration === gen) emu.halt(`Could not read the game file: ${e.message}`); };
+          const fail = (e) => { if (emu.loadGeneration === gen) { emu.pendingReads--; emu.halt(`Could not read the game file: ${e.message}`); } };
           data.load(start, n).then(finish, fail);
           return true;
         }
@@ -601,6 +603,9 @@
   const ERR_NOT_FORMATTED = 0xC8A04554;
   const ERR_EXTDATA_MISSING = 0xC8A04478;
   const ERR_DIR_NOT_EMPTY = 0xC82044F0;
+
+  // FS commands that change save data, extdata or the SD card
+  const FS_WRITES = new Set([0x804, 0x805, 0x806, 0x807, 0x808, 0x809, 0x80A, 0x80F, 0x84C, 0x851, 0x852, 0x856, 0x857]);
 
   // A writable, in-memory archive (save data, extdata, SD card, system save).
   class Volume {
@@ -628,12 +633,13 @@
         case 0x803: { // Write(offset u64, size, flags, buffer)
           const off = ipc.get(1) + ipc.get(2) * 4294967296, size = ipc.get(3), ptr = ipc.get(6);
           if (off + size > this.data.length) this.resize(off + size);
+          this.emu.savesDirty = true;
           if (size) this.data.set(this.mem.readBytes(ptr, size), off);
           ipc.reply(id, [0, size], [(size << 4) | 0xA, ptr]);
           return true;
         }
         case 0x804: { const n = this.data.length; ipc.reply(id, [0, n >>> 0, Math.floor(n / 4294967296)]); return true; } // GetSize
-        case 0x805: this.resize(ipc.get(1) + ipc.get(2) * 4294967296); ipc.reply(id, [0]); return true; // SetSize
+        case 0x805: this.resize(ipc.get(1) + ipc.get(2) * 4294967296); this.emu.savesDirty = true; ipc.reply(id, [0]); return true; // SetSize
         case 0x806: ipc.reply(id, [0, 0]); return true; // GetAttributes
         case 0x807: ipc.reply(id, [0]); return true;    // SetAttributes
         case 0x808: case 0x809: ipc.reply(id, [0]); return true; // Close, Flush
@@ -791,6 +797,7 @@
     }
 
     handle(ipc, id) {
+      if (FS_WRITES.has(id)) this.emu.savesDirty = true; // the game's saves changed: kept in the browser (see main.js)
       if (this.emu.traceFs) this.emu.log(`fs: cmd ${hex(id, 4)} [${[1, 2, 3, 4, 5, 6].map((i) => hex(ipc.get(i))).join(' ')}]`);
       switch (id) {
         case 0x801: case 0x861: case 0x862: ipc.reply(id, [0]); return true; // Initialize, InitializeWithSdkVersion, SetPriority
@@ -987,12 +994,14 @@
       const tm = new EMU.KTimer(2);
       tm.interval = Math.round(EMU.TICKS_PER_SEC * AUDIO_FRAME_SAMPLES / AUDIO_RATE);
       tm.next = this.kernel.ticks + tm.interval;
-      tm.onFire = () => this.tick();
+      tm.owner = this;
       this.kernel.timers.add(tm);
       this.timer = tm;
     }
 
     // One audio frame: report statuses, then tell the application the frame is done.
+    onTimer() { this.tick(); }
+
     tick() {
       if (!this.on) return;
       this.frames++;
@@ -1304,10 +1313,12 @@
       const tm = new EMU.KTimer(0);
       tm.next = k.ticks + period;
       tm.interval = loop ? period : 0;
-      tm.onFire = () => { k.signalEvent(this.event); if (!loop) this.stopSampling(); };
+      tm.owner = this;
       k.timers.add(tm);
       this.timer = tm;
     }
+
+    onTimer(tm) { this.kernel.signalEvent(this.event); if (!tm.interval) this.stopSampling(); }
 
     stopSampling() { if (this.timer) { this.kernel.timers.delete(this.timer); this.timer = null; } }
 
@@ -1715,4 +1726,7 @@
   }
 
   EMU.Services = Services;
+  EMU.Volume = Volume;
+  // Classes a save state can hold (see state.js)
+  Object.assign(EMU.classes || (EMU.classes = {}), { Ipc, Service, SrvService, ErrFService, AptService, GspService, HidService, FileService, Volume, VolumeFileService, DirectoryService, FsService, DspService, CfgService, PtmService, Y2rService, MicService, RoService, StubService, Services });
 })(typeof window !== 'undefined' ? window.EMU : globalThis.EMU);

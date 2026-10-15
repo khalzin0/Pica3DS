@@ -252,6 +252,9 @@ ${code}};`)();
       this.blocksCompiled = 0;
     }
 
+    // Forget compiled code (after loading a save state)
+    resetJit() { this.blockTab = new Array(BLOCK_TAB).fill(null); this.hot = new Uint16Array(BLOCK_TAB); }
+
     // ---------------------------------------------------------------- context
     newContext() {
       return { r: new Uint32Array(16), pc: 0, t: 0, n: 0, z: 0, c: 0, v: 0, q: 0, ge: 0, fu: new Uint32Array(32), fpscr: 0x03C00000, tls: 0, tlsRW: 0 };
@@ -1292,5 +1295,7 @@ ${code}};`)();
   }
 
   EMU.CPU = CPU;
+  // Classes a save state can hold (see state.js)
+  Object.assign(EMU.classes || (EMU.classes = {}), { CPU });
   EMU.compileArmBlock = compileArmBlock; // for tests
 })(typeof window !== 'undefined' ? window.EMU : globalThis.EMU);

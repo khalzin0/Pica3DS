@@ -174,6 +174,11 @@
   .field:last-child { border-bottom: 0; }
   .field label, .field > span { color: var(--text); }
   .field small { display: block; color: var(--muted); font-size: 11.5px; }
+  .note { margin: 0 0 10px; color: var(--muted); font-size: 12.5px; }
+  .slot { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .slot b { width: 52px; flex: none; font-weight: 650; }
+  .slot span { flex: 1; min-width: 0; color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pane .row { flex-wrap: wrap; justify-content: flex-start; }
   select { background: var(--panel-2); border: 1px solid var(--border); border-radius: 7px; padding: 5px 8px; }
   .switch { position: relative; width: 36px; height: 20px; flex: none; }
   .switch input { opacity: 0; width: 100%; height: 100%; margin: 0; position: absolute; cursor: pointer; z-index: 1; }
@@ -265,6 +270,19 @@
     body.touch .stage { --side: calc(var(--u) * 3.3); justify-content: center; padding-left: calc(var(--side) + 8px + env(safe-area-inset-left)); padding-right: calc(var(--side) + 8px + env(safe-area-inset-right)); }
     body.touch .vpad { position: absolute; inset: 0; max-width: none; align-items: stretch; pointer-events: none; padding: 8px calc(6px + env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) calc(6px + env(safe-area-inset-left)); }
     body.touch .vp-side { pointer-events: auto; width: var(--side); justify-content: space-between; }
+  }
+  /* Phones held sideways: little height to spare, so a slim one-row top bar and tighter spacing */
+  @media (orientation: landscape) and (max-height: 520px) {
+    .topbar { flex-wrap: nowrap; gap: 6px; padding-top: max(4px, env(safe-area-inset-top)); padding-bottom: 4px; }
+    .brand .wordmark, .btn .lbl, .sep, .pill, .volume input[type=range] { display: none; }
+    .brand img { width: 26px; }
+    .toolbar { flex-wrap: nowrap; gap: 4px; margin-left: auto; }
+    .btn { height: 32px; } .btn.icon { width: 32px; }
+    .toolbar label.btn.primary { width: 32px; padding: 0; }
+    .game-title { font-size: 13px; max-width: 30vw; }
+    body.touch .stage { padding-top: 4px; padding-bottom: calc(4px + env(safe-area-inset-bottom)); }
+    body.touch .device { padding: 4px; gap: 4px; }
+    .panel { height: 92vh; height: 92dvh; }
   }
   /* Fullscreen without the browser's fullscreen API (iPhone): hide the top bar */
   body.pseudo-full .topbar { display: none; }
@@ -375,6 +393,7 @@
     <div class="tabs" role="tablist">
       <button class="tab" role="tab" id="tab-perf" aria-controls="pane-perf" aria-selected="true">Performance</button>
       <button class="tab" role="tab" id="tab-settings" aria-controls="pane-settings" aria-selected="false">Settings</button>
+      <button class="tab" role="tab" id="tab-states" aria-controls="pane-states" aria-selected="false">Saves</button>
       <button class="tab" role="tab" id="tab-controls" aria-controls="pane-controls" aria-selected="false">Controls</button>
       <button class="tab" role="tab" id="tab-log" aria-controls="pane-log" aria-selected="false">Log<span class="badge" id="log-badge" hidden>0</span></button>
       <button class="btn icon small sheet-close" id="panel-close" aria-label="Close">
@@ -448,6 +467,29 @@
         <div class="row" style="justify-content:flex-start;margin-top:10px">
           <label class="btn small" for="sysfiles">Add system files…</label>
           <button class="btn small" id="sys-clear" disabled>Remove all</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="pane" id="pane-states" role="tabpanel" hidden>
+      <div class="section">
+        <h4>Save states</h4>
+        <p class="note">A snapshot of the whole game at this moment: load it to carry on from exactly here. Kept in this browser, per game. Keyboard: Shift+F1–F4 saves, F1–F4 loads.</p>
+        <div id="state-slots"></div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn small" id="state-export" disabled>Download a state</button>
+          <label class="btn small" for="state-import">Open a state file…</label>
+          <input type="file" id="state-import" accept=".p3ds,.p3ds-state">
+        </div>
+      </div>
+      <div class="section">
+        <h4>Game saves</h4>
+        <p class="note">What the game saves itself (save data, extra data, SD card files) is kept in this browser automatically and comes back the next time you open the game.</p>
+        <div class="row">
+          <button class="btn small" id="saves-export" disabled>Download saves</button>
+          <label class="btn small" for="saves-import">Restore saves…</label>
+          <input type="file" id="saves-import" accept=".json,.p3ds-saves">
+          <button class="btn small" id="saves-delete" disabled>Delete</button>
         </div>
       </div>
     </div>
@@ -532,6 +574,7 @@
 <script src="src/sysdata.js"></script>
 <script src="src/loader.js"></script>
 <script src="src/emulator.js"></script>
+<script src="src/state.js"></script>
 <script src="src/demo-rom.js"></script>
 <script src="src/main.js"></script>
 </body>

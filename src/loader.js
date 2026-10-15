@@ -281,6 +281,8 @@
     }
   }
   EMU.LazyFile = LazyFile;
+  // Classes a save state can hold (see state.js)
+  Object.assign(EMU.classes || (EMU.classes = {}), { LazyFile });
 
   // Game files bigger than this are not read whole: the start of the file (headers and code) is read, and the
   // RomFS is read on demand. Returns { bytes, romfs } (romfs null when the file is read whole).

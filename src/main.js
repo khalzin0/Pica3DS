@@ -322,6 +322,15 @@
     $('pause').disabled = false;
     $('reset').disabled = false;
     paused = true; setPaused(false);
+    // The game's own saves from earlier sessions go back in before it runs its first frame
+    const gen = emu.loadGeneration, key = emu.titleKey;
+    paused = true;
+    dbGet('saves', key).then((saves) => {
+      if (emu.loadGeneration !== gen) return;
+      if (saves) { emu.setSaves(saves); logLine('Restored this game\'s saves from the browser.'); }
+      paused = true; setPaused(false);
+      updateStates();
+    });
   }
 
   function loadFile(file) {
@@ -353,23 +362,157 @@
   // ------------------------------------------------------------------ system files (kept in IndexedDB)
   function openDb() {
     return new Promise((resolve, reject) => {
-      const req = indexedDB.open('emu3ds', 1);
-      req.onupgradeneeded = () => req.result.createObjectStore('sysdata');
+      const req = indexedDB.open('emu3ds', 2);
+      req.onupgradeneeded = () => {
+        for (const s of ['sysdata', 'saves', 'states']) if (!req.result.objectStoreNames.contains(s)) req.result.createObjectStore(s);
+      };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
     });
   }
-  async function dbDo(mode, fn) {
+  async function dbDo(mode, fn, storeName = 'sysdata') {
     try {
       const db = await openDb();
       return await new Promise((resolve, reject) => {
-        const tx = db.transaction('sysdata', mode);
-        fn(tx.objectStore('sysdata'));
+        const tx = db.transaction(storeName, mode);
+        fn(tx.objectStore(storeName));
         tx.oncomplete = () => resolve(true);
         tx.onerror = () => reject(tx.error);
       });
     } catch (e) { return null; } // storage unavailable: files last for this session only
   }
+
+  async function dbGet(storeName, key) {
+    let out;
+    await dbDo('readonly', (s) => { const r = s.get(key); r.onsuccess = () => { out = r.result; }; }, storeName);
+    return out;
+  }
+  const dbPut = (storeName, key, value) => dbDo('readwrite', (s) => s.put(value, key), storeName);
+  const dbDelete = (storeName, key) => dbDo('readwrite', (s) => s.delete(key), storeName);
+
+  // ------------------------------------------------------------------ game saves and save states
+  // The game's saves are written to the browser shortly after the game changes them
+  let savesTimer = 0;
+  function flushSaves() {
+    if (!emu.loaded || !emu.savesDirty) return;
+    emu.savesDirty = false;
+    dbPut('saves', emu.titleKey, emu.getSaves());
+    $('saves-delete').disabled = false;
+  }
+  setInterval(() => { if (emu.savesDirty && performance.now() - savesTimer > 1500) { savesTimer = performance.now(); flushSaves(); } }, 500);
+  window.addEventListener('pagehide', flushSaves);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) flushSaves(); });
+
+  const SLOTS = 4;
+  const stateKey = (slot) => `${emu.titleKey}#${slot}`;
+  function download(blob, name) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  }
+  const gameFileName = () => ($('game-title').textContent || 'game').replace(/[\\/:*?"<>|]+/g, '').trim() || 'game';
+
+  let statesGen = 0;
+  async function updateStates() {
+    const gen = ++statesGen, ready = emu.loaded && !emu.halted;
+    const metas = [];
+    for (let i = 1; i <= SLOTS; i++) metas.push(ready ? await dbGet('states', stateKey(i) + ':meta') : null);
+    const hasSaves = emu.loaded && !!(await dbGet('saves', emu.titleKey));
+    if (gen !== statesGen) return; // a newer refresh is on its way
+    const box = $('state-slots');
+    box.textContent = '';
+    metas.forEach((meta, k) => {
+      const i = k + 1, row = document.createElement('div');
+      row.className = 'slot';
+      row.innerHTML = `<b>Slot ${i}</b><span></span><button class="btn small" data-a="save">Save</button><button class="btn small" data-a="load">Load</button>`;
+      row.querySelector('span').textContent = meta ? new Date(meta.time).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : 'Empty';
+      row.querySelector('[data-a=save]').disabled = !ready;
+      row.querySelector('[data-a=load]').disabled = !ready || !meta;
+      row.querySelector('[data-a=save]').addEventListener('click', () => saveSlot(i));
+      row.querySelector('[data-a=load]').addEventListener('click', () => loadSlot(i));
+      box.appendChild(row);
+    });
+    $('state-export').disabled = !ready;
+    $('saves-export').disabled = !emu.loaded;
+    $('saves-delete').disabled = !hasSaves;
+  }
+
+  // Snapshot between frames (saveState copies everything before it returns to the loop)
+  async function makeState() {
+    for (let tries = 0; emu.pendingReads && tries < 50; tries++) await new Promise((r) => setTimeout(r, 100));
+    return EMU.saveState(emu);
+  }
+  async function saveSlot(i) {
+    if (!emu.loaded || emu.halted) return;
+    try {
+      const blob = await makeState(), meta = { time: Date.now(), frame: emu.frame };
+      await dbPut('states', stateKey(i), blob);
+      await dbPut('states', stateKey(i) + ':meta', meta);
+      toast(`Saved state to slot ${i} (${(blob.size / 1048576).toFixed(1)} MB)`);
+    } catch (e) { toast(`Could not save the state: ${e.message}`, true, 5000); logLine(`Save state: ${e.message}`, 'err'); }
+    updateStates();
+  }
+  async function applyState(blob, label) {
+    try {
+      flushSaves();
+      await EMU.loadState(emu, blob);
+      audio.clear();
+      emu.savesDirty = false;
+      lastTime = performance.now(); acc = 0;
+      if (paused) present();
+      toast(`Loaded ${label}`);
+    } catch (e) { toast(`Could not load the state: ${e.message}`, true, 6000); logLine(`Load state: ${e.message}`, 'err'); }
+  }
+  async function loadSlot(i) {
+    if (!emu.loaded) return;
+    const blob = await dbGet('states', stateKey(i));
+    if (!blob) { toast(`Slot ${i} is empty`); return; }
+    applyState(blob, `slot ${i}`);
+  }
+  $('state-export').addEventListener('click', async () => {
+    try { download(await makeState(), `${gameFileName()}.p3ds`); }
+    catch (e) { toast(`Could not save the state: ${e.message}`, true, 5000); }
+  });
+  $('state-import').addEventListener('change', (e) => {
+    const f = e.target.files[0]; e.target.value = '';
+    if (!f) return;
+    if (!emu.loaded) { toast('Open the game first, then load its state', true); return; }
+    applyState(f, f.name);
+  });
+
+  // Game saves as a file: JSON with each file's bytes in base64
+  const toB64 = (u8) => { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); };
+  const fromB64 = (b) => { const s = atob(b), u8 = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i); return u8; };
+  $('saves-export').addEventListener('click', () => {
+    const saves = emu.getSaves(), out = { pica3dsSaves: 1, game: emu.titleKey, title: emu.title, volumes: {} };
+    for (const k of Object.keys(saves)) out.volumes[k] = { dirs: saves[k].dirs, files: saves[k].files.map(([p, b]) => [p, toB64(b)]) };
+    download(new Blob([JSON.stringify(out)], { type: 'application/json' }), `${gameFileName()} saves.json`);
+  });
+  $('saves-import').addEventListener('change', async (e) => {
+    const f = e.target.files[0]; e.target.value = '';
+    if (!f) return;
+    if (!emu.loaded) { toast('Open the game first, then restore its saves', true); return; }
+    try {
+      const doc = JSON.parse(await f.text());
+      if (!doc.pica3dsSaves) throw new Error('not a Pica3DS saves file');
+      if (doc.game && doc.game !== emu.titleKey) throw new Error(`these saves are for another game (${doc.title || doc.game})`);
+      const saves = {};
+      for (const k of Object.keys(doc.volumes)) saves[k] = { dirs: doc.volumes[k].dirs, files: doc.volumes[k].files.map(([p, b]) => [p, fromB64(b)]) };
+      emu.savesDirty = false;
+      await dbPut('saves', emu.titleKey, saves);
+      toast('Saves restored. Restarting the game to use them…');
+      start(romBytes, romName, romFs);
+    } catch (err) { toast(`Could not restore saves: ${err.message}`, true, 5000); }
+  });
+  $('saves-delete').addEventListener('click', async () => {
+    if (!emu.loaded || !confirm("Delete this game's saves from the browser? Download them first if you want to keep them.")) return;
+    emu.savesDirty = false;
+    await dbDelete('saves', emu.titleKey);
+    toast('Saves deleted. Restarting the game…');
+    start(romBytes, romName, romFs);
+  });
+  updateStates();
 
   function updateSysStatus() {
     const names = [...emu.systemArchives.keys()].map((id) => EMU.SYSTEM_ARCHIVE_NAMES[id] || id.toUpperCase());
@@ -418,7 +561,7 @@
   updateSysStatus();
 
   // ------------------------------------------------------------------ panel and tabs
-  const TABS = ['perf', 'settings', 'controls', 'log'];
+  const TABS = ['perf', 'settings', 'states', 'controls', 'log'];
   function selectTab(name) {
     for (const t of TABS) {
       $('tab-' + t).setAttribute('aria-selected', String(t === name));
@@ -681,6 +824,8 @@
     const button = codeToButton.get(e.code);
     if (button) { held.add(button); e.preventDefault(); return; }
     if (e.repeat) return;
+    const fk = /^F([1-4])$/.exec(e.code);
+    if (fk) { e.preventDefault(); if (e.shiftKey) saveSlot(+fk[1]); else loadSlot(+fk[1]); return; }
     if (e.code === 'KeyP') { audio.unlock(); setPaused(!paused); }
     else if (e.code === 'KeyF') toggleFullscreen();
     else if (e.code === 'KeyM') toggleMute();
