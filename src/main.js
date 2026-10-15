@@ -273,8 +273,18 @@
   }
 
   // Renderer: the host graphics card through WebGL 2 (default when available) or the software rasterizer
+  // Its canvas is laid over both screens and shows them directly (see present); without WebGL the screens are
+  // drawn on their own 2D canvases instead
   let glRenderer = null, glError = '';
-  try { glRenderer = new EMU.GLRenderer(document.createElement('canvas')); } catch (e) { glError = e.message; }
+  const glCanvas = document.createElement('canvas');
+  glCanvas.className = 'gl-screens';
+  try { glRenderer = new EMU.GLRenderer(glCanvas, { display: true }); } catch (e) { glError = e.message; }
+  let display = glRenderer ? { w: 1, h: 1, rects: [null, null] } : null; // canvas size and screen rects, device pixels
+  if (display) $('device').prepend(glCanvas);
+  glCanvas.addEventListener('webglcontextlost', () => {
+    display = null; glCanvas.remove();
+    logLine('The graphics card was reset by the browser (this happens on phones low on memory). Restart the game.', 'err');
+  });
   let useGL = !!glRenderer && store.get('renderer', 'webgl') !== 'software';
   function applyRenderer() { emu.setRenderer(useGL && glRenderer ? glRenderer : null); }
 
@@ -528,17 +538,35 @@
       const one = sum(sc, 'paddingLeft', 'paddingRight'), gap = parseFloat(ds.rowGap) || 0;
       const two = one * 2 + gap * 2 + (layout === 'side' ? hinge.offsetWidth : hinge.offsetHeight);
       const [w, fw, h, fh] = layout === 'side' ? [720, two, 240, one] : layout === 'stacked' ? [400, one, 480, two] : [400, one, 240, one];
-      s = Math.max(0.5, Math.min((availW - fw) / w, (availH - fh) / h));
+      s = Math.max(0.3, Math.min((availW - fw) / w, (availH - fh) / h));
       if (!$('smooth').checked && s > 1) s = Math.floor(s * 4) / 4; // quarter steps keep pixels even-ish
     } else s = parseFloat(choice);
     topCanvas.style.width = 400 * s + 'px'; topCanvas.style.height = 240 * s + 'px';
     bottomCanvas.style.width = 320 * s + 'px'; bottomCanvas.style.height = 240 * s + 'px';
+    layoutDisplay();
+  }
+
+  // The WebGL canvas covers the device at the display's full resolution; each screen is drawn where its 2D canvas
+  // sits (those stay underneath for layout and touch)
+  function layoutDisplay() {
+    if (!display) return;
+    const dev = $('device'), dpr = window.devicePixelRatio || 1;
+    glCanvas.style.width = dev.clientWidth + 'px'; glCanvas.style.height = dev.clientHeight + 'px';
+    const cr = glCanvas.getBoundingClientRect();
+    display.w = Math.max(1, Math.round(cr.width * dpr)); display.h = Math.max(1, Math.round(cr.height * dpr));
+    [topCanvas, bottomCanvas].forEach((c, i) => {
+      const r = c.getBoundingClientRect();
+      display.rects[i] = r.width && r.height && !(i && layout === 'top-only')
+        ? [Math.round((r.left - cr.left) * dpr), Math.round((r.top - cr.top) * dpr), Math.round(r.width * dpr), Math.round(r.height * dpr)] : null;
+    });
+    requestAnimationFrame(() => present()); // redraw at the new size (also while paused)
   }
   $('scale').value = store.get('screen-size', 'auto');
   if (!$('scale').value) $('scale').value = 'auto';
   $('scale').addEventListener('change', () => { store.set('screen-size', $('scale').value); fitScreens(); });
   $('smooth').checked = store.get('smooth', '0') === '1';
-  function applySmooth() { $('stage').classList.toggle('smooth', $('smooth').checked); }
+  let smooth = $('smooth').checked;
+  function applySmooth() { smooth = $('smooth').checked; $('stage').classList.toggle('smooth', smooth); }
   $('smooth').addEventListener('change', () => { store.set('smooth', $('smooth').checked ? '1' : '0'); applySmooth(); fitScreens(); });
   applySmooth();
   $('show-hud').checked = store.get('hud', '0') === '1';
@@ -825,17 +853,31 @@
   // frame runs the emulated frames that are due, but stops catching up once it has used ~12 ms so the page
   // stays responsive; when emulation is slower than real time the game runs slower (Speed < 100%) rather
   // than skipping emulated work.
+  // The ~12 ms budget grows when the display gives the page fewer animation frames (iOS Low Power Mode: 30 a
+  // second), so two emulated frames per animation frame still fit there.
   const FRAME_MS = 1000 / 59.83, CATCH_UP_MS = 12;
-  let lastTime = performance.now(), acc = 0;
+  let lastTime = performance.now(), acc = 0, lastRaf = 0, rafMs = 1000 / 60;
   // Telemetry since the last stats update
   const stat = { time: performance.now(), frames: 0, presents: 0, insns: 0, cpu: 0, gpu: 0, xfer: 0, present: 0, frameMs: [] };
   const history = []; // recent frame times (ms) for the graph
 
   function present() {
     const t0 = performance.now();
-    // Straight from the graphics card when possible, otherwise converted from emulated memory
-    if (!emu.loaded || !emu.presentGL(0, topCtx)) { emu.renderScreen(0, topImg.data); topCtx.putImageData(topImg, 0, 0); }
-    if (layout !== 'top-only' && (!emu.loaded || !emu.presentGL(1, bottomCtx))) { emu.renderScreen(1, bottomImg.data); bottomCtx.putImageData(bottomImg, 0, 0); }
+    if (display) {
+      // Straight from the graphics card when the game's screen is there, otherwise uploaded from emulated memory
+      glRenderer.beginDisplay(display.w, display.h);
+      for (let i = 0; i < 2; i++) {
+        const rect = display.rects[i];
+        if (!rect || (emu.loaded && emu.displayGL(i, rect, smooth))) continue;
+        const img = i ? bottomImg : topImg;
+        emu.renderScreen(i, img.data);
+        glRenderer.displayPixels(i, img.data, i ? 320 : 400, rect, smooth);
+      }
+      glRenderer.endDisplay();
+    } else {
+      if (!emu.loaded || !emu.presentGL(0, topCtx)) { emu.renderScreen(0, topImg.data); topCtx.putImageData(topImg, 0, 0); }
+      if (layout !== 'top-only' && (!emu.loaded || !emu.presentGL(1, bottomCtx))) { emu.renderScreen(1, bottomImg.data); bottomCtx.putImageData(bottomImg, 0, 0); }
+    }
     stat.present += performance.now() - t0;
     stat.presents++;
   }
@@ -886,6 +928,8 @@
 
   function loop(now) {
     requestAnimationFrame(loop);
+    const gap = now - lastRaf; lastRaf = now;
+    if (gap > 4 && gap < 100) rafMs += (gap - rafMs) * 0.05;
     if (now - stat.time >= 500) showStats(now);
     if (!emu.loaded || emu.halted || paused) { lastTime = now; return; }
     acc += Math.min(now - lastTime, 250);
@@ -902,7 +946,7 @@
       stat.frames++; stat.insns += emu.insnCount - insns;
       stat.cpu += p.frame - p.gpu - p.xfer; stat.gpu += p.gpu; stat.xfer += p.xfer; stat.frameMs.push(p.frame);
       history.push(p.frame); if (history.length > 240) history.shift();
-      if (performance.now() - t0 > CATCH_UP_MS) break;
+      if (performance.now() - t0 > Math.max(CATCH_UP_MS, rafMs * 0.75)) break;
     }
     if (acc > FRAME_MS) acc = FRAME_MS; // behind: keep at most one frame due instead of building up a backlog
     audio.flush();
@@ -910,8 +954,34 @@
   }
   requestAnimationFrame(loop);
 
+  // ------------------------------------------------------------------ installed app (home screen)
+  // Opened from the home screen: no browser bars. Otherwise offer to install it (Android: the browser's own install
+  // prompt; iPhone and iPad: Share, then Add to Home Screen) on touch devices.
+  const installed = matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches || navigator.standalone === true;
+  document.body.classList.toggle('installed', installed);
+  const ios = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  let installPrompt = null;
+  if (!installed && ios) { $('install').hidden = false; $('install-ios').hidden = false; }
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    installPrompt = e;
+    $('install').hidden = false; $('install-btn').hidden = false;
+  });
+  $('install-btn').addEventListener('click', async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    const choice = await installPrompt.userChoice.catch(() => null);
+    installPrompt = null;
+    if (choice && choice.outcome === 'accepted') { $('install').hidden = true; toast('Installed. Open Pica3DS from your home screen.'); }
+  });
+  window.addEventListener('appinstalled', () => { $('install').hidden = true; });
+  // Offline cache for the app's own files (not available when opened from a file)
+  if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
+    window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch((e) => logLine(`Offline mode is unavailable: ${e.message}`)));
+  }
+
   // For debugging and measuring from the browser console
-  window.pica = { emu, pause: (p = true) => setPaused(p), audio };
+  window.pica = { emu, pause: (p = true) => setPaused(p), audio, present };
 
   // Paint the idle screens black.
   present();

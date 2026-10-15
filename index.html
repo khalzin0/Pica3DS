@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#161a21">
+<meta name="theme-color" content="#0d0f13">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -11,6 +11,8 @@
 <link rel="manifest" href="manifest.webmanifest">
 <title>Pica3DS</title>
 <link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+<link rel="icon" href="assets/icon-192.png" type="image/png" sizes="192x192">
+<link rel="apple-touch-icon" href="assets/icon-180.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Russo+One&display=swap" rel="stylesheet">
@@ -40,9 +42,11 @@
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
+  html, body { overscroll-behavior: none; }
   html { touch-action: manipulation; -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  body { display: flex; flex-direction: column; height: 100vh; height: 100dvh; overflow: hidden; }
+  /* Pinned to the screen's edges: iOS reports 100vh short when opened from the home screen */
+  body { display: flex; flex-direction: column; position: fixed; inset: 0; overflow: hidden; }
   button, select, input { font: inherit; color: inherit; }
   svg { display: block; }
 
@@ -103,7 +107,7 @@
   .stage:fullscreen { padding: 0; background: #000; }
   .stage:fullscreen .device { background: transparent; border: 0; box-shadow: none; padding: 0; }
 
-  .device { background: var(--shell); border-radius: 22px; padding: 16px; border: 1px solid #2f3442; box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,.04);
+  .device { position: relative; background: var(--shell); border-radius: 22px; padding: 16px; border: 1px solid #2f3442; box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,.04);
     display: flex; flex-direction: column; align-items: center; gap: 12px; }
   .device.side { flex-direction: row; align-items: center; }
   .device.top-only .screen.bottom { display: none; }
@@ -115,6 +119,8 @@
   .smooth canvas { image-rendering: auto; }
   #bottom { cursor: crosshair; touch-action: none; }
 
+  .gl-screens { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 1; background: transparent; }
+  .hud { z-index: 2; }
   .hud { position: absolute; top: 14px; left: 14px; padding: 3px 8px; border-radius: 6px; background: rgba(0,0,0,.6); color: #fff; font: 600 12px/1.3 ui-monospace, Consolas, monospace; pointer-events: none; font-variant-numeric: tabular-nums; }
   .hud[hidden] { display: none; }
 
@@ -129,6 +135,9 @@
   .card .formats span { font: 600 11.5px ui-monospace, Consolas, monospace; color: var(--muted); background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 2px 7px; }
   .dropzone { width: 100%; border: 2px dashed var(--border-2); border-radius: 12px; padding: 22px 16px; color: var(--muted); display: flex; flex-direction: column; gap: 12px; align-items: center; }
   .dropzone .row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+  .install { width: 100%; padding-top: 12px; border-top: 1px solid var(--border); display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .install svg.inline { display: inline; width: 15px; height: 15px; vertical-align: -2px; color: var(--text); }
+  .install b { color: var(--text); }
   .error-icon { width: 42px; height: 42px; border-radius: 50%; background: var(--accent-soft); color: var(--accent-2); display: grid; place-items: center; }
 
   /* ---------------------------------------------------------------- side panel */
@@ -198,7 +207,7 @@
     .toolbar { flex-wrap: nowrap; gap: 4px; }
     .game-title { max-width: none; font-size: 13px; }
   }
-  @media (max-width: 420px) { .brand .wordmark, .btn .lbl { display: none; } .toolbar label.btn.primary { width: 38px; padding: 0; } }
+  @media (max-width: 600px) { .brand .wordmark, .btn .lbl { display: none; } .toolbar label.btn.primary { width: 38px; padding: 0; } }
   /* Bigger targets for fingers */
   @media (pointer: coarse) {
     .btn { height: 38px; } .btn.icon { width: 38px; } .btn.small { height: 34px; }
@@ -254,6 +263,8 @@
   }
   /* Fullscreen without the browser's fullscreen API (iPhone): hide the top bar */
   body.pseudo-full .topbar { display: none; }
+  /* Installed on the home screen: behave like an app (no text selection or long-press menus on the controls) */
+  body.installed .topbar, body.installed .tabs { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
   body.pseudo-full .stage { padding-top: calc(8px + env(safe-area-inset-top)); }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
@@ -334,6 +345,12 @@
         </div>
         <div class="formats"><span>.3ds</span><span>.cci</span><span>.cxi</span><span>.3dsx</span><span>.elf</span></div>
         <p class="note">Games must be decrypted on your own console. Encrypted dumps and .cia files are not supported.</p>
+        <div class="install" id="install" hidden>
+          <button class="btn" id="install-btn" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>Install as an app
+          </button>
+          <p class="note" id="install-ios" hidden>Play it like an app: tap <b>Share</b> <svg class="inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3M8 7l4-4 4 4M6 11H5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-8a1 1 0 0 0-1-1h-1"/></svg> then <b>Add to Home Screen</b>. It opens full screen and works offline.</p>
+        </div>
       </div>
       <div class="card" id="message" hidden>
         <div class="error-icon"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 7v6M12 17h.01"/><circle cx="12" cy="12" r="10"/></svg></div>

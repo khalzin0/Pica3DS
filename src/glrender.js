@@ -386,8 +386,10 @@ void main() {
   const GL_BLEND_FACTOR = [0, 1, 0x0300, 0x0301, 0x0306, 0x0307, 0x0302, 0x0303, 0x0304, 0x0305, 0x8001, 0x8002, 0x8003, 0x8004, 0x0308];
 
   class GLRenderer {
-    constructor(canvas) {
-      const gl = canvas.getContext('webgl2', { antialias: false, depth: false, stencil: false, alpha: false, preserveDrawingBuffer: false, powerPreference: 'high-performance' });
+    // display: the canvas is shown on the page and the screens are drawn straight onto it (see beginDisplay); it
+    // then needs an alpha channel so the page shows through between the screens
+    constructor(canvas, { display = false } = {}) {
+      const gl = canvas.getContext('webgl2', { antialias: false, depth: false, stencil: false, alpha: display, premultipliedAlpha: true, preserveDrawingBuffer: false, powerPreference: 'high-performance' });
       if (!gl) throw new Error('WebGL 2 is not available');
       this.gl = gl;
       this.canvas = canvas;
@@ -465,6 +467,25 @@ void main() {
         precision highp float; precision highp int;
         uniform sampler2D uSrc; uniform ivec2 uOrigin; out vec4 c;
         void main() { c = vec4(texelFetch(uSrc, ivec2(uOrigin.x + int(gl_FragCoord.y), uOrigin.y + int(gl_FragCoord.x)), 0).rgb, 1.0); }`));
+      // Screens drawn at their size on the page. Mode 0: a framebuffer in the 3DS layout (rotated: texel (x, y) is
+      // screen pixel (y, x), from uOrigin); mode 1: upright RGBA pixels, top row first. Sharp or smoothed.
+      this.displayProg = this.link(quadVs, this.compile(gl.FRAGMENT_SHADER, `#version 300 es
+        precision highp float; precision highp int;
+        uniform sampler2D uSrc; uniform ivec2 uOrigin; uniform vec4 uRect; uniform vec2 uSize; uniform int uMode; uniform bool uSmooth;
+        out vec4 c;
+        void main() {
+          vec2 p = (gl_FragCoord.xy - uRect.xy) / uRect.zw * uSize; // screen pixel, y up
+          vec2 o = vec2(uOrigin), t = uMode == 0 ? vec2(o.x + p.y, o.y + p.x) : vec2(p.x, uSize.y - p.y);
+          vec2 lo = uMode == 0 ? o : vec2(0.0), hi = lo + (uMode == 0 ? uSize.yx : uSize);
+          if (uSmooth) c = vec4(texture(uSrc, clamp(t, lo + 0.5, hi - 0.5) / vec2(textureSize(uSrc, 0))).rgb, 1.0);
+          else c = vec4(texelFetch(uSrc, ivec2(clamp(t, lo, hi - 0.5)), 0).rgb, 1.0);
+        }`));
+      this.linearSampler = gl.createSampler();
+      gl.samplerParameteri(this.linearSampler, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.samplerParameteri(this.linearSampler, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.samplerParameteri(this.linearSampler, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.samplerParameteri(this.linearSampler, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      this.pixelTex = [null, null]; // screens shown from emulated memory (see displayPixels)
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
     }
@@ -838,6 +859,69 @@ void main() {
       gl.bindVertexArray(this.vao);
       ctx.drawImage(c, 0, 0);
       return true;
+    }
+
+    // ---- Drawing the screens straight onto this renderer's canvas, shown on the page. Copying a WebGL canvas into
+    // 2D canvases (present) makes Safari wait for the graphics card every time, which costs milliseconds a frame.
+    // beginDisplay(w, h), then displaySurface / displayPixels per screen, then endDisplay. rect: [x, y, w, h] in
+    // canvas pixels from the top left.
+    beginDisplay(w, h) {
+      const gl = this.gl, c = this.canvas;
+      if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.disable(gl.BLEND); gl.disable(gl.DEPTH_TEST); gl.disable(gl.STENCIL_TEST); gl.disable(gl.SCISSOR_TEST); gl.disable(gl.CULL_FACE);
+      gl.colorMask(true, true, true, true);
+      gl.viewport(0, 0, w, h);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.useProgram(this.displayProg);
+      gl.uniform1i(this.uni(this.displayProg, 'uSrc'), 0);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindVertexArray(this.quadVao);
+    }
+
+    displayDraw(tex, mode, ox, oy, W, rect, smooth) {
+      const gl = this.gl, p = this.displayProg, [x, y, w, h] = rect, gy = this.canvas.height - y - h;
+      gl.viewport(x, gy, w, h);
+      gl.bindSampler(0, smooth ? this.linearSampler : null);
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.uniform2i(this.uni(p, 'uOrigin'), ox, oy);
+      gl.uniform4f(this.uni(p, 'uRect'), x, gy, w, h);
+      gl.uniform2f(this.uni(p, 'uSize'), W, 240);
+      gl.uniform1i(this.uni(p, 'uMode'), mode);
+      gl.uniform1i(this.uni(p, 'uSmooth'), smooth ? 1 : 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    // A screen whose framebuffer is a display transfer output held here. False: show it from memory instead.
+    displaySurface(phys, format, stride, W, rect, smooth) {
+      const s = this.surfaces.find((x) => x.kind === 'linear' && x.dirty && phys >= x.phys && phys < x.phys + x.bytes);
+      if (!s || (format & 7) !== s.fmt || stride !== s.w * s.bpp) return false;
+      const off = phys - s.phys, row = Math.floor(off / stride), col = (off % stride) / s.bpp;
+      if (!Number.isInteger(col) || col + 240 > s.w || row + W > s.h) return false;
+      this.displayDraw(s.tex, 0, col, row, W, rect, smooth);
+      return true;
+    }
+
+    // A screen as RGBA pixels (W x 240, top row first), e.g. from Emulator.renderScreen
+    displayPixels(screen, rgba, W, rect, smooth) {
+      const gl = this.gl;
+      let t = this.pixelTex[screen];
+      if (!t) {
+        t = this.pixelTex[screen] = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, t);
+        gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, W, 240);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      } else gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, 240, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+      this.displayDraw(t, 1, 0, 0, W, rect, smooth);
+    }
+
+    endDisplay() {
+      const gl = this.gl;
+      gl.bindSampler(0, null);
+      gl.bindVertexArray(this.vao);
     }
 
     // Something is about to read [phys, phys + size) from memory: write back render targets there

@@ -141,6 +141,16 @@
       return gl.present(this.gpu.toPhys(info.fb0), info.format, info.stride || 240 * EMU.FB_BPP[info.format & 7], screen === 0 ? 400 : 320, ctx);
     }
 
+    // Draw a screen straight from the host GPU onto the renderer's own canvas shown on the page (see
+    // GLRenderer.beginDisplay). False: use renderScreen.
+    displayGL(screen, rect, smooth) {
+      const gl = this.gpu && this.gpu.gl;
+      const gsp = gl && this.services.instances.get('gsp::Gpu');
+      const info = gsp && gsp.screenInfo(screen);
+      if (!info || !info.fb0) return false;
+      return gl.displaySurface(this.gpu.toPhys(info.fb0), info.format, info.stride || 240 * EMU.FB_BPP[info.format & 7], screen === 0 ? 400 : 320, rect, smooth);
+    }
+
     // Render a screen (0 = top 400x240, 1 = bottom 320x240) into RGBA pixels. Returns false if nothing to show.
     // Pixels are written as little-endian 32-bit words (R, G, B, A bytes); conversions match EMU.decodePixel.
     renderScreen(screen, out) {

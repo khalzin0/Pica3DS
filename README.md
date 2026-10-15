@@ -21,7 +21,7 @@ Open [pica3ds.netlify.app](https://pica3ds.netlify.app/), or run it locally:
 
 Open `index.html?demo` to start the demo automatically.
 
-**On a phone or tablet:** on-screen controls appear automatically (Circle Pad or D-Pad, A/B/X/Y, L/R, ZL/ZR, Start/Select), in portrait or landscape. For the most screen space, use your browser's *Add to Home Screen*: it opens full screen without the browser's bars. Speed depends heavily on the phone; recent high-end phones do best.
+**On a phone or tablet:** on-screen controls appear automatically (Circle Pad or D-Pad, A/B/X/Y, L/R, ZL/ZR, Start/Select), in portrait or landscape. For the most screen space, install it: *Add to Home Screen* on iPhone and iPad (Share menu), or *Install app* on Android. It then opens full screen like an app and works offline (the emulator's own files are cached; games stay on your device). Speed depends heavily on the phone; recent high-end phones do best.
 
 ## Status
 
@@ -43,7 +43,7 @@ Open `index.html?demo` to start the demo automatically.
 | Kernel (HLE) | `src/kernel.js` | Threads with a priority scheduler, mutexes, semaphores, events, timers, address arbiters, shared memory, and heap/linear memory (old and new linear heap layouts) |
 | 3D GPU | `src/gpu.js` | PICA200 in software: command lists, vertex and geometry shaders, clipping, rasterizer, all 14 texture formats including ETC1, texture combiners, fragment lighting, fog, and the output merger. This is also the reference the WebGL renderer is checked against |
 | Audio (HLE) | `src/audio.js` | The DSP's audio pipeline: reads the voices the game sets up in DSP shared memory, plays their buffer queues (PCM8, PCM16, DSP-ADPCM), resamples, mixes with the game's gains and reports playback status back. The browser plays it through an AudioWorklet |
-| WebGL renderer | `src/glrender.js` | Draws with your graphics card: vertex shaders translated to GLSL, texture combiners, lighting and fog as generated fragment shaders, render targets kept on the graphics card and copied to emulated memory only when something reads them, display transfers and screen output without copies |
+| WebGL renderer | `src/glrender.js` | Draws with your graphics card: vertex shaders translated to GLSL, texture combiners, lighting and fog as generated fragment shaders, render targets kept on the graphics card and copied to emulated memory only when something reads them, display transfers without copies, and both screens drawn straight onto the page (no WebGL-to-2D-canvas copies, which are slow in Safari) |
 | Services (HLE) | `src/services.js` | `srv:`, `APT` (parameters, shared font, library applets), `gsp::Gpu`, `hid`, `fs` (RomFS, save data, extra data, SD card), `dsp` (with `src/audio.js`), `y2r:u` (YUV to RGB for video), `mic:u` (silence), `ldr:ro` (code modules), `cfg`, `ptm`, `err:f`. Other services are stubbed |
 | System data | `src/sysdata.js` | RomFS builder, plus stand-ins for missing system data (Mii data, system fonts, bad word list) and an empty archive for any other |
 | Loader | `src/loader.js` | `.3dsx`, ARM ELF, and decrypted `.3ds`/`.cci` (NCSD) and `.cxi` (NCCH), including compressed code and RomFS. Games over 256 MB (up to 4 GB cartridges) are not read whole: the code is loaded and game data is read from the file in 1 MB chunks as the game asks for it |
