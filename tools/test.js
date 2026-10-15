@@ -6,7 +6,7 @@ const path = require('path');
 const vm = require('vm');
 
 const ROOT = path.join(__dirname, '..');
-for (const f of ['memory.js', 'cpu.js', 'kernel.js', 'services.js', 'gpu.js', 'sysdata.js', 'loader.js', 'emulator.js']) {
+for (const f of ['memory.js', 'cpu.js', 'kernel.js', 'services.js', 'gpu.js', 'audio.js', 'sysdata.js', 'loader.js', 'emulator.js']) {
   vm.runInThisContext(fs.readFileSync(path.join(ROOT, 'src', f), 'utf8'), { filename: f });
 }
 const EMU = globalThis.EMU;
@@ -98,8 +98,84 @@ const tests = [
     for (let i = 0; i < pa.length; i += 4) if (pa[i]) lit++;
     return Object.keys(files).length === 2 && lit > 1500 && pa.every((v, i) => v === pb[i]) && !b.halted;
   }],
+  ['stand-in system archives: bad word list, shared fonts (LZ11) and an empty fallback', () => {
+    const lz11 = (src) => { // LZ11 decompressor (literals and back-references)
+      const n = src[1] | (src[2] << 8) | (src[3] << 16), out = new Uint8Array(n);
+      let i = 4, o = 0;
+      while (o < n) {
+        const flags = src[i++];
+        for (let b = 7; b >= 0 && o < n; b--) {
+          if (!((flags >> b) & 1)) { out[o++] = src[i++]; continue; }
+          let len, disp, x = src[i] >> 4;
+          if (x === 0) { len = (((src[i] & 15) << 4) | (src[i + 1] >> 4)) + 0x11; disp = (((src[i + 1] & 15) << 8) | src[i + 2]) + 1; i += 3; }
+          else if (x === 1) { len = (((src[i] & 15) << 12) | (src[i + 1] << 4) | (src[i + 2] >> 4)) + 0x111; disp = (((src[i + 2] & 15) << 8) | src[i + 3]) + 1; i += 4; }
+          else { len = x + 1; disp = (((src[i] & 15) << 8) | src[i + 1]) + 1; i += 2; }
+          for (let k = 0; k < len; k++, o++) out[o] = out[o - disp];
+        }
+      }
+      return out;
+    };
+    const files = (img) => Object.fromEntries(EMU.listRomfs(img).map((f) => [f.path, img.slice(f.offset, f.offset + f.size)]));
+    const ng = files(EMU.STANDIN_ARCHIVES['000400db00010302']());
+    const ngOk = Object.keys(ng).length === 18 && ng['version.dat'].length === 4 && ng['16.txt'][0] === 0xFF && ng['16.txt'][1] === 0xFE;
+    const font = files(EMU.STANDIN_ARCHIVES['0004009b00014002']())['cbf_std.bcfnt.lz'];
+    const fontRaw = EMU.buildStandinFont(0, false), fontOut = font && lz11(font);
+    const fontOk = !!fontOut && fontOut.length === fontRaw.length && fontOut.every((v, i) => v === fontRaw[i]) && String.fromCharCode(...fontOut.subarray(0, 4)) === 'CFNT';
+    return ngOk && fontOk && EMU.listRomfs(EMU.buildEmptyArchive()).length === 0;
+  }],
+  ...['tests/roms/cpu-O2.3dsx', 'tests/roms/cpu-O0.3dsx', 'tests/roms/thumb.3dsx', 'tests/roms/thread-basic.3dsx', 'demo/demo.3dsx'].map((rom) => [
+    `ARM block compiler matches the interpreter in lockstep: ${path.basename(rom)}`, () => lockstep(rom, 90, (f) => (f > 30 ? EMU.KEYS.DRIGHT : 0))]),
+  ['ARM block compiler matches the interpreter on 3000 random instruction sequences', () => {
+    const err = require(path.join(ROOT, 'tests/cpu/armfuzz.js'))(EMU).check(3000);
+    if (err) console.log(`    ${err.split('\n')[0]}`);
+    return !err;
+  }],
   ...require(path.join(ROOT, 'tests/gpu/scenes.js'))(EMU).tests,
+  ...(() => { // GPU regression scenes (reference vs compiled rasterizer, golden hashes)
+    const helpers = require(path.join(ROOT, 'tests/gpu/scenes.js'))(EMU);
+    return require(path.join(ROOT, 'tests/gpu/regress.js'))(EMU, helpers).tests;
+  })(),
+  ['GPU: shader compiler matches the interpreter on 2000 random programs', () => {
+    const err = require(path.join(ROOT, 'tests/gpu/shaderfuzz.js'))(EMU).check(2000);
+    if (err) console.log(`    ${err.split('\n')[0]}`);
+    return !err;
+  }],
 ];
+
+// Run a ROM twice, with and without the ARM block compiler, and compare the machine state after every frame
+// and all of memory at the end.
+function lockstep(rom, frames, keys) {
+  const realNow = Date.now;
+  Date.now = () => 1760000000000; // same clock for both runs (the shared page holds the time)
+  try {
+    const make = (jit) => {
+      const s = { debug: '' };
+      s.emu = new EMU.Emulator({ onDebug: (t) => { s.debug += t; }, onHalt: () => {} });
+      s.emu.load(new Uint8Array(fs.readFileSync(path.join(ROOT, rom))), path.basename(rom));
+      s.emu.cpu.jit = jit;
+      return s;
+    };
+    const a = make(false), b = make(true);
+    b.emu.cpu.jitThreshold = 2; // compile nearly everything, to test as much compiled code as possible
+    const state = ({ emu, debug }) => [emu.insnCount, emu.halted, emu.kernel.current && emu.kernel.current.id, emu.cpu.pc, emu.cpu.getCPSR(), ...emu.cpu.r, ...emu.cpu.fu, debug.length].join(',');
+    const px = [new Uint8ClampedArray(400 * 240 * 4), new Uint8ClampedArray(400 * 240 * 4)];
+    for (let f = 0; f < frames; f++) {
+      for (const s of [a, b]) { s.emu.input.keys = keys(f); s.emu.runFrame(); }
+      if (state(a) !== state(b)) { console.log(`    frame ${f}: states differ`); return false; }
+      if (f % 15 === 14) {
+        a.emu.renderScreen(0, px[0]); b.emu.renderScreen(0, px[1]);
+        if (!px[0].every((v, i) => v === px[1][i])) { console.log(`    frame ${f}: screens differ`); return false; }
+      }
+    }
+    for (const reg of a.emu.mem.regions) {
+      const x = a.emu.mem.readBytes(reg.base, reg.size), y = b.emu.mem.readBytes(reg.base, reg.size);
+      if (!x.every((v, i) => v === y[i])) { console.log(`    memory differs in ${reg.name || EMU.hex(reg.base)}`); return false; }
+    }
+    return a.debug === b.debug && b.emu.cpu.blocksCompiled > 0; // and the compiler was actually used
+  } finally {
+    Date.now = realNow;
+  }
+}
 
 let failed = 0;
 for (const [name, fn] of tests) {

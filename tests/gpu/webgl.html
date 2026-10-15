@@ -1,0 +1,63 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebGL renderer check</title>
+<style>
+  body { background: #111; color: #ddd; font: 13px system-ui, sans-serif; margin: 16px; }
+  .scene { margin-bottom: 18px; } canvas { image-rendering: pixelated; margin-right: 8px; border: 1px solid #333; }
+  .bad { color: #f66; } .ok { color: #6d6; }
+</style>
+<h3>WebGL renderer vs software reference</h3>
+<p>Renders the GPU regression scenes (tests/gpu/regress.js) with both renderers. Left: software, middle: WebGL, right: differences.
+Serve the repository over http (for example <code>python -m http.server</code>) and open tests/gpu/webgl.html.</p>
+<div id="out"></div>
+<script src="../../src/memory.js"></script>
+<script src="../../src/gpu.js"></script>
+<script src="../../src/glrender.js"></script>
+<script>
+(async () => {
+  // Load the Node test modules with a tiny CommonJS shim
+  const cryptoShim = { createHash: () => ({ update() { return this; }, digest: () => '' }) };
+  const load = async (path, mods) => {
+    const module = { exports: {} };
+    new Function('module', 'require', await (await fetch(path)).text())(module, (n) => mods[n]);
+    return module.exports;
+  };
+  const scenesMod = await load('scenes.js', {});
+  const helpers = scenesMod(EMU);
+  const regress = (await load('regress.js', { crypto: cryptoShim }))(EMU, helpers);
+  const renderer = new EMU.GLRenderer(document.createElement('canvas'));
+  const out = document.getElementById('out');
+  const results = [];
+  for (const sc of regress.scenes) {
+    const sw = regress.render(sc, true);
+    const gl = regress.render(sc, true, (s) => { renderer.attach(s.gpu); s.gpu.gl = renderer; });
+    const { W, H } = sw;
+    const div = document.createElement('div'); div.className = 'scene';
+    const canv = [0, 1, 2].map(() => { const c = document.createElement('canvas'); c.width = W; c.height = H; return c; });
+    const imgs = canv.map((c) => c.getContext('2d').createImageData(W, H));
+    let differ = 0, maxd = 0;
+    // memory is tiled RGBA8 (A, B, G, R bytes), rows bottom-up
+    const MORTON = (x, y) => { let m = 0; for (let i = 0; i < 3; i++) m |= (((x >> i) & 1) << (2 * i)) | (((y >> i) & 1) << (2 * i + 1)); return m; };
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const fy = y, o = (((fy >> 3) * (W >> 3) + (x >> 3)) * 64 + MORTON(x & 7, fy & 7)) * 4, p = (y * W + x) * 4;
+      let d = 0;
+      for (let k = 0; k < 3; k++) {
+        const a = sw.color[o + 3 - k], b = gl.color[o + 3 - k];
+        imgs[0].data[p + k] = a; imgs[1].data[p + k] = b; d = Math.max(d, Math.abs(a - b));
+      }
+      imgs[2].data[p] = d > 8 ? 255 : d * 16; imgs[2].data[p + 1] = d > 8 ? 0 : d * 16; imgs[2].data[p + 2] = d > 8 ? 0 : d * 16;
+      for (let i = 0; i < 3; i++) imgs[i].data[p + 3] = 255;
+      if (d > 8) differ++;
+      maxd = Math.max(maxd, d);
+    }
+    canv.forEach((c, i) => c.getContext('2d').putImageData(imgs[i], 0, 0));
+    const pct = differ / (W * H) * 100;
+    results.push({ name: sc.name, pct, maxd, warnings: gl.logs });
+    div.innerHTML = `<div class="${pct < 2 ? 'ok' : 'bad'}">${sc.name}: ${pct.toFixed(2)}% of pixels differ by more than 8 (max ${maxd})${gl.logs.length ? ' | ' + gl.logs.join('; ') : ''}</div>`;
+    canv.forEach((c) => div.appendChild(c));
+    out.appendChild(div);
+  }
+  window.results = results;
+  window.dbg = { helpers, regress, renderer }; // for interactive checks
+})().catch((e) => { document.getElementById('out').textContent = e.stack; window.results = { error: e.stack }; });
+</script>

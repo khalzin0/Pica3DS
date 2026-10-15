@@ -139,8 +139,9 @@
     [0xE000, '~A'], [0xE001, '~B'], [0xE002, '~X'], [0xE003, '~Y'], [0xE004, '~L'], [0xE005, '~R'], [0xE006, '~+'],
   ];
 
-  // Build a CFNT (BCFNT) font whose internal pointers assume it is loaded at `base`.
-  function buildStandinFont(base) {
+  // Build a BCFNT font whose internal pointers assume it is loaded at `base`. relocated: 'CFNU' header as in
+  // the system's shared font; otherwise 'CFNT' as in a font file (use base 0, pointers relative to the file).
+  function buildStandinFont(base, relocated = true) {
     const glyphs = []; // rows (8 numbers) per glyph index
     const rowsOf = (hex) => hex.replace(/ /g, '').match(/../g).map((h) => parseInt(h, 16));
     GLYPHS_5X8.forEach((g) => glyphs.push(rowsOf(g)));
@@ -192,8 +193,8 @@
     const tag = (o, s) => { for (let i = 0; i < 4; i++) out[o + i] = s.charCodeAt(i); };
     const ptr = (o) => (base + o) >>> 0;
 
-    // 'CFNU': pointers are already absolute (relocated), as in the system's shared font
-    tag(0, 'CFNU'); dv.setUint16(4, 0xFEFF, true); dv.setUint16(6, 0x14, true);
+    // 'CFNU': pointers are already absolute (relocated); 'CFNT': relative to the file
+    tag(0, relocated ? 'CFNU' : 'CFNT'); dv.setUint16(4, 0xFEFF, true); dv.setUint16(6, 0x14, true);
     dv.setUint32(8, 0x03000000, true); dv.setUint32(12, total, true); dv.setUint32(16, 5, true);
 
     tag(offFINF, 'FINF'); dv.setUint32(offFINF + 4, 0x20, true);
@@ -237,10 +238,52 @@
   EMU.listRomfs = listRomfs;
   EMU.buildStandinFont = buildStandinFont;
 
+  // LZ11 container with every byte stored as a literal (valid input for the system's LZ11 decompressor)
+  function lz11Literal(data) {
+    const n = data.length, out = new Uint8Array(4 + n + Math.ceil(n / 8));
+    out[0] = 0x11; out[1] = n & 0xFF; out[2] = (n >>> 8) & 0xFF; out[3] = (n >>> 16) & 0xFF;
+    let o = 4;
+    for (let i = 0; i < n; i += 8) {
+      out[o++] = 0; // flags: next 8 bytes are literals
+      for (let k = i; k < Math.min(n, i + 8); k++) out[o++] = data[k];
+    }
+    return out.subarray(0, o);
+  }
+
+  // UTF-16LE text with a byte order mark
+  function utf16(text) {
+    const out = new Uint8Array(2 + text.length * 2);
+    out[0] = 0xFF; out[1] = 0xFE;
+    for (let i = 0; i < text.length; i++) { out[2 + i * 2] = text.charCodeAt(i) & 0xFF; out[3 + i * 2] = text.charCodeAt(i) >>> 8; }
+    return out;
+  }
+
+  // Bad word list: 17 pattern lists (one per language/region slot) and a version number. Each list holds one
+  // pattern that no typed text can match, so nothing is filtered.
+  function buildNgWordList() {
+    const files = { 'version.dat': Uint8Array.of(0x12, 0, 0, 0) };
+    const never = '^' + String.fromCharCode(0xFFFF) + '-never-matches$' + String.fromCharCode(10);
+    for (let i = 0; i <= 16; i++) files[`${i}.txt`] = utf16(never);
+    return buildRomfs(files);
+  }
+
+  const fontArchive = (name) => () => buildRomfs({ [name]: lz11Literal(buildStandinFont(0, false)) });
+
   // Stand-in archives by title ID. Each returns a RomFS image.
   EMU.STANDIN_ARCHIVES = {
     // Mii data: games check that CFL_Res.dat exists and read its header. The stand-in has no Mii models,
     // so a game that actually draws Miis will not show them correctly.
     '0004009b00010202': () => buildRomfs({ 'CFL_Res.dat': new Uint8Array(0x1000) }),
+    // Shared fonts opened as archives (most games get the font from APT instead): the stand-in font
+    '0004009b00014002': fontArchive('cbf_std.bcfnt.lz'),
+    '0004009b00014102': fontArchive('cbf_zh-Hans-CN.bcfnt.lz'),
+    '0004009b00014202': fontArchive('cbf_ko-Hang-KR.bcfnt.lz'),
+    '0004009b00014302': fontArchive('cbf_zh-Hant-TW.bcfnt.lz'),
+    '000400db00010302': buildNgWordList,
   };
+
+  // Any other system data archive: an empty one, so games that only check for it carry on. A game that reads a
+  // file from it gets "not found".
+  EMU.buildEmptyArchive = () => buildRomfs({});
+  EMU.lz11Literal = lz11Literal;
 })(typeof window !== 'undefined' ? window.EMU : globalThis.EMU);

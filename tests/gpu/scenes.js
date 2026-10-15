@@ -46,6 +46,8 @@ module.exports = (EMU) => {
       return this;
     }
     mov(d, s, idx = 0) { return this.op(0x13, d, s, 'r0', idx); }
+    setemit(vtx, prim = 0, winding = 0) { return this.flow(0x2B, 0, 0, (vtx << 2) | (prim << 1) | winding); }
+    emit() { return this.flow(0x2A, 0, 0); }
     add(d, a, b) { return this.op(0x00, d, a, b); }
     mul(d, a, b) { return this.op(0x08, d, a, b); }
     dp4(d, a, b) { return this.op(0x02, d, a, b); }
@@ -62,7 +64,8 @@ module.exports = (EMU) => {
   const COLOR_PHYS = 0x18000000, DEPTH_PHYS = 0x18100000;
 
   class Scene {
-    constructor() {
+    constructor({ w = W, h = H } = {}) {
+      this.W = w; this.H = h;
       this.logs = [];
       const mem = new EMU.Memory();
       mem.alloc(0x1F000000, 0x600000, 3, 6, 'VRAM');
@@ -93,6 +96,7 @@ module.exports = (EMU) => {
       return this;
     }
     clear(rgba, depth = 0xFFFFFF, stencil = 0) {
+      const { W, H } = this;
       const c = new Uint8Array(W * H * 4), d = new Uint8Array(W * H * 4);
       for (let i = 0; i < W * H * 4; i += 4) {
         c.set([rgba[3], rgba[2], rgba[1], rgba[0]], i);
@@ -103,6 +107,7 @@ module.exports = (EMU) => {
     }
     // Pixel at (x, y) with y = 0 at the bottom of the render target.
     offset(x, y) {
+      const { W, H } = this;
       const fy = H - 1 - y;
       let m = 0;
       for (let i = 0; i < 3; i++) m |= (((x >> i) & 1) << (2 * i)) | (((fy >> i) & 1) << (2 * i + 1));
@@ -112,6 +117,7 @@ module.exports = (EMU) => {
     depthAt(x, y) { const o = 0x1F100000 + this.offset(x, y) * 4; return this.mem.r32(o) & 0xFFFFFF; }
     stencilAt(x, y) { return this.mem.r8(0x1F100000 + this.offset(x, y) * 4 + 3); }
     image() {
+      const { W, H } = this;
       const px = new Uint8Array(W * H * 4);
       for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const c = this.pixel(x, H - 1 - y); px.set(c, (y * W + x) * 4); px[(y * W + x) * 4 + 3] = 255; }
       return px;
@@ -127,9 +133,20 @@ module.exports = (EMU) => {
       return this;
     }
     uniform(index, x, y, z, w) { return this.w(0x2C0, 0x80000000 | index).w(0x2C1, bitsOf(w), bitsOf(z), bitsOf(y), bitsOf(x)); }
+    // Geometry shader program, swizzles, entry point and float uniforms
+    gshader(asm) {
+      this.w(0x29B, 0);
+      for (let i = 0; i < asm.code.length; i += 8) this.w(0x29C, ...asm.code.slice(i, i + 8));
+      this.w(0x2A5, 0);
+      for (let i = 0; i < asm.swz.length; i += 8) this.w(0x2A6, ...asm.swz.slice(i, i + 8));
+      this.w(0x28A, 0x7FFF0000);
+      return this;
+    }
+    guniform(index, x, y, z, w) { return this.w(0x290, 0x80000000 | index).w(0x291, bitsOf(w), bitsOf(z), bitsOf(y), bitsOf(x)); }
 
     // Common state: 64x64 RGBA8 + D24S8 target, viewport, VS outputs o0 = pos, o1 = color, o2 = uv0.
     setup({ outputs = 3 } = {}) {
+      const { W, H } = this;
       this.w(0x040, 0);                                   // no culling
       this.w(0x041, toF24(W / 2)).w(0x043, toF24(H / 2)); // viewport half size
       this.w(0x068, 0);
@@ -165,7 +182,8 @@ module.exports = (EMU) => {
       this.w(0x200, addr >>> 3);
       const fmt = (1 << perVertex * 4) - 1; // all float4
       this.w(0x201, fmt & 0xFFFFFFFF, ((perVertex - 1) << 28) | 0);
-      const comps = [0, 1, 2, 3].slice(0, perVertex).reduce((a, c, i) => a | (c << (i * 4)), 0);
+      let comps = 0;
+      for (let i = 0; i < perVertex; i++) comps |= i << (i * 4);
       this.w(0x203, 0, comps, (perVertex << 28) | ((perVertex * 16) << 16));
       for (let l = 1; l < 12; l++) this.w(0x203 + l * 3, 0, 0, 0);
       return this;
@@ -263,6 +281,24 @@ module.exports = (EMU) => {
     return near(at(0, 7), [138, 138, 138, 255], 0) && near(at(3, 7), [255, 255, 255, 255], 0);
   });
 
+  test('re-decodes only the changed tiles of a cached texture', () => {
+    const s = new Scene().setup();
+    const ok = [];
+    for (const fmt of [0, 4, 10, 13]) { // RGBA8, RGBA4, L4, ETC1A4
+      const bytes = (64 * 64 * [32, 16, 4, 8][[0, 4, 10, 13].indexOf(fmt)]) >> 3;
+      const src = new Uint8Array(bytes).map((_, i) => (i * 7919 + fmt) & 255);
+      const virt = s.data(src), addr = s.phys(virt);
+      const t = s.gpu.texture(addr, 64, 64, fmt);
+      // Change two separate tiles (one byte, and one run across a tile boundary)
+      const tileBytes = bytes / 64;
+      for (const o of [5, tileBytes * 17 - 2, tileBytes * 17 + 1]) { src[o] ^= 0x5A; s.mem.w8(virt + o, src[o]); }
+      s.gpu.staleTextures(addr, bytes);
+      const t2 = s.gpu.texture(addr, 64, 64, fmt), full = EMU.decodeTexture(src, 0, 64, 64, fmt);
+      ok.push(t2 === t && t2.data.every((v, i) => v === full[i]));
+    }
+    return ok.every(Boolean);
+  });
+
   test('vertex shader math, uniforms and indexed strips', () => {
     const s = new Scene().setup();
     // o0 = v0 * c0 (scale), o1 = c1
@@ -328,6 +364,31 @@ module.exports = (EMU) => {
     s.vertices(quad([0, 1, 0, 0.4])).drawArrays(6).run();
     return s.stencilAt(10, 10) === 1 && s.stencilAt(50, 10) === 0 && near(s.pixel(10, 10), [0, 0, 128, 128], 2) && near(s.pixel(50, 10), [0, 0, 0, 255]);
   });
+
+  // Each point becomes a quad: two triangles from four emitted vertices (the second one with SETEMIT's winding flag)
+  function gsQuads(jit) {
+    const s = new Scene().setup({ outputs: 2 }).passthroughShader();
+    s.gpu.vs.jit = s.gpu.gs.jit = jit;
+    const a = new Asm();
+    a.setemit(0).add('o0', 'c0', 'v0').mov('o1', 'v1').emit();
+    a.setemit(1).add('o0', 'c1', 'v0').emit();
+    a.setemit(2, 1).add('o0', 'c2', 'v0').emit();
+    a.setemit(0, 1, 1).add('o0', 'c3', 'v0').emit();
+    a.end();
+    s.gshader(a);
+    const d = 0.2;
+    s.guniform(0, -d, -d, 0, 0).guniform(1, d, -d, 0, 0).guniform(2, -d, d, 0, 0).guniform(3, d, d, 0, 0);
+    s.w(0x229, 2).w(0x244, 1).w(0x24A, 1);       // geometry stage on, own configuration, 2 VS outputs per vertex
+    s.w(0x289, 0x08000000 | 1).w(0x28B, 0x10, 0).w(0x28D, 3); // point mode with 2 inputs (v0, v1), outputs o0, o1
+    s.vertices([[P(-0.5, -0.5), RED], [P(0.5, 0.5), GREEN]]);
+    s.wm(0x25E, 0x2, 3 << 8).w(0x25F, 1).w(0x228, 2).w(0x22A, 0).w(0x22E, 1).w(0x110, 1).run();
+    // quads span 6.4 pixels around (16, 16) and (48, 48)
+    return near(s.pixel(16, 16), [255, 0, 0, 255]) && near(s.pixel(12, 20), [255, 0, 0, 255]) && near(s.pixel(20, 12), [255, 0, 0, 255]) &&
+      near(s.pixel(48, 48), [0, 255, 0, 255]) && near(s.pixel(52, 44), [0, 255, 0, 255]) &&
+      near(s.pixel(32, 32), [0, 0, 0, 255]) && near(s.pixel(16, 26), [0, 0, 0, 255]) && s.gpu.stats.triangles === 4;
+  }
+  test('geometry shader: points expanded to quads (compiled)', () => gsQuads(true));
+  test('geometry shader: points expanded to quads (interpreted)', () => gsQuads(false));
 
   test('texture combiners: modulate, constant color and combiner buffer', () => {
     const s = new Scene().setup().passthroughShader();

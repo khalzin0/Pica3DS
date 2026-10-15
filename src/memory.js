@@ -4,6 +4,7 @@
 
   const hex = (v, w = 8) => '0x' + (v >>> 0).toString(16).toUpperCase().padStart(w, '0');
   EMU.hex = hex;
+  EMU.now = typeof performance !== 'undefined' ? () => performance.now() : () => Date.now(); // ms, for timings
 
   class EmuError extends Error {}
   EMU.EmuError = EmuError;
@@ -180,6 +181,44 @@
         done += n;
       }
       return out;
+    }
+
+    // Like readBytes, into an existing buffer (returned)
+    readInto(addr, out) {
+      const len = out.length;
+      let done = 0;
+      while (done < len) {
+        const a = (addr + done) >>> 0;
+        const p = this.pages[a >>> 12];
+        if (p === null) this.fault(a, 'readBytes');
+        const o = a & 0xFFF;
+        const n = Math.min(PAGE_SIZE - o, len - done);
+        out.set(p.subarray(o, o + n), done);
+        done += n;
+      }
+      return out;
+    }
+
+    // Fill `len` bytes with the little-endian `width`-byte (2, 3 or 4) pattern `value`, starting at the pattern's first byte
+    fillPattern(addr, len, value, width) {
+      if ((width === 2 || width === 4) && !(addr & (width - 1)) && !(len & (width - 1))) {
+        // Aligned: fill whole elements page by page (page boundaries keep the pattern phase)
+        const v = width === 2 ? value & 0xFFFF : value >>> 0, shift = width === 2 ? 1 : 2;
+        let done = 0;
+        while (done < len) {
+          const a = (addr + done) >>> 0;
+          const idx = a >>> 12;
+          if (this.pages[idx] === null) this.fault(a, 'fillPattern');
+          const o = a & 0xFFF, n = Math.min(PAGE_SIZE - o, len - done);
+          (width === 2 ? this.pages16 : this.pages32)[idx].fill(v, o >>> shift, (o + n) >>> shift);
+          done += n;
+        }
+        return;
+      }
+      const pat = [value & 0xFF, (value >>> 8) & 0xFF, (value >>> 16) & 0xFF, value >>> 24];
+      const data = new Uint8Array(len);
+      for (let j = 0, k = 0; j < len; j++, k = k + 1 === width ? 0 : k + 1) data[j] = pat[k];
+      this.writeBytes(addr, data);
     }
 
     writeBytes(addr, data) {

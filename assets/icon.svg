@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 556 476" role="img" aria-label="Pica3DS">
+  <defs>
+    <linearGradient id="red" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff0a2e"/>
+      <stop offset="1" stop-color="#ff2457"/>
+    </linearGradient>
+    <mask id="cut">
+      <rect width="556" height="476" fill="#fff"/>
+      <rect x="92" y="35" width="370" height="168" rx="12" fill="#000"/>
+      <rect x="145" y="277" width="265" height="159" rx="10" fill="#000"/>
+      <rect x="26" y="333" width="90" height="30" rx="10" fill="#000"/>
+      <rect x="56" y="303" width="30" height="90" rx="10" fill="#000"/>
+      <circle cx="481" cy="317" r="16" fill="#000"/>
+      <circle cx="481" cy="379" r="16" fill="#000"/>
+      <circle cx="450" cy="348" r="16" fill="#000"/>
+      <circle cx="512" cy="348" r="16" fill="#000"/>
+    </mask>
+  </defs>
+  <g fill="url(#red)" mask="url(#cut)">
+    <rect x="0" y="0" width="556" height="230" rx="48"/>
+    <path d="M40 245H516A40 40 0 0 1 556 285V378A95 95 0 0 1 461 473H95A95 95 0 0 1 0 378V285A40 40 0 0 1 40 245Z"/>
+  </g>
+</svg>

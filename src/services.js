@@ -104,9 +104,43 @@
         for (let o = 0xC; o + 1 < buffer.length && text.length < 200; o += 2) { const c = dv.getUint16(o, true); if (!c) break; text += String.fromCharCode(c); }
         detail = ` (type ${type}, code ${code}${text ? `, "${text}"` : ''})`;
       }
+      if ((applet & 0xFF) === 2) {
+        // Mii selector: answer as if the player picked a Mii (a built-in stand-in, not one from a console)
+        this.emu.log(`APT: ${name} ${hex(applet, 3)} requested; selecting the stand-in Mii "Player"`);
+        this.sendToApp({ sender: applet, signal: 0xA, buffer: AptService.miiSelectorResult(), object: null });
+        return;
+      }
       this.emu.log(`APT: ${name} ${hex(applet, 3)} requested${detail}; closing it immediately`);
       // WakeupByExit returns the parameter buffer to the application (the applet's result).
       this.sendToApp({ sender: applet, signal: 0xA, buffer, object: null });
+    }
+
+    // Mii selector return (0x84 bytes): [0] 0 = a Mii was selected, [4] guest Mii selected, [8] guest index,
+    // [0xC] Mii data (0x5C bytes), [0x68] padding, [0x6A] CRC-16 of the Mii data and padding (big-endian),
+    // [0x6C] guest Mii name.
+    static miiSelectorResult() {
+      const out = new Uint8Array(0x84), dv = new DataView(out.buffer);
+      dv.setUint32(0x08, 0xFFFFFFFF, true); // not a guest Mii
+      const m = 0x0C;
+      out[m] = 3;                        // Mii data format version
+      out[m + 1] = 1;                    // copying allowed
+      dv.setUint32(m + 0x04, 0x50494341); // system ID ("PICA"), big-endian halves
+      dv.setUint32(m + 0x08, 0x33445321);
+      dv.setUint32(m + 0x0C, 0x80000001); // Mii ID (bit 31: an ordinary, non-special Mii)
+      out.set([0x02, 0x50, 0x49, 0x43, 0x41, 0x01], m + 0x10); // creator MAC address (locally administered)
+      dv.setUint16(m + 0x18, (1 << 1) | (1 << 5), true); // male, born 1 January, favourite colour 0
+      const text = (o, s) => { for (let i = 0; i < 10; i++) dv.setUint16(m + o + i * 2, i < s.length ? s.charCodeAt(i) : 0, true); };
+      text(0x1A, 'Player');
+      out[m + 0x2E] = 64; out[m + 0x2F] = 64; // width and height: middle of the range
+      text(0x48, 'Player');      // creator name
+      // CRC-16 (polynomial 0x1021, initial value 0) over the Mii data and the padding after it
+      let crc = 0;
+      for (let i = m; i < 0x6A; i++) {
+        crc ^= out[i] << 8;
+        for (let b = 0; b < 8; b++) crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xFFFF : (crc << 1) & 0xFFFF;
+      }
+      dv.setUint16(0x6A, crc, false);
+      return out;
     }
 
     // The system font lives in shared memory: a 0x80-byte header, then the BCFNT with absolute pointers.
@@ -220,15 +254,21 @@
     switch (fmt) {
       case 0: return ((b[o + 3] << 24) | (b[o + 2] << 16) | (b[o + 1] << 8) | b[o]) >>> 0;
       case 1: return ((b[o + 2] << 24) | (b[o + 1] << 16) | (b[o] << 8) | 255) >>> 0;
-      default: { const c = decodePixel(fmt, b, o); return ((c[0] << 24) | (c[1] << 16) | (c[2] << 8) | c[3]) >>> 0; }
+      case 2: { const v = b[o] | (b[o + 1] << 8); return ((((v >> 11) & 31) * 255 / 31 | 0) << 24 | (((v >> 5) & 63) * 255 / 63 | 0) << 16 | ((v & 31) * 255 / 31 | 0) << 8 | 255) >>> 0; }
+      case 3: { const v = b[o] | (b[o + 1] << 8); return ((((v >> 11) & 31) * 255 / 31 | 0) << 24 | (((v >> 6) & 31) * 255 / 31 | 0) << 16 | (((v >> 1) & 31) * 255 / 31 | 0) << 8 | (v & 1) * 255) >>> 0; }
+      case 4: { const v = b[o] | (b[o + 1] << 8); return ((((v >> 12) & 15) * 17) << 24 | (((v >> 8) & 15) * 17) << 16 | (((v >> 4) & 15) * 17) << 8 | (v & 15) * 17) >>> 0; }
     }
+    return 255;
   }
 
   function encodePacked(fmt, b, o, v) {
+    const r = v >>> 24, g = (v >>> 16) & 255, bl = (v >>> 8) & 255, a = v & 255;
     switch (fmt) {
       case 0: b[o] = v; b[o + 1] = v >>> 8; b[o + 2] = v >>> 16; b[o + 3] = v >>> 24; return;
       case 1: b[o] = v >>> 8; b[o + 1] = v >>> 16; b[o + 2] = v >>> 24; return;
-      default: encodePixel(fmt, b, o, [v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]);
+      case 2: { const x = ((r >> 3) << 11) | ((g >> 2) << 5) | (bl >> 3); b[o] = x; b[o + 1] = x >> 8; return; }
+      case 3: { const x = ((r >> 3) << 11) | ((g >> 3) << 6) | ((bl >> 3) << 1) | (a >> 7); b[o] = x; b[o + 1] = x >> 8; return; }
+      case 4: { const x = ((r >> 4) << 12) | ((g >> 4) << 8) | ((bl >> 4) << 4) | (a >> 4); b[o] = x; b[o + 1] = x >> 8; return; }
     }
   }
 
@@ -251,6 +291,12 @@
       this.event = null;
       this.threadId = 0;
       this.screens = [null, null];
+      this.scratchIn = new Uint8Array(0); this.scratchOut = new Uint8Array(0); // reused transfer buffers
+    }
+
+    scratch(which, size) {
+      if (this[which].length < size) this[which] = new Uint8Array(size);
+      return this[which].subarray(0, size);
     }
 
     u32(o) { const b = this.shared; return (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0; }
@@ -298,8 +344,13 @@
           ipc.reply(id, [0]);
           return true;
         }
-        case 0x8: case 0x9: // FlushDataCache / InvalidateDataCache(addr, size): the GPU must re-read this memory
-          this.emu.gpu.invalidateVirt(ipc.get(1), ipc.get(2));
+        case 0x8: // FlushDataCache(addr, size): the CPU wrote this memory, the GPU must re-read it
+          this.emu.gpu.cacheFlushed(ipc.get(1), ipc.get(2));
+          ipc.reply(id, [0]);
+          return true;
+        case 0x9: // InvalidateDataCache(addr, size): the CPU is about to read what the GPU wrote
+          this.emu.gpu.syncToMemoryVirt(ipc.get(1), ipc.get(2));
+          this.emu.gpu.cacheFlushed(ipc.get(1), ipc.get(2));
           ipc.reply(id, [0]);
           return true;
         case 0xA: case 0xB: ipc.reply(id, [0]); return true; // SetLcdForceBlack, UpdateHeapRegions
@@ -337,11 +388,14 @@
         for (let i = 0; i < 8; i++) w.push(this.u32(off + i * 4));
         b[base] = (idx + 1) % 15;
         b[base + 1]--;
+        const t0 = EMU.now();
         try {
           this.execGx(w);
         } catch (e) {
           this.emu.log(`GX command ${w[0] & 0xFF} failed: ${e.message}`);
         }
+        const perf = this.emu.perf;
+        if ((w[0] & 0xFF) === 1) perf.gpu += EMU.now() - t0; else perf.xfer += EMU.now() - t0;
       }
     }
 
@@ -349,7 +403,7 @@
       const mem = this.mem;
       switch (w[0] & 0xFF) {
         case 0: { // RequestDma(src, dst, size)
-          if (w[3]) { mem.writeBytes(w[2], mem.readBytes(w[1], w[3])); this.emu.gpu.invalidateVirt(w[2], w[3]); }
+          if (w[3]) { this.emu.gpu.syncToMemoryVirt(w[1], w[3]); mem.writeBytes(w[2], mem.readBytes(w[1], w[3])); this.emu.gpu.invalidateVirt(w[2], w[3]); }
           this.pushInterrupt(GSP_INT.DMA);
           return;
         }
@@ -362,12 +416,9 @@
           fills.forEach(([start, value, end, ctl], i) => {
             if (!start || !(ctl & 1) || end <= start) return;
             const width = (ctl >> 8) & 3;
-            const len = end - start;
-            const data = new Uint8Array(len);
-            const pat = width === 0 ? [value & 0xFF, (value >> 8) & 0xFF] : width === 1 ? [value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF] : [value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF, value >>> 24];
-            for (let j = 0; j < len; j++) data[j] = pat[j % pat.length];
-            mem.writeBytes(start, data);
-            this.emu.gpu.invalidateVirt(start, len);
+            const bytes = width === 0 ? 2 : width === 1 ? 3 : 4;
+            mem.fillPattern(start, end - start, value, bytes);
+            this.emu.gpu.invalidateVirt(start, end - start, { value, bytes }); // a fill: render targets can just be cleared
             this.pushInterrupt(i === 0 ? GSP_INT.PSC0 : GSP_INT.PSC1);
           });
           return;
@@ -380,31 +431,46 @@
     }
 
     displayTransfer(src, dst, inDim, outDim, flags) {
-      const inW = inDim & 0xFFFF, inH = inDim >>> 16, outW = outDim & 0xFFFF, outH = outDim >>> 16;
+      // With downscaling (anti-aliasing), the output size register holds the size before scaling
+      const scaleMode = (flags >> 24) & 3;
+      const inW = inDim & 0xFFFF, inH = inDim >>> 16;
+      const outW = (outDim & 0xFFFF) >> (scaleMode ? 1 : 0), outH = (outDim >>> 16) >> (scaleMode === 2 ? 1 : 0);
       const inFmt = (flags >> 8) & 7, outFmt = (flags >> 12) & 7;
       const inBpp = BPP[inFmt], outBpp = BPP[outFmt];
       if (!inW || !inH || !outW || !outH) return;
-      const input = this.mem.readBytes(src, inW * inH * inBpp);
+      const gpu = this.emu.gpu;
+      if (gpu.gl && gpu.gl.displayTransfer(gpu.toPhys(src), gpu.toPhys(dst), inW, inH, outW, outH, inFmt, outFmt, flags)) return;
+      gpu.syncToMemoryVirt(src, inW * inH * inBpp);
+      const input = this.mem.readInto(src, this.scratch('scratchIn', inW * inH * inBpp));
       if (flags & 8) { // raw copy
         this.mem.writeBytes(dst, input.subarray(0, Math.min(input.length, outW * outH * outBpp)));
         return;
       }
-      const output = new Uint8Array(outW * outH * outBpp);
+      // Every output byte is either written below or left zero, as in a freshly allocated buffer
+      const output = this.scratch('scratchOut', outW * outH * outBpp).fill(0);
       const flip = flags & 1, outTiled = flags & 2, scale = (flags >> 24) & 3;
       const sx = scale ? 1 : 0, sy = scale === 2 ? 1 : 0;
       const same = inFmt === outFmt;
+      const inLen = input.length, outLen = output.length;
+      const inTilesX = inW >> 3, outTilesX = outW >> 3;
       for (let y = 0; y < outH; y++) {
         const oy = flip ? outH - 1 - y : y;
         const iy = y << sy;
         if (iy >= inH) break;
+        // Row parts of the tiled offsets (see tiledOffset)
+        const inRow = (iy >> 3) * inTilesX, inM = (iy & 7) * 8, outRow = (oy >> 3) * outTilesX, outM = (oy & 7) * 8;
         for (let x = 0; x < outW; x++) {
           const ix = x << sx;
           if (ix >= inW) break;
-          const so = outTiled ? (iy * inW + ix) * inBpp : tiledOffset(ix, iy, inW, inBpp);
-          const doff = outTiled ? tiledOffset(x, oy, outW, outBpp) : (oy * outW + x) * outBpp;
-          if (so + inBpp > input.length || doff + outBpp > output.length) continue;
-          if (same) for (let k = 0; k < inBpp; k++) output[doff + k] = input[so + k];
-          else encodePacked(outFmt, output, doff, decodePacked(inFmt, input, so));
+          const so = outTiled ? (iy * inW + ix) * inBpp : (((inRow + (ix >> 3)) << 6) + MORTON8[inM + (ix & 7)]) * inBpp;
+          const doff = outTiled ? (((outRow + (x >> 3)) << 6) + MORTON8[outM + (x & 7)]) * outBpp : (oy * outW + x) * outBpp;
+          if (so + inBpp > inLen || doff + outBpp > outLen) continue;
+          if (same) {
+            output[doff] = input[so];
+            if (inBpp > 1) output[doff + 1] = input[so + 1];
+            if (inBpp > 2) output[doff + 2] = input[so + 2];
+            if (inBpp > 3) output[doff + 3] = input[so + 3];
+          } else encodePacked(outFmt, output, doff, decodePacked(inFmt, input, so));
         }
       }
       this.mem.writeBytes(dst, output);
@@ -415,6 +481,7 @@
       const inW = (inLine & 0xFFFF) * 16, inGap = (inLine >>> 16) * 16;
       const outW = (outLine & 0xFFFF) * 16, outGap = (outLine >>> 16) * 16;
       size &= ~15;
+      this.emu.gpu.syncToMemoryVirt(src, size + inGap * Math.ceil(size / Math.max(inW, 1)));
       this.emu.gpu.invalidateVirt(dst, size + outGap * Math.ceil(size / Math.max(outW, 1)));
       if (!inW || !outW) { if (size) this.mem.writeBytes(dst, this.mem.readBytes(src, size)); return; }
       let si = src, di = dst, sRem = inW, dRem = outW, left = size;
@@ -650,19 +717,23 @@
     // Binary archive path [title ID low, title ID high, media type, reserved] -> loaded system RomFS.
     systemArchive(ptr) {
       const id = (this.mem.r32((ptr + 4) >>> 0).toString(16).padStart(8, '0') + this.mem.r32(ptr >>> 0).toString(16).padStart(8, '0')).toLowerCase();
-      let romfs = this.emu.systemArchives.get(id);
-      const name = EMU.SYSTEM_ARCHIVE_NAMES[id];
-      if (!romfs && EMU.STANDIN_ARCHIVES && EMU.STANDIN_ARCHIVES[id]) {
-        romfs = EMU.STANDIN_ARCHIVES[id]();
-        this.emu.systemArchives.set(id, romfs); // reuse for the rest of the session
-        this.emu.standinArchives = (this.emu.standinArchives || new Set()).add(id);
-        this.emu.log(`fs: system file ${id.toUpperCase()}${name ? ` (${name})` : ''} not added; using a built-in stand-in`);
+      const romfs = this.emu.systemArchives.get(id);
+      if (romfs) return romfs;
+      // Not added by the user: a built-in stand-in, or for unknown archives an empty one. Built once per load and
+      // kept apart from the user's files.
+      const emu = this.emu, cache = emu.standinArchives || (emu.standinArchives = new Map());
+      if (cache.has(id)) return cache.get(id);
+      const name = EMU.SYSTEM_ARCHIVE_NAMES[id], label = `${id.toUpperCase()}${name ? ` (${name})` : ''}`;
+      const build = EMU.STANDIN_ARCHIVES && EMU.STANDIN_ARCHIVES[id];
+      if (build) emu.log(`fs: system file ${label} not added; using a built-in stand-in`);
+      else {
+        // Remembered so that if the game stops later, the message can say this file may be the reason
+        emu.missingSystemArchive = { id, name, empty: true };
+        emu.log(`fs: system file ${label} not added; using an empty stand-in. If the game stops, dump it from your 3DS and add it with "System files…".`);
       }
-      if (!romfs) {
-        this.emu.missingSystemArchive = { id, name };
-        this.emu.log(`fs: missing system file ${id.toUpperCase()}${name ? ` (${name})` : ''}. Dump it from your 3DS and add it with "System files…".`);
-      }
-      return romfs || null;
+      const img = build ? build() : EMU.buildEmptyArchive();
+      cache.set(id, img);
+      return img;
     }
 
     pathKey(type, size, ptr) { return type === 1 ? '' : this.readPath(type, size, ptr); }
@@ -887,6 +958,14 @@
 
     start() {
       this.on = true;
+      if (!this.audio && EMU.DspAudio) {
+        // Shared memory regions 0 and 1 (DSP word addresses 0x8000 and 0x18000) and the structure offsets
+        // reported to the application in the Initialize reply
+        this.audio = new EMU.DspAudio(this.emu, [DSP_RAM + 0x10000, DSP_RAM + 0x30000], {
+          frameCounter: DSP_STRUCTS[0], sourceConfigs: DSP_STRUCTS[1], sourceStatuses: DSP_STRUCTS[2],
+          adpcmCoefs: DSP_STRUCTS[3], dspConfig: DSP_STRUCTS[4],
+        });
+      }
       if (this.timer) return;
       const tm = new EMU.KTimer(2);
       tm.interval = Math.round(EMU.TICKS_PER_SEC * AUDIO_FRAME_SAMPLES / AUDIO_RATE);
@@ -900,6 +979,7 @@
     tick() {
       if (!this.on) return;
       this.frames++;
+      if (this.audio) this.audio.tick();
       this.signalInterrupt(2, 2);
     }
 
@@ -944,7 +1024,7 @@
         case 0x0E: case 0x10: this.readPipe(ipc, id, ipc.get(1), ipc.get(3) & 0xFFFF); return true; // ReadPipe(IfPossible)
         case 0x0F: ipc.reply(id, [0, (this.pipes[ipc.get(1)] || []).length]); return true; // GetPipeReadableSize
         case 0x11: // LoadComponent(size, programMask, dataMask, buffer) -> loaded
-          if (!this.warned) { this.warned = true; this.emu.log('DSP: audio firmware accepted; audio runs silently (sound output is not emulated yet)'); }
+          if (!this.warned) { this.warned = true; this.emu.log('DSP: audio firmware accepted; audio is emulated at a high level (no effects or filters)'); }
           ipc.reply(id, [0, 1], [(ipc.get(1) << 4) | 0xA, ipc.get(5)]);
           return true;
         case 0x12: this.on = false; ipc.reply(id, [0]); return true;          // UnloadComponent
@@ -1005,6 +1085,231 @@
     }
   }
 
+  // ------------------------------------------------------------------ y2r:u (YUV -> RGB converter, used for video)
+  // Standard coefficient sets (ITU-R BT.601, BT.709, and both scaled to the 16-235 range): C0..C3 multiply Y, V
+  // and U; C5..C7 are the R, G, B offsets
+  const Y2R_STANDARD = [
+    [0x100, 0x166, 0xB6, 0x58, 0x1C5, -0x166F, 0x10EE, -0x1C5B],
+    [0x100, 0x193, 0x77, 0x2F, 0x1DB, -0x1933, 0xA7C, -0x1D51],
+    [0x12A, 0x198, 0xD0, 0x64, 0x204, -0x1BDE, 0x10F2, -0x229B],
+    [0x12A, 0x1CA, 0x88, 0x36, 0x21C, -0x1F04, 0x99C, -0x2421],
+  ];
+
+  class Y2rService extends Service {
+    constructor(emu, name) {
+      super(emu, name);
+      this.event = new EMU.KEvent(0, 'Y2R transfer end');
+      this.inFmt = 0; this.outFmt = 0; this.rotation = 0; this.block = 0;
+      this.width = 0; this.lines = 0; this.alpha = 0xFF; this.coef = Y2R_STANDARD[0].slice(); this.interrupt = 0;
+      const buf = () => ({ addr: 0, size: 0, unit: 0, gap: 0 });
+      this.y = buf(); this.u = buf(); this.v = buf(); this.yuyv = buf(); this.out = buf();
+    }
+
+    // [address, total size, transfer unit, gap]: the unit and gap are 16-bit fields (the upper half is unused)
+    setBuffer(b, ipc) { b.addr = ipc.get(1); b.size = ipc.get(2); b.unit = ipc.get(3) & 0xFFFF; b.gap = ipc.get(4) & 0xFFFF; }
+
+    handle(ipc, id) {
+      const g = (i) => ipc.get(i), word = (a, b) => ((a & 0xFFFF) | ((b & 0xFFFF) << 16)) >>> 0;
+      const coefWords = (c) => [word(c[0], c[1]), word(c[2], c[3]), word(c[4], c[5]), word(c[6], c[7])];
+      switch (id) {
+        case 0x01: this.inFmt = g(1) & 7; break;
+        case 0x02: ipc.reply(id, [0, this.inFmt]); return true;
+        case 0x03: this.outFmt = g(1) & 3; break;
+        case 0x04: ipc.reply(id, [0, this.outFmt]); return true;
+        case 0x05: this.rotation = g(1) & 3; break;
+        case 0x06: ipc.reply(id, [0, this.rotation]); return true;
+        case 0x07: this.block = g(1) & 1; break;
+        case 0x08: ipc.reply(id, [0, this.block]); return true;
+        case 0x09: case 0x0B: case 0x24: break; // dithering settings (not emulated)
+        case 0x0A: case 0x0C: ipc.reply(id, [0, 0]); return true;
+        case 0x0D: this.interrupt = g(1) & 1; break;
+        case 0x0E: ipc.reply(id, [0, this.interrupt]); return true;
+        case 0x0F: ipc.reply(id, [0], [0, this.kernel.createHandle(this.event)]); return true; // GetTransferEndEvent
+        case 0x10: this.setBuffer(this.y, ipc); break;
+        case 0x11: this.setBuffer(this.u, ipc); break;
+        case 0x12: this.setBuffer(this.v, ipc); break;
+        case 0x13: this.setBuffer(this.yuyv, ipc); break;
+        case 0x14: case 0x15: case 0x16: case 0x17: case 0x19: ipc.reply(id, [0, 1]); return true; // IsFinished...: conversions finish at once
+        case 0x18: this.setBuffer(this.out, ipc); break;
+        case 0x1A: this.width = g(1) & 0x3FF; break;
+        case 0x1B: ipc.reply(id, [0, this.width]); return true;
+        case 0x1C: this.lines = g(1) & 0x3FF; break;
+        case 0x1D: ipc.reply(id, [0, this.lines]); return true;
+        case 0x1E: for (let i = 0; i < 8; i++) this.coef[i] = (g(1 + (i >> 1)) >>> ((i & 1) * 16)) << 16 >> 16; break;
+        case 0x1F: ipc.reply(id, [0, ...coefWords(this.coef)]); return true;
+        case 0x20: this.coef = Y2R_STANDARD[g(1) & 3].slice(); break;
+        case 0x21: ipc.reply(id, [0, ...coefWords(Y2R_STANDARD[g(1) & 3])]); return true;
+        case 0x22: this.alpha = g(1) & 0xFF; break;
+        case 0x23: ipc.reply(id, [0, this.alpha]); return true;
+        case 0x25: ipc.reply(id, [0, 0, 0, 0, 0, 0, 0, 0, 0]); return true;
+        case 0x26: this.convert(); this.kernel.signalEvent(this.event); break; // StartConversion
+        case 0x27: break; // StopConversion
+        case 0x28: ipc.reply(id, [0, 0]); return true; // IsBusyConversion
+        case 0x29: { // SetPackageParameter
+          const a = g(1), b = g(2), c = g(3);
+          this.inFmt = a & 7; this.outFmt = (a >>> 8) & 3; this.rotation = (a >>> 16) & 3; this.block = (a >>> 24) & 1;
+          this.width = b & 0x3FF; this.lines = (b >>> 16) & 0x3FF;
+          this.coef = Y2R_STANDARD[c & 3].slice(); this.alpha = (c >>> 16) & 0xFF;
+          break;
+        }
+        case 0x2A: ipc.reply(id, [0, 0]); return true; // PingProcess
+        case 0x2B: case 0x2C: break; // DriverInitialize / DriverFinalize
+        case 0x2D: ipc.reply(id, [0, (this.inFmt | (this.outFmt << 8) | (this.rotation << 16) | (this.block << 24)) >>> 0, word(this.width, this.lines), (this.alpha << 16) >>> 0]); return true;
+        default: return false;
+      }
+      ipc.reply(id, [0]);
+      return true;
+    }
+
+    // Read n samples through a DMA-style buffer (transfer unit bytes, then skip gap bytes). 16-bit inputs keep
+    // the low byte of each sample.
+    readSamples(b, n, step) {
+      const out = new Uint8Array(n), mem = this.mem, unit = b.unit || n * step;
+      let o = 0, addr = b.addr, inUnit = 0;
+      while (o < n) {
+        out[o++] = mem.r8(addr >>> 0);
+        addr += step; inUnit += step;
+        if (inUnit >= unit) { addr += b.gap; inUnit = 0; }
+      }
+      b.addr = addr; // a strip continues where the previous one ended
+      return out;
+    }
+
+    convert() {
+      const w = this.width, lines = this.lines;
+      if (!w || !lines) return;
+      if (this.rotation && !this.warnedRotation) { this.warnedRotation = true; this.emu.log('y2r: rotated output is not emulated (drawn unrotated)'); }
+      const fmt = this.inFmt, step = fmt === 2 || fmt === 3 ? 2 : 1, c = this.coef, alpha = this.alpha;
+      const bpp = [4, 3, 2, 2][this.outFmt], mem = this.mem;
+      const bufs = { y: { ...this.y }, u: { ...this.u }, v: { ...this.v }, yuyv: { ...this.yuyv } };
+      const out = { ...this.out }, outUnit = out.unit || w * 8 * bpp;
+      let outAddr = out.addr, inUnit = 0;
+      const put = (byte) => {
+        mem.w8(outAddr >>> 0, byte);
+        outAddr++;
+        if (++inUnit >= outUnit) { outAddr += out.gap; inUnit = 0; }
+      };
+      const strip = new Int32Array(w * 8 * 3); // r, g, b per pixel, 8 rows
+      const cl = (v) => (v < 0 ? 0 : v > 255 ? 255 : v);
+      for (let y0 = 0; y0 < lines; y0 += 8) {
+        const rows = Math.min(8, lines - y0);
+        let Y, U, V;
+        if (fmt === 4) Y = this.readSamples(bufs.yuyv, w * 2 * rows, 1);
+        else {
+          Y = this.readSamples(bufs.y, w * rows, step);
+          const chromaRows = fmt === 1 || fmt === 3 ? rows >> 1 : rows;
+          U = this.readSamples(bufs.u, (w >> 1) * chromaRows, step);
+          V = this.readSamples(bufs.v, (w >> 1) * chromaRows, step);
+        }
+        for (let y = 0; y < rows; y++) {
+          for (let x = 0; x < w; x++) {
+            let yy, uu, vv;
+            if (fmt === 4) { const p = (y * w + (x & ~1)) * 2; yy = Y[(y * w + x) * 2]; uu = Y[p + 1]; vv = Y[p + 3]; }
+            else {
+              const ci = fmt === 1 || fmt === 3 ? (y >> 1) * (w >> 1) + (x >> 1) : (y * w + x) >> 1;
+              yy = Y[y * w + x]; uu = U[ci]; vv = V[ci];
+            }
+            const cy = c[0] * yy;
+            const r = ((cy + c[1] * vv) >> 3) + c[5] + 0x18;
+            const gg = ((cy - c[2] * vv - c[3] * uu) >> 3) + c[6] + 0x18;
+            const b = ((cy + c[4] * uu) >> 3) + c[7] + 0x18;
+            const o = (y * w + x) * 3;
+            strip[o] = cl(r >> 5); strip[o + 1] = cl(gg >> 5); strip[o + 2] = cl(b >> 5);
+          }
+        }
+        // Pixel order: rows, or 8x8 tiles with texels in Morton order (for use as a texture)
+        const emit = (x, y) => {
+          if (y >= rows) { for (let k = 0; k < bpp; k++) put(0); return; }
+          const o = (y * w + x) * 3, r = strip[o], gg = strip[o + 1], b = strip[o + 2];
+          switch (this.outFmt) {
+            case 0: put(alpha); put(b); put(gg); put(r); break;
+            case 1: put(b); put(gg); put(r); break;
+            case 2: { const v = ((r >> 3) << 11) | ((gg >> 3) << 6) | ((b >> 3) << 1) | (alpha >> 7); put(v & 0xFF); put(v >> 8); break; }
+            default: { const v = ((r >> 3) << 11) | ((gg >> 2) << 5) | (b >> 3); put(v & 0xFF); put(v >> 8); }
+          }
+        };
+        if (this.block) {
+          for (let tx = 0; tx < w; tx += 8) {
+            for (let i = 0; i < 64; i++) {
+              let x = 0, y = 0;
+              for (let bit = 0; bit < 3; bit++) { x |= ((i >> (2 * bit)) & 1) << bit; y |= ((i >> (2 * bit + 1)) & 1) << bit; }
+              emit(tx + x, y);
+            }
+          }
+        } else for (let y = 0; y < rows; y++) for (let x = 0; x < w; x++) emit(x, y);
+      }
+      // The output may be a texture or a framebuffer the GPU caches
+      if (this.emu.gpu) this.emu.gpu.invalidateVirt(out.addr >>> 0, outAddr - out.addr);
+    }
+  }
+
+  // ------------------------------------------------------------------ mic:u (microphone: records silence)
+  const MIC_RATES = [32730, 16360, 10910, 8180];
+
+  class MicService extends Service {
+    constructor(emu, name) {
+      super(emu, name);
+      this.event = new EMU.KEvent(0, 'MIC buffer full');
+      this.block = null; this.blockSize = 0; this.timer = null; this.gain = 0; this.power = 0; this.clamp = 0;
+    }
+
+    // Byte i of the mapped shared memory
+    put(i, v) { const p = this.block.pages[i >>> 12]; if (p) p[i & 0xFFF] = v; }
+
+    startSampling(encoding, rate, offset, size, loop) {
+      this.stopSampling();
+      if (!this.block) return;
+      // Silence: the middle value for unsigned encodings (0, 1), zero for signed ones (2, 3)
+      const pcm16 = encoding & 1, silent = encoding < 2 ? (pcm16 ? 0x8000 : 0x80) : 0;
+      for (let i = 0; i + pcm16 < size; i += 1 + pcm16) {
+        this.put(offset + i, silent & 0xFF);
+        if (pcm16) this.put(offset + i + 1, silent >>> 8);
+      }
+      // The last word of the shared memory holds the current write position: the buffer is full
+      const end = this.blockSize - 4, pos = size;
+      for (let b = 0; b < 4; b++) this.put(end + b, (pos >>> (b * 8)) & 0xFF);
+      // Signal "buffer full" each time the buffer would have filled at the sample rate
+      const bytesPerSec = MIC_RATES[rate & 3] * (1 + pcm16), k = this.kernel;
+      const period = Math.max(1, Math.round(size / bytesPerSec * EMU.TICKS_PER_SEC));
+      const tm = new EMU.KTimer(0);
+      tm.next = k.ticks + period;
+      tm.interval = loop ? period : 0;
+      tm.onFire = () => { k.signalEvent(this.event); if (!loop) this.stopSampling(); };
+      k.timers.add(tm);
+      this.timer = tm;
+    }
+
+    stopSampling() { if (this.timer) { this.kernel.timers.delete(this.timer); this.timer = null; } }
+
+    handle(ipc, id) {
+      const g = (i) => ipc.get(i);
+      switch (id) {
+        case 0x01: { // MapSharedMemory(size, handle)
+          const b = this.kernel.getObj(g(3));
+          this.block = b && b.pages ? b : null; this.blockSize = g(1);
+          break;
+        }
+        case 0x02: this.stopSampling(); this.block = null; break; // UnmapSharedMemory
+        case 0x03: this.startSampling(g(1) & 3, g(2) & 3, g(3), g(4), g(5) & 1); break;
+        case 0x04: break; // AdjustSampling
+        case 0x05: this.stopSampling(); break;
+        case 0x06: ipc.reply(id, [0, this.timer ? 1 : 0]); return true; // IsSampling
+        case 0x07: ipc.reply(id, [0], [0, this.kernel.createHandle(this.event)]); return true; // GetBufferFullEvent
+        case 0x08: this.gain = g(1) & 0xFF; break;
+        case 0x09: ipc.reply(id, [0, this.gain]); return true;
+        case 0x0A: this.power = g(1) & 1; break;
+        case 0x0B: ipc.reply(id, [0, this.power]); return true;
+        case 0x0C: break; // SetIirFilterMic
+        case 0x0D: this.clamp = g(1) & 1; break;
+        case 0x0E: ipc.reply(id, [0, this.clamp]); return true;
+        case 0x0F: case 0x10: break; // SetAllowShellClosed, SetClientVersion
+        default: return false;
+      }
+      ipc.reply(id, [0]);
+      return true;
+    }
+  }
+
   class StubService extends Service {}
 
   // ------------------------------------------------------------------ registry
@@ -1038,6 +1343,8 @@
           case 'CFG': svc = new CfgService(this.emu, name); break;
           case 'PTM': svc = new PtmService(this.emu, name); break;
           case 'dsp::DSP': svc = new DspService(this.emu, name); break;
+          case 'y2r:u': svc = new Y2rService(this.emu, name); break;
+          case 'mic:u': svc = new MicService(this.emu, name); break;
           default: svc = new StubService(this.emu, name); this.emu.log(`Service "${name}" is stubbed`);
         }
         this.instances.set(key, svc);

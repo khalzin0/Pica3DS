@@ -11,6 +11,169 @@
   const satU = (v, bits) => { const max = 2 ** bits - 1; return v > max ? max : v < 0 ? 0 : v; };
   const TWO32 = 4294967296;
 
+  // ================================================================ ARM block compiler
+  // Straight-line runs of ARM instructions (within one 4 KB page) are translated into a JavaScript function.
+  // Decoding and condition dispatch happen once; common data-processing, load/store, extend and multiply
+  // forms get specialised code, and every other instruction calls the interpreter's own handler exactly as
+  // CPU.run would. A block re-checks its instruction words against memory each time it runs (so rewritten
+  // code is never executed stale) and only runs when the whole block fits in the instruction budget, so
+  // instruction counts, and therefore thread scheduling, are identical to the interpreter.
+  const BLOCK_MAX = 96;
+  const BLOCK_TAB = 1 << 16;
+  const COND_EXPR = [
+    'c.z === 1', 'c.z === 0', 'c.c === 1', 'c.c === 0', 'c.n === 1', 'c.n === 0', 'c.v === 1', 'c.v === 0',
+    'c.c === 1 && c.z === 0', 'c.c === 0 || c.z === 1', 'c.n === c.v', 'c.n !== c.v', 'c.z === 0 && c.n === c.v', 'c.z === 1 || c.n !== c.v',
+  ];
+  const rorConst = (v, n) => ((n &= 31) === 0 ? v >>> 0 : ((v >>> n) | (v << (32 - n))) >>> 0);
+
+  function compileArmBlock(cpu, start) {
+    const pages32 = cpu.mem.pages32, idx = start >>> 12, page = pages32[idx];
+    if (page === null || (start & 3)) return null;
+    let code = '';
+    let checks = '';
+    let n = 0, pc = start, ended = false;
+    while (n < BLOCK_MAX && (pc >>> 12) === idx && !ended) {
+      const insn = page[(pc & 0xFFF) >>> 2] | 0, PC = pc;
+      checks += `${n ? ' || ' : ''}P[${(pc & 0xFFF) >>> 2}] !== ${insn >>> 0}`;
+      const cond = insn >>> 28;
+      const R = (k) => (k === 15 ? `${(PC + 8) >>> 0}` : `r[${k}]`);
+      // The interpreter's own steps for one instruction; leave the block if it changed control flow
+      const generic = () => `c.curPC = ${PC}; c.pc = ${(PC + 4) >>> 0}; r[15] = ${(PC + 8) >>> 0}; ` +
+        `${cond === 15 ? `c.execArmUncond(${insn}, ${PC});` : `c.execArm(${insn}, ${PC});`}` +
+        ` if (c.pc !== ${(PC + 4) >>> 0} || c.t || c.stop) return ${n + 1};`;
+      let body = null;
+      const op3 = (insn >>> 25) & 7;
+      if (cond === 15) body = generic();
+      else if (op3 === 5) { // B / BL ends the block
+        const target = (PC + 8 + ((insn << 8) >> 6)) >>> 0;
+        const taken = `${insn & 0x01000000 ? `r[14] = ${(PC + 4) >>> 0}; ` : ''}c.pc = ${target};`;
+        code += `c.curPC = ${PC}; r[15] = ${(PC + 8) >>> 0};\n`;
+        code += cond === 14 ? `${taken}\n` : `if (${COND_EXPR[cond]}) { ${taken} } else c.pc = ${(PC + 4) >>> 0};\n`;
+        code += `return ${n + 1};\n`;
+        n++; ended = true;
+        break;
+      } else body = specialise(insn, PC, R) || generic();
+      code += cond >= 14 ? `${body}\n` : `if (${COND_EXPR[cond]}) { ${body} }\n`; // 15: unconditional space
+      n++;
+      pc = (pc + 4) >>> 0;
+    }
+    if (!ended) code += `c.pc = ${pc}; c.curPC = ${(pc - 4) >>> 0}; r[15] = ${(pc + 4) >>> 0}; return ${n};\n`;
+    const src = `return function block(c, r, mem, P) {\nif (${checks}) return -1;\n${code}};`;
+    const fn = new Function(src)();
+    return { fn, n, idx, start };
+  }
+
+  // Specialised code for common instruction forms, or null to use the generic path
+  function specialise(insn, PC, R) {
+    const op3 = (insn >>> 25) & 7;
+    const rn = (insn >>> 16) & 15, rd = (insn >>> 12) & 15, rm = insn & 15;
+    // ---- data processing (immediate, register, register shifted by immediate)
+    const isDP = (op3 === 0 && (insn & 0x90) !== 0x90 && (insn & 0x01900000) !== 0x01000000 && !(insn & 0x10)) ||
+      (op3 === 1 && (insn & 0x01900000) !== 0x01000000);
+    if (isDP) {
+      if (rd === 15) return null;
+      const op = (insn >>> 21) & 15, S = (insn & 0x00100000) !== 0;
+      let b, sc, pre = '';
+      if (insn & 0x02000000) {
+        const rot = ((insn >>> 8) & 15) * 2, v = rorConst(insn & 0xFF, rot);
+        b = `${v}`; sc = rot === 0 ? 'c.c' : `${v >>> 31}`;
+      } else if ((insn & 0xFF0) === 0) {
+        b = R(rm); sc = 'c.c';
+      } else {
+        const type = (insn >>> 5) & 3, amt = (insn >>> 7) & 31;
+        pre = `const x = ${R(rm)}; `;
+        switch (type) {
+          case 0: b = amt ? `((x << ${amt}) >>> 0)` : 'x'; sc = amt ? `((x >>> ${32 - amt}) & 1)` : 'c.c'; break;
+          case 1: b = amt ? `(x >>> ${amt})` : '0'; sc = amt ? `((x >>> ${amt - 1}) & 1)` : '(x >>> 31)'; break;
+          case 2: b = amt ? `(((x | 0) >> ${amt}) >>> 0)` : '((x >>> 31) ? 0xFFFFFFFF : 0)'; sc = amt ? `((x >>> ${amt - 1}) & 1)` : '(x >>> 31)'; break;
+          default: b = amt ? `(((x >>> ${amt}) | (x << ${32 - amt})) >>> 0)` : '(((c.c << 31) | (x >>> 1)) >>> 0)'; sc = amt ? `((x >>> ${amt - 1}) & 1)` : '(x & 1)';
+        }
+      }
+      const a = R(rn);
+      const logicFlags = (res) => `c.n = ${res} >>> 31; c.z = ${res} === 0 ? 1 : 0; c.c = s;`;
+      // sc must be read before any flag changes (RRX reads the old carry)
+      const needSc = S && (op < 2 || op >= 12 || op === 8 || op === 9);
+      let s = `{ ${pre}const b = ${b};${needSc ? ` const s = ${sc};` : ''} `;
+      switch (op) {
+        case 0: s += `const res = (${a} & b) >>> 0;`; break;
+        case 1: s += `const res = (${a} ^ b) >>> 0;`; break;
+        case 2: s += S ? `const res = c.subF(${a}, b);` : `const res = (${a} - b) >>> 0;`; break;
+        case 3: s += S ? `const res = c.subF(b, ${a});` : `const res = (b - ${a}) >>> 0;`; break;
+        case 4: s += S ? `const res = c.addF(${a}, b);` : `const res = (${a} + b) >>> 0;`; break;
+        case 5: s += S ? `const res = c.adcF(${a}, b);` : `const res = (${a} + b + c.c) >>> 0;`; break;
+        case 6: s += S ? `const res = c.sbcF(${a}, b);` : `const res = (${a} - b - (1 - c.c)) >>> 0;`; break;
+        case 7: s += S ? `const res = c.sbcF(b, ${a});` : `const res = (b - ${a} - (1 - c.c)) >>> 0;`; break;
+        case 8: return `${s}const res = (${a} & b) >>> 0; ${logicFlags('res')} }`;
+        case 9: return `${s}const res = (${a} ^ b) >>> 0; ${logicFlags('res')} }`;
+        case 10: return `${s}c.subF(${a}, b); }`;
+        case 11: return `${s}c.addF(${a}, b); }`;
+        case 12: s += `const res = (${a} | b) >>> 0;`; break;
+        case 13: s += 'const res = b;'; break;
+        case 14: s += `const res = (${a} & ~b) >>> 0;`; break;
+        default: s += 'const res = (~b) >>> 0;';
+      }
+      if (S && (op < 2 || op >= 12)) s += ` ${logicFlags('res')}`;
+      return `${s} r[${rd}] = res; }`;
+    }
+    // ---- LDR / STR / LDRB / STRB
+    if (op3 === 2 || (op3 === 3 && !(insn & 0x10))) {
+      const L = insn & 0x00100000, P = insn & 0x01000000, U = insn & 0x00800000, B = insn & 0x00400000;
+      const wb = !P || (insn & 0x00200000);
+      if ((L && rd === 15) || (wb && rn === 15)) return null;
+      let off;
+      if (op3 === 2) off = `${insn & 0xFFF}`;
+      else {
+        const type = (insn >>> 5) & 3, amt = (insn >>> 7) & 31, x = R(rm);
+        switch (type) { // immShift values (the shifter carry is not used by loads/stores)
+          case 0: off = amt ? `((${x} << ${amt}) >>> 0)` : x; break;
+          case 1: off = amt ? `(${x} >>> ${amt})` : '0'; break;
+          case 2: off = amt ? `(((${x} | 0) >> ${amt}) >>> 0)` : `((${x} >>> 31) ? 0xFFFFFFFF : 0)`; break;
+          default: off = amt ? `(((${x} >>> ${amt}) | (${x} << ${32 - amt})) >>> 0)` : `(((c.c << 31) | (${x} >>> 1)) >>> 0)`;
+        }
+      }
+      let s = `{ c.curPC = ${PC}; const base = ${R(rn)}, offAddr = (base ${U ? '+' : '-'} ${off}) >>> 0; `;
+      const addr = P ? 'offAddr' : 'base';
+      if (L) s += `const v = ${B ? `mem.r8(${addr})` : `mem.r32(${addr})`}; ${wb ? `r[${rn}] = offAddr; ` : ''}r[${rd}] = v; }`;
+      else s += `const v = ${R(rd)}; ${B ? `mem.w8(${addr}, v & 0xFF)` : `mem.w32(${addr}, v)`}; ${wb ? `r[${rn}] = offAddr; ` : ''}}`;
+      return s;
+    }
+    if (op3 === 0 && (insn & 0x90) === 0x90) {
+      // ---- LDRH / STRH / LDRSB / LDRSH (LDRD / STRD use the generic path)
+      if ((insn & 0x60) !== 0) {
+        const L = insn & 0x00100000, P = insn & 0x01000000, U = insn & 0x00800000, sh = (insn >>> 5) & 3;
+        const wb = !P || (insn & 0x00200000);
+        if ((!L && sh !== 1) || (L && rd === 15) || (wb && rn === 15)) return null;
+        const off = (insn & 0x00400000) ? `${((insn >>> 4) & 0xF0) | (insn & 0xF)}` : R(rm);
+        let s = `{ c.curPC = ${PC}; const base = ${R(rn)}, offAddr = (base ${U ? '+' : '-'} ${off}) >>> 0; `;
+        const addr = P ? 'offAddr' : 'base';
+        if (L) {
+          const load = sh === 1 ? `mem.r16(${addr})` : sh === 2 ? `((mem.r8(${addr}) << 24) >> 24)` : `((mem.r16(${addr}) << 16) >> 16)`;
+          s += `const v = ${load}; ${wb ? `r[${rn}] = offAddr; ` : ''}r[${rd}] = v; }`;
+        } else s += `mem.w16(${addr}, ${R(rd)} & 0xFFFF); ${wb ? `r[${rn}] = offAddr; ` : ''}}`;
+        return s;
+      }
+      // ---- MUL / MLA
+      if ((insn & 0x0FC000F0) === 0x00000090) {
+        const mrd = (insn >>> 16) & 15, mrn = (insn >>> 12) & 15, rs = (insn >>> 8) & 15;
+        if (mrd === 15) return null;
+        const acc = insn & 0x00200000 ? ` + ${R(mrn)}` : '';
+        return `{ r[${mrd}] = Math.imul(${R(rm)}, ${R(rs)})${acc};${insn & 0x00100000 ? ` const x = r[${mrd}]; c.n = x >>> 31; c.z = x === 0 ? 1 : 0;` : ''} }`;
+      }
+      return null;
+    }
+    // ---- SXTB / SXTH / UXTB / UXTH (and the add forms)
+    if (op3 === 3 && (insn & 0x10) && ((insn >>> 5) & 7) === 3) {
+      const op1 = (insn >>> 20) & 0x1F;
+      if (op1 !== 10 && op1 !== 11 && op1 !== 14 && op1 !== 15) return null;
+      const rot = ((insn >>> 10) & 3) * 8, x = R(rm);
+      const v = rot ? `(((${x} >>> ${rot}) | (${x} << ${32 - rot})) >>> 0)` : x;
+      const add = rn !== 15 ? ` + ${R(rn)}` : ' + 0';
+      const ext = { 10: `((v << 24) >> 24)`, 11: `((v << 16) >> 16)`, 14: '(v & 0xFF)', 15: '(v & 0xFFFF)' }[op1];
+      return `{ const v = ${v}; r[${rd}] = ${ext}${add}; }`;
+    }
+    return null;
+  }
+
   class CPU {
     constructor(mem) {
       this.mem = mem;
@@ -31,6 +194,15 @@
       this.stop = false;
       this.svcHandler = null;
       this.curPC = 0;
+      this.jit = true;          // compile hot ARM blocks (false = interpret every instruction; same results)
+      // Direct-mapped by address bits: compiled blocks (checked against their start address) and branch-target
+      // counters (shared on collisions; they only decide when to compile)
+      this.blockTab = new Array(BLOCK_TAB).fill(null);
+      this.hot = new Uint16Array(BLOCK_TAB);
+      // Blocks are compiled once reached this often: the JS engine only optimises functions that run many
+      // times, and a block compiled too early runs slower than the interpreter
+      this.jitThreshold = 4096;
+      this.blocksCompiled = 0;
     }
 
     // ---------------------------------------------------------------- context
@@ -63,8 +235,31 @@
     run(max) {
       this.stop = false;
       const mem = this.mem, r = this.r, pages32 = mem.pages32;
-      let i = 0;
+      let i = 0, jumped = true;
       while (i < max && !this.stop) {
+        // At a branch target: run a compiled block if there is one and it fits in the budget
+        if (jumped && this.jit && !this.t) {
+          const start = this.pc, slot = (start >>> 2) & (BLOCK_TAB - 1);
+          let b = this.blockTab[slot];
+          if (b === null || b.start !== start) {
+            b = null;
+            const n = this.hot[slot] + 1;
+            if (n < this.jitThreshold) this.hot[slot] = n;
+            else {
+              this.hot[slot] = 0;
+              b = compileArmBlock(this, start);
+              this.blockTab[slot] = b;
+              if (b) this.blocksCompiled++;
+            }
+          }
+          if (b !== null && b.n <= max - i) {
+            const P = pages32[b.idx];
+            const k = P === null ? -1 : b.fn(this, r, mem, P);
+            if (k >= 0) { i += k; continue; }
+            this.blockTab[slot] = null; // the code changed: compile again once it is hot
+          }
+          jumped = false;
+        }
         i++;
         const pc = this.pc;
         this.curPC = pc;
@@ -82,6 +277,7 @@
           if (cond === 14 || this.cond(cond)) this.execArm(insn, pc);
           else if (cond === 15) this.execArmUncond(insn, pc);
         }
+        jumped = this.pc !== ((pc + (this.t ? 2 : 4)) >>> 0) || this.t !== 0;
       }
       return i;
     }
@@ -1050,4 +1246,5 @@
   }
 
   EMU.CPU = CPU;
+  EMU.compileArmBlock = compileArmBlock; // for tests
 })(typeof window !== 'undefined' ? window.EMU : globalThis.EMU);

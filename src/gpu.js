@@ -67,11 +67,46 @@
       this.b = 0;                   // bool uniforms
       this.i = new Int32Array(12);  // int uniforms (x = count, y = init, z = step) x4
       this.decoded = null;
+      this.jit = true;          // run compiled programs (false = interpreter; same results)
+      this.compiled = new Map(); // entry point -> compiled program (for the current bool/int uniforms)
+      this.codeVersion = 0;               // bumped whenever program words or swizzles change
+      this.compiled.verified = new Map(); // entry -> codeVersion it was last checked against the program words
+      this.compiledBySpec = new Map([['0|0,0,0,0,0,0,0,0,0,0,0,0', this.compiled]]); // uniform values -> such a map
+      this.flatten = true;       // allow straight-line programs specialised on the bool/int uniforms
+      this.stkEnd = []; this.stkRet = []; this.stkRepeat = []; this.stkInc = []; this.stkStart = []; this.stkLoop = [];
+      this.uniBuf = [];         // float uniform words being assembled
+      // Geometry shader emitter: SETEMIT selects the vertex slot (0-2), whether EMIT also outputs the
+      // triangle, and its winding; EMIT calls onEmit(unit) with the output registers set
+      this.emitVtx = 0; this.emitPrim = 0; this.emitWinding = 0;
+      this.onEmit = null;
       this.S = [new Float32Array(4), new Float32Array(4), new Float32Array(4)];
       this.D = new Float32Array(4);
     }
 
-    invalidate() { this.decoded = null; }
+    // Program words or swizzles changed. Compiled programs are kept: each is checked against the words it was
+    // built from before its next use (games switch between a few programs many times per frame).
+    invalidate() {
+      this.decoded = null;
+      this.codeVersion++;
+    }
+
+    // Set the bool uniforms and the int uniforms (count, init, step) x4; compiled programs depend on them
+    setUniforms(b, ints) {
+      let same = this.b === b;
+      for (let k = 0; same && k < 12; k++) same = this.i[k] === ints[k];
+      if (same) return;
+      this.b = b; this.i.set(ints);
+      // Programs compiled for these values before are kept (games switch between a few sets per frame)
+      const key = `${b}|${this.i.join(',')}`;
+      let m = this.compiledBySpec.get(key);
+      if (!m) {
+        if (this.compiledBySpec.size >= 64) { this.compiledBySpec.clear(); }
+        m = new Map();
+        m.verified = new Map();
+        this.compiledBySpec.set(key, m);
+      }
+      this.compiled = m;
+    }
 
     decode() {
       const out = new Array(4096);
@@ -149,7 +184,22 @@
     }
 
     // Run from `entry` until END. Inputs must already be in R[0..63].
+    // Compiled program starting at entry, for the current uniforms
+    program(entry) {
+      const m = this.compiled;
+      let fn = m.get(entry);
+      if (fn && m.verified.get(entry) !== this.codeVersion) {
+        if (sameProgram(this, fn)) m.verified.set(entry, this.codeVersion); else fn = null;
+      }
+      if (!fn) { fn = compileShader(this, entry); m.set(entry, fn); m.verified.set(entry, this.codeVersion); }
+      return fn;
+    }
+
     run(entry) {
+      if (this.jit) {
+        this.program(entry)(this, SHADER_HELPERS);
+        return;
+      }
       if (!this.decoded) this.decode();
       const prog = this.decoded, R = this.R, D = this.D, [S1, S2, S3] = this.S;
       const stack = [];
@@ -264,7 +314,9 @@
             this.store(ins.dst, d.mask, D);
             break;
           }
-          case OP.NOP: case OP.EMIT: case OP.SETEMIT: break;
+          case OP.NOP: break;
+          case OP.SETEMIT: this.emitVtx = (ins.w >>> 24) & 3; this.emitPrim = (ins.w >>> 23) & 1; this.emitWinding = (ins.w >>> 22) & 1; break;
+          case OP.EMIT: if (this.onEmit) this.onEmit(this); break;
           case OP.END: return;
           case OP.BREAK: case OP.BREAKC: {
             if (ins.op === OP.BREAKC && !cond(ins)) break;
@@ -297,86 +349,474 @@
     }
   }
 
+  // ------------------------------------------------------------------ shader compiler
+  // Translates a shader program (from its entry point) into JavaScript: one switch case per reachable
+  // instruction, falling through on straight-line code. Register indices and swizzles become constants;
+  // flow control keeps the interpreter's call/loop stack so results match ShaderUnit.run exactly
+  // (each result is computed in double precision and rounded to float32 once, when stored).
+  const shaderCache = new Map();
+
+  // ---- code generation shared by both shader compilers
+  // PICA multiplication (0 * inf = 0), inlined: the helper call is not always inlined by the JS engine
+  const mulExpr = (a, b) => `(mz = (mx = ${a}) * (my = ${b}), mz === mz || mx !== mx || my !== my ? mz : 0)`;
+  // Source operand component c as an expression (after swizzle, negation and relative addressing).
+  // offs: '' (none), the name of an address register, or a number (a loop counter known at compile time).
+  const shaderSrc = (raw, sw, neg, offs, c) => {
+    if (typeof offs === 'number' && raw >= 0x20) {
+      const r = raw + offs;
+      return r < 0x20 || r >= 0x80 ? '0' : `${neg ? '-' : ''}R[${(r << 2) + sw[c]}]`; // out of range reads as +0
+    }
+    if (offs && raw >= 0x20) return `((ut = ${raw} + ${offs}) < 0x20 || ut >= 0x80 ? 0 : ${neg ? '-' : ''}R[(ut << 2) + ${sw[c]}])`;
+    return `${neg ? '-' : ''}R[${(raw << 2) + sw[c]}]`;
+  };
+  const dstRef = (dst, c) => (dst < 0x10 ? `O[${(dst << 2) + c}]` : `R[${((dst & 0x1F) << 2) + c}]`);
+  const shaderCond = (ins) => {
+    const x = `(cx === ${!!ins.refx})`, y = `(cy === ${!!ins.refy})`;
+    return [`(${x} || ${y})`, `(${x} && ${y})`, x, y][ins.cop];
+  };
+
+  // Code for one instruction that does not change control flow, or null for flow control instructions
+  function genShaderOp(ins, offs) {
+    const d = ins.desc, src = shaderSrc;
+    let code = '';
+    // Destination components (in mask order x, y, z, w = bits 3..0)
+    const comps = d ? [0, 1, 2, 3].filter((c) => d.mask & (8 >> c)) : [];
+    const s1 = (c, off) => src(ins.s1, d.sw1, d.n1, off, c), s2 = (c, off) => src(ins.s2, d.sw2, d.n2, off, c), s3 = (c, off) => src(ins.s3, d.sw3, d.n3, off, c);
+    const o1 = ins.inv ? '' : offs, o2 = ins.inv ? offs : '';
+      switch (ins.op) {
+        case OP.ADD: case OP.MUL: case OP.MAX: case OP.MIN: case OP.SGE: case OP.SLT: case OP.SGEI: case OP.SLTI: {
+          if (!comps.length) break;
+          code += '{ ';
+          for (const c of comps) code += `const a${c} = ${s1(c, o1)}, b${c} = ${s2(c, o2)}; `;
+          for (const c of comps) {
+            const a = `a${c}`, b = `b${c}`;
+            const e = { [OP.ADD]: `${a} + ${b}`, [OP.MUL]: mulExpr(a, b), [OP.MAX]: `${a} > ${b} ? ${a} : ${b}`, [OP.MIN]: `${a} < ${b} ? ${a} : ${b}`,
+              [OP.SGE]: `${a} >= ${b} ? 1 : 0`, [OP.SGEI]: `${a} >= ${b} ? 1 : 0` }[ins.op] || `${a} < ${b} ? 1 : 0`;
+            code += `${dstRef(ins.dst, c)} = ${e}; `;
+          }
+          code += '}\n';
+          break;
+        }
+        case OP.DP3: case OP.DP4: case OP.DPH: case OP.DPHI: {
+          if (!comps.length) break;
+          const n = ins.op === OP.DP3 ? 3 : 4, h = ins.op === OP.DPH || ins.op === OP.DPHI;
+          const terms = [];
+          for (let c = 0; c < n; c++) terms.push(mulExpr(h && c === 3 ? '1' : s1(c, o1), s2(c, o2)));
+          code += `{ const r = ${terms.join(' + ')}; ${comps.map((c) => `${dstRef(ins.dst, c)} = r;`).join(' ')} }\n`;
+          break;
+        }
+        case OP.DST: case OP.DSTI: {
+          if (!comps.length) break;
+          const v = { 0: '1', 1: mulExpr(s1(1, o1), s2(1, o2)), 2: s1(2, o1), 3: s2(3, o2) };
+          // Evaluate all used sources before writing (the destination may be a source)
+          code += `{ ${comps.map((c) => `const v${c} = ${v[c]};`).join(' ')} ${comps.map((c) => `${dstRef(ins.dst, c)} = v${c};`).join(' ')} }\n`;
+          break;
+        }
+        case OP.EX2: case OP.LG2: case OP.RCP: case OP.RSQ: {
+          if (!comps.length) break;
+          const x = s1(0, offs);
+          const e = { [OP.EX2]: `Math.pow(2, x)`, [OP.LG2]: 'Math.log2(x)', [OP.RCP]: '1 / x' }[ins.op] || '1 / Math.sqrt(x)';
+          code += `{ const x = ${x}, r = ${e}; ${comps.map((c) => `${dstRef(ins.dst, c)} = r;`).join(' ')} }\n`;
+          break;
+        }
+        case OP.LITP: {
+          code += `{ const x0 = ${s1(0, offs)}, x1 = ${s1(1, offs)}, x2 = ${s1(2, offs)}, x3 = ${s1(3, offs)};\n`;
+          code += 'const v0 = Math.max(x0, 0), v1 = Math.min(Math.max(x1, -127.9961), 127.9961), v2 = x2, v3 = Math.max(x3, 0);\n';
+          code += 'cx = x0 > 0; cy = x3 > 0; ';
+          code += `${comps.map((c) => `${dstRef(ins.dst, c)} = v${c};`).join(' ')} }\n`;
+          break;
+        }
+        case OP.FLR: case OP.MOV: {
+          if (!comps.length) break;
+          code += `{ ${comps.map((c) => `const v${c} = ${ins.op === OP.FLR ? `Math.floor(${s1(c, offs)})` : s1(c, offs)};`).join(' ')} `;
+          code += `${comps.map((c) => `${dstRef(ins.dst, c)} = v${c};`).join(' ')} }\n`;
+          break;
+        }
+        case OP.MOVA: { // load before either address register changes (the source may be addressed through them)
+          if (!(d.mask & 12)) break;
+          code += `{ const x = ${s1(0, offs)}, y = ${s1(1, offs)};${d.mask & 8 ? ' a0x = Math.trunc(x) | 0;' : ''}${d.mask & 4 ? ' a0y = Math.trunc(y) | 0;' : ''} }\n`;
+          break;
+        }
+        case OP.CMP: {
+          const cmp = (op, a, b) => [`${a} === ${b}`, `${a} !== ${b}`, `${a} < ${b}`, `${a} <= ${b}`, `${a} > ${b}`, `${a} >= ${b}`][op] || 'true';
+          code += `{ const a0 = ${s1(0, offs)}, a1 = ${s1(1, offs)}, b0 = ${s2(0, '')}, b1 = ${s2(1, '')}; cx = ${cmp(ins.cmpx, 'a0', 'b0')}; cy = ${cmp(ins.cmpy, 'a1', 'b1')}; }\n`;
+          break;
+        }
+        case OP.MAD: case OP.MADI: {
+          if (!comps.length) break;
+          const inv = ins.op === OP.MADI;
+          code += `{ ${comps.map((c) => `const v${c} = ${mulExpr(s1(c, ''), s2(c, inv ? '' : offs))} + ${s3(c, inv ? offs : '')};`).join(' ')} `;
+          code += `${comps.map((c) => `${dstRef(ins.dst, c)} = v${c};`).join(' ')} }\n`;
+          break;
+        }
+        case OP.SETEMIT: code += `vs.emitVtx = ${(ins.w >>> 24) & 3}; vs.emitPrim = ${(ins.w >>> 23) & 1}; vs.emitWinding = ${(ins.w >>> 22) & 1};\n`; break;
+        case OP.EMIT: code += 'if (vs.onEmit) vs.onEmit(vs);\n'; break;
+        case OP.END: case OP.BREAK: case OP.BREAKC: case OP.CALL: case OP.CALLC: case OP.CALLU:
+        case OP.IFU: case OP.IFC: case OP.LOOP: case OP.JMPC: case OP.JMPU: return null;
+        default: break; // NOP and unknown opcodes do nothing
+      }
+    return code;
+  }
+
+  // ---- straight-line compiler
+  // With the bool and int uniforms fixed, calls, uniform branches and loops are resolved at compile time by
+  // following the interpreter's call/loop stack: calls are inlined, loops unrolled (so the loop counter is a
+  // constant) and only branches on the compare flags remain, as if/else that rejoin where both paths meet.
+  // The result is short code the JS engine optimises well. Programs that do not fit return null.
+  const FLAT_LIMIT = 3000; // instructions emitted per program
+  const FLAT_FAIL = new Error('shader too large to flatten');
+
+  // The straight-line body of a program (code text), using lang.op(ins, offs) and lang.cond(ins) to generate
+  // instructions and flag conditions; null when the program does not fit. Shared with the WebGL renderer,
+  // which generates GLSL with the same walk.
+  const JS_LANG = { op: (ins, offs) => genShaderOp(ins, offs), cond: (ins) => shaderCond(ins) };
+
+  function flattenShaderBody(unit, entry, lang) {
+    if (!unit.decoded) unit.decode();
+    const prog = unit.decoded, B = unit.b, IU = unit.i;
+    let budget = FLAT_LIMIT;
+    const copy = (st) => ({ pc: st.pc, aL: st.aL, stack: st.stack.map((f) => ({ ...f })) });
+    const keyOf = (st) => `${st.pc}:${st.aL}:${st.stack.map((f) => `${f.end}.${f.ret}.${f.repeat}.${f.inc}.${f.start}.${f.loop ? 1 : 0}`).join('/')}`;
+    // Pop finished call/loop bodies, exactly as ShaderUnit.run does before each instruction
+    const settle = (st) => {
+      const stk = st.stack;
+      while (stk.length && st.pc === stk[stk.length - 1].end) {
+        const t = stk[stk.length - 1];
+        if (t.loop) st.aL = (st.aL + t.inc) | 0;
+        if (t.repeat-- <= 0) { st.pc = t.ret; stk.pop(); } else st.pc = t.start;
+      }
+    };
+    const push = (st, start, num, ret, repeat = 0, inc = 0, loop = false) => {
+      st.stack.push({ end: start + num, ret, repeat, inc, start, loop });
+      st.pc = start;
+    };
+    const settled = (st) => { const c = copy(st); settle(c); return c; };
+
+    // Emit code from st until it reaches the state with key `stop` (returns that state) or every path ends
+    function walk(st, stop) {
+      let code = '';
+      for (;;) {
+        settle(st);
+        if (stop !== null && keyOf(st) === stop) return { code, at: st };
+        if (st.pc >= 4096) return { code: code + 'return;\n', at: null };
+        if (--budget < 0) throw FLAT_FAIL;
+        const ins = prog[st.pc], next = st.pc + 1;
+        st.pc = next;
+        const g = lang.op(ins, ins.idx === 3 ? st.aL : ['', 'a0x', 'a0y'][ins.idx] || '');
+        if (g !== null) { code += g; continue; }
+        // Two-way branch on the compare flags: both paths up to their meeting point, then carry on from there
+        const fork = (cond, a, b, join) => {
+          const stopKey = join ? keyOf(settled(join)) : null;
+          const x = walk(a, stopKey), y = walk(b, stopKey);
+          code += `if (${cond}) {\n${x.code}} else {\n${y.code}}\n`;
+          return x.at || y.at;
+        };
+        let at = st;
+        switch (ins.op) {
+          case OP.END: return { code: code + 'return;\n', at: null };
+          case OP.CALL: push(st, ins.target, ins.num, next); break;
+          case OP.CALLU: if ((B >>> ins.bid) & 1) push(st, ins.target, ins.num, next); break;
+          case OP.CALLC: { const a = copy(st); push(a, ins.target, ins.num, next); at = fork(lang.cond(ins), a, st, copy(st)); break; }
+          case OP.IFU:
+            if ((B >>> ins.bid) & 1) push(st, next, ins.target - next, ins.target + ins.num);
+            else push(st, ins.target, ins.num, ins.target + ins.num);
+            break;
+          case OP.IFC: {
+            const join = copy(st); join.pc = ins.target + ins.num;
+            const a = copy(st), b = copy(st);
+            push(a, next, ins.target - next, ins.target + ins.num);
+            push(b, ins.target, ins.num, ins.target + ins.num);
+            at = fork(lang.cond(ins), a, b, join);
+            break;
+          }
+          case OP.LOOP: {
+            const k = ins.iid * 3;
+            st.aL = IU[k + 1];
+            push(st, next, ins.target - next + 1, ins.target + 1, IU[k], IU[k + 2], true);
+            break;
+          }
+          case OP.BREAK: case OP.BREAKC: {
+            const a = ins.op === OP.BREAKC ? copy(st) : st;
+            while (a.stack.length) { const t = a.stack.pop(); if (t.loop) { a.pc = t.ret; break; } }
+            if (ins.op === OP.BREAKC) at = fork(lang.cond(ins), a, st, null);
+            break;
+          }
+          case OP.JMPU: if (((B >>> ins.bid) & 1) === ((ins.num & 1) ^ 1)) st.pc = ins.target; break;
+          case OP.JMPC: {
+            const a = copy(st); a.pc = ins.target;
+            at = fork(lang.cond(ins), a, st, ins.target > next - 1 ? a : null); // forward jumps rejoin at the target
+            break;
+          }
+        }
+        if (!at) return { code, at: null };
+        st = at;
+      }
+    }
+
+    try { return walk({ pc: entry, aL: 0, stack: [] }, null).code; } catch (e) { if (e === FLAT_FAIL) return null; throw e; }
+  }
+
+  function flattenShader(unit, entry) {
+    const body = flattenShaderBody(unit, entry, JS_LANG);
+    if (body === null) return null;
+    const src = `const R = vs.R, O = vs.O;
+      let mx = 0, my = 0, mz = 0, ut = 0, a0x = 0, a0y = 0, cx = false, cy = false;
+${body}`;
+    const fn = new Function('vs', 'H', src);
+    fn.source = src;
+    fn.flat = true;
+    return fn;
+  }
+
+  // Is fn (from compileShader) still the program in unit's memory?
+  function sameProgram(unit, fn) {
+    const pcs = fn.pcs, words = fn.words, code = unit.code;
+    for (let k = 0; k < pcs.length; k++) if (code[pcs[k]] !== words[k]) return false;
+    const swz = fn.swz, sw = unit.swizzle;
+    for (let i = 0; i < 128; i++) if (sw[i] !== swz[i]) return false;
+    return true;
+  }
+
+  // Remember what a compiled program was built from (see sameProgram)
+  function stamp(fn, unit, pcs) {
+    if (!fn.pcs) {
+      fn.pcs = Int32Array.from(pcs);
+      fn.words = Uint32Array.from(pcs, (pc) => unit.code[pc]);
+      fn.swz = Uint32Array.from(unit.swizzle);
+    }
+    return fn;
+  }
+
+  function compileShader(unit, entry) {
+    if (!unit.decoded) unit.decode();
+    const prog = unit.decoded;
+    // Reachable instructions, and the pcs where a call/loop body may end
+    const reach = new Set(), ends = new Set(), todo = [entry];
+    while (todo.length) {
+      const pc = todo.pop();
+      if (pc >= 4096 || reach.has(pc)) continue;
+      reach.add(pc);
+      const ins = prog[pc];
+      const next = pc + 1;
+      switch (ins.op) {
+        case OP.END: break;
+        case OP.CALL: case OP.CALLC: case OP.CALLU:
+          ends.add(ins.target + ins.num); todo.push(ins.target, next, ins.target + ins.num); break;
+        case OP.IFU: case OP.IFC:
+          ends.add(ins.target); ends.add(ins.target + ins.num); todo.push(next, ins.target, ins.target + ins.num); break;
+        case OP.LOOP:
+          ends.add(ins.target + 1); todo.push(next, ins.target + 1); break;
+        case OP.JMPC: case OP.JMPU: todo.push(next, ins.target); break;
+        default: todo.push(next);
+      }
+    }
+    const pcs = [...reach].sort((a, b) => a - b);
+    // Cache by program contents: games re-upload the same shaders constantly
+    let key = `${entry}:`;
+    for (const pc of pcs) key += `${pc}=${unit.code[pc].toString(36)},`;
+    key += '|';
+    for (let i = 0; i < 128; i++) key += unit.swizzle[i].toString(36) + ',';
+    // Straight-line version for these uniform values, when the program allows it
+    const flatKey = `${key}|${unit.b}|${unit.i.join(',')}`;
+    let fn = shaderCache.get(flatKey);
+    if (fn) return stamp(fn, unit, pcs);
+    if (unit.flatten) {
+      fn = flattenShader(unit, entry);
+      if (fn) {
+        if (shaderCache.size > 512) shaderCache.clear();
+        shaderCache.set(flatKey, fn);
+        return stamp(fn, unit, pcs);
+      }
+    }
+    fn = shaderCache.get(key);
+    if (fn) { shaderCache.set(flatKey, fn); return stamp(fn, unit, pcs); }
+
+    const OFFS = ['', 'a0x', 'a0y', 'aL'];
+    const cond = shaderCond;
+    const callCode = (start, num, ret) => `E[sp] = ${start + num}; T[sp] = ${ret}; P[sp] = 0; N[sp] = 0; S[sp] = ${start}; K[sp] = 0; sp++; pc = ${start}; continue;`;
+
+    // End of a call/loop body: repeat the loop or return (possibly several levels), as ShaderUnit.run does
+    const UNWIND = 'do { const t = sp - 1; if (K[t]) aL = (aL + N[t]) | 0; if (P[t]-- <= 0) { pc = T[t]; sp--; } else pc = S[t]; } while (sp > 0 && pc === E[sp - 1]);';
+    let code = '';
+    for (let k = 0; k < pcs.length; k++) {
+      const pc = pcs[k], ins = prog[pc], next = pc + 1;
+      code += `case ${pc}:\n`;
+      if (ends.has(pc)) code += `if (sp > 0 && E[sp - 1] === ${pc}) { pc = ${pc}; ${UNWIND} continue; }\n`;
+      code += 'if (++steps > 200000) return;\n';
+      let falls = true;
+      const g = genShaderOp(ins, OFFS[ins.idx]);
+      if (g !== null) code += g;
+      else switch (ins.op) {
+        case OP.END: code += 'return;\n'; falls = false; break;
+        case OP.BREAK: case OP.BREAKC:
+          code += `${ins.op === OP.BREAKC ? `if (${cond(ins)}) ` : ''}{ let found = false; while (sp > 0) { sp--; if (K[sp]) { pc = T[sp]; found = true; break; } } if (found) continue; }\n`;
+          break;
+        case OP.CALL: code += callCode(ins.target, ins.num, next) + '\n'; falls = false; break;
+        case OP.CALLC: code += `if (${cond(ins)}) { ${callCode(ins.target, ins.num, next)} }\n`; break;
+        case OP.CALLU: code += `if ((vs.b >>> ${ins.bid}) & 1) { ${callCode(ins.target, ins.num, next)} }\n`; break;
+        case OP.IFU: case OP.IFC: {
+          const ok = ins.op === OP.IFU ? `(vs.b >>> ${ins.bid}) & 1` : cond(ins);
+          code += `if (${ok}) { E[sp] = ${ins.target}; T[sp] = ${ins.target + ins.num}; P[sp] = 0; N[sp] = 0; S[sp] = ${next}; K[sp] = 0; sp++; pc = ${next}; }\n`;
+          code += `else { E[sp] = ${ins.target + ins.num}; T[sp] = ${ins.target + ins.num}; P[sp] = 0; N[sp] = 0; S[sp] = ${ins.target}; K[sp] = 0; sp++; pc = ${ins.target}; }\ncontinue;\n`;
+          falls = false;
+          break;
+        }
+        case OP.LOOP: {
+          const ik = ins.iid * 3;
+          code += `aL = vs.i[${ik + 1}]; E[sp] = ${ins.target + 1}; T[sp] = ${ins.target + 1}; P[sp] = vs.i[${ik}]; N[sp] = vs.i[${ik + 2}]; S[sp] = ${next}; K[sp] = 1; sp++;\n`;
+          code += `pc = ${next}; continue;\n`;
+          falls = false;
+          break;
+        }
+        case OP.JMPC: code += `if (${cond(ins)}) { pc = ${ins.target}; continue; }\n`; break;
+        case OP.JMPU: code += `if (((vs.b >>> ${ins.bid}) & 1) === ${(ins.num & 1) ^ 1}) { pc = ${ins.target}; continue; }\n`; break;
+      }
+      if (falls && pcs[k + 1] !== next) code += `pc = ${next}; continue;\n`;
+    }
+
+    const src2 = `const R = vs.R, O = vs.O;
+      let mx = 0, my = 0, mz = 0, ut = 0;
+      const E = vs.stkEnd, T = vs.stkRet, P = vs.stkRepeat, N = vs.stkInc, S = vs.stkStart, K = vs.stkLoop;
+      let pc = ${entry}, sp = 0, a0x = 0, a0y = 0, aL = 0, cx = false, cy = false, steps = 0;
+      for (;;) {
+        switch (pc) {
+${code}
+          default:
+            if (sp > 0 && pc === E[sp - 1]) { ${UNWIND} continue; }
+            return;
+        }
+      }`;
+    fn = new Function('vs', 'H', src2);
+    fn.source = src2;
+    if (shaderCache.size > 512) shaderCache.clear();
+    shaderCache.set(key, fn);
+    shaderCache.set(flatKey, fn);
+    return stamp(fn, unit, pcs);
+  }
+
+  const SHADER_HELPERS = {};
+
   // ------------------------------------------------------------------ textures
   const TEX_BITS = [32, 24, 16, 16, 16, 16, 16, 8, 8, 8, 4, 4, 4, 8];
   const ETC_MOD = [[2, 8], [5, 17], [9, 29], [13, 42], [18, 60], [24, 80], [33, 106], [47, 183]];
 
-  // Decode one ETC1 4x4 block (lo/hi = little-endian 32-bit halves) into out[] at texel (x, y).
-  function etc1Texel(lo, hi, x, y, out, o) {
-    const texel = 4 * x + y;
+  // Decode one ETC1 4x4 block (lo/hi = little-endian 32-bit halves) whose top-left texel is (x0, y0) in a
+  // texture w x h; rows in out are ordered by t (texel y goes to row h - 1 - y). Alpha comes from aLo/aHi (4 bits
+  // per texel) when hasAlpha, else 255.
+  function etc1Block(lo, hi, out, w, h, x0, y0, hasAlpha, aLo, aHi) {
     const flip = hi & 1, diff = (hi >>> 1) & 1;
-    if (flip) { const t = x; x = y; y = t; }
-    let r, g, b;
-    const second = x >= 2;
+    let r0, g0, b0, r1, g1, b1;
     if (diff) {
-      r = (hi >>> 27) & 31; g = (hi >>> 19) & 31; b = (hi >>> 11) & 31;
-      if (second) {
-        r += ((hi >>> 24) & 7) << 29 >> 29; g += ((hi >>> 16) & 7) << 29 >> 29; b += ((hi >>> 8) & 7) << 29 >> 29;
-      }
-      r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2); b = (b << 3) | (b >> 2);
+      r0 = (hi >>> 27) & 31; g0 = (hi >>> 19) & 31; b0 = (hi >>> 11) & 31;
+      r1 = r0 + (((hi >>> 24) & 7) << 29 >> 29); g1 = g0 + (((hi >>> 16) & 7) << 29 >> 29); b1 = b0 + (((hi >>> 8) & 7) << 29 >> 29);
+      r0 = (r0 << 3) | (r0 >> 2); g0 = (g0 << 3) | (g0 >> 2); b0 = (b0 << 3) | (b0 >> 2);
+      r1 = (r1 << 3) | (r1 >> 2); g1 = (g1 << 3) | (g1 >> 2); b1 = (b1 << 3) | (b1 >> 2);
     } else {
-      if (second) { r = (hi >>> 24) & 15; g = (hi >>> 16) & 15; b = (hi >>> 8) & 15; }
-      else { r = (hi >>> 28) & 15; g = (hi >>> 20) & 15; b = (hi >>> 12) & 15; }
-      r *= 17; g *= 17; b *= 17;
+      r0 = ((hi >>> 28) & 15) * 17; g0 = ((hi >>> 20) & 15) * 17; b0 = ((hi >>> 12) & 15) * 17;
+      r1 = ((hi >>> 24) & 15) * 17; g1 = ((hi >>> 16) & 15) * 17; b1 = ((hi >>> 8) & 15) * 17;
     }
-    const table = second ? (hi >>> 2) & 7 : (hi >>> 5) & 7;
-    let mod = ETC_MOD[table][(lo >>> texel) & 1];
-    if ((lo >>> (16 + texel)) & 1) mod = -mod;
-    r += mod; g += mod; b += mod;
-    out[o] = r < 0 ? 0 : r > 255 ? 255 : r;
-    out[o + 1] = g < 0 ? 0 : g > 255 ? 255 : g;
-    out[o + 2] = b < 0 ? 0 : b > 255 ? 255 : b;
+    const m0 = ETC_MOD[(hi >>> 5) & 7], m1 = ETC_MOD[(hi >>> 2) & 7];
+    for (let sx = 0; sx < 4; sx++) {
+      for (let sy = 0; sy < 4; sy++) {
+        const texel = 4 * sx + sy;
+        const second = flip ? sy >= 2 : sx >= 2;
+        let mod = (second ? m1 : m0)[(lo >>> texel) & 1];
+        if ((lo >>> (16 + texel)) & 1) mod = -mod;
+        const r = (second ? r1 : r0) + mod, g = (second ? g1 : g0) + mod, b = (second ? b1 : b0) + mod;
+        const o = ((h - 1 - (y0 + sy)) * w + x0 + sx) * 4;
+        out[o] = r < 0 ? 0 : r > 255 ? 255 : r;
+        out[o + 1] = g < 0 ? 0 : g > 255 ? 255 : g;
+        out[o + 2] = b < 0 ? 0 : b > 255 ? 255 : b;
+        out[o + 3] = hasAlpha ? (((texel < 8 ? aLo >>> (texel * 4) : aHi >>> ((texel - 8) * 4)) & 15) * 17) : 255;
+      }
+    }
+  }
+
+  const rd32 = (src, p) => (src[p] | (src[p + 1] << 8) | (src[p + 2] << 16) | (src[p + 3] << 24)) >>> 0;
+
+  // Decode the 8x8 tile (tx, ty) of a tiled texture whose bytes start at src[tb] into out (RGBA8, w x h, rows
+  // ordered by sampling t: t = 0 is the last stored row).
+  function decodeTile(src, tb, out, w, h, tx, ty, fmt) {
+    if (fmt === 12 || fmt === 13) {
+      const alpha = fmt === 13;
+      for (let sub = 0; sub < 4; sub++) {
+        let p = tb + sub * (alpha ? 16 : 8), aLo = 0, aHi = 0;
+        if (alpha) { aLo = rd32(src, p); aHi = rd32(src, p + 4); p += 8; }
+        etc1Block(rd32(src, p), rd32(src, p + 4), out, w, h, tx * 8 + (sub & 1) * 4, ty * 8 + (sub >> 1) * 4, alpha, aLo, aHi);
+      }
+      return;
+    }
+    for (let fy = 0; fy < 8; fy++) {
+      const y = ty * 8 + fy, row = (h - 1 - y) * w;
+      for (let fx = 0; fx < 8; fx++) {
+        const x = tx * 8 + fx, o = (row + x) * 4, m = MORTON[fy * 8 + fx];
+        let r = 0, g = 0, b = 0, a = 255;
+        switch (fmt) {
+          case 0: { const p = tb + m * 4; a = src[p]; b = src[p + 1]; g = src[p + 2]; r = src[p + 3]; break; }
+          case 1: { const p = tb + m * 3; b = src[p]; g = src[p + 1]; r = src[p + 2]; break; }
+          case 2: { const p = tb + m * 2, v = src[p] | (src[p + 1] << 8); r = (v >>> 11) & 31; g = (v >>> 6) & 31; b = (v >>> 1) & 31; r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2); b = (b << 3) | (b >> 2); a = v & 1 ? 255 : 0; break; }
+          case 3: { const p = tb + m * 2, v = src[p] | (src[p + 1] << 8); r = (v >>> 11) & 31; g = (v >>> 5) & 63; b = v & 31; r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); b = (b << 3) | (b >> 2); break; }
+          case 4: { const p = tb + m * 2, v = src[p] | (src[p + 1] << 8); r = ((v >>> 12) & 15) * 17; g = ((v >>> 8) & 15) * 17; b = ((v >>> 4) & 15) * 17; a = (v & 15) * 17; break; }
+          case 5: { const p = tb + m * 2; r = g = b = src[p + 1]; a = src[p]; break; }
+          case 6: { const p = tb + m * 2; r = src[p + 1]; g = src[p]; b = 0; break; }
+          case 7: r = g = b = src[tb + m]; break;
+          case 8: r = g = b = 0; a = src[tb + m]; break;
+          case 9: { const v = src[tb + m]; r = g = b = (v >>> 4) * 17; a = (v & 15) * 17; break; }
+          case 10: { const v = src[tb + (m >> 1)]; r = g = b = ((m & 1) ? v >>> 4 : v & 15) * 17; break; }
+          case 11: { const v = src[tb + (m >> 1)]; r = g = b = 0; a = ((m & 1) ? v >>> 4 : v & 15) * 17; break; }
+        }
+        out[o] = r; out[o + 1] = g; out[o + 2] = b; out[o + 3] = a;
+      }
+    }
   }
 
   // Decode a whole tiled texture to RGBA8, rows ordered by sampling t (t = 0 is the last stored row).
   function decodeTexture(src, so, w, h, fmt) {
     const out = new Uint8Array(w * h * 4);
-    const bits = TEX_BITS[fmt] || 32;
-    const tileBytes = (64 * bits) >> 3;
-    const tilesX = w >> 3;
+    const tileBytes = (64 * (TEX_BITS[fmt] || 32)) >> 3, tilesX = w >> 3;
     for (let ty = 0; ty < (h >> 3); ty++) {
-      for (let tx = 0; tx < tilesX; tx++) {
-        const tb = so + (ty * tilesX + tx) * tileBytes;
-        for (let fy = 0; fy < 8; fy++) {
-          const y = ty * 8 + fy, row = (h - 1 - y) * w;
-          for (let fx = 0; fx < 8; fx++) {
-            const x = tx * 8 + fx, o = (row + x) * 4, m = MORTON[fy * 8 + fx];
-            let r = 0, g = 0, b = 0, a = 255;
-            switch (fmt) {
-              case 0: { const p = tb + m * 4; a = src[p]; b = src[p + 1]; g = src[p + 2]; r = src[p + 3]; break; }
-              case 1: { const p = tb + m * 3; b = src[p]; g = src[p + 1]; r = src[p + 2]; break; }
-              case 2: { const p = tb + m * 2, v = src[p] | (src[p + 1] << 8); r = (v >>> 11) & 31; g = (v >>> 6) & 31; b = (v >>> 1) & 31; r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2); b = (b << 3) | (b >> 2); a = v & 1 ? 255 : 0; break; }
-              case 3: { const p = tb + m * 2, v = src[p] | (src[p + 1] << 8); r = (v >>> 11) & 31; g = (v >>> 5) & 63; b = v & 31; r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); b = (b << 3) | (b >> 2); break; }
-              case 4: { const p = tb + m * 2, v = src[p] | (src[p + 1] << 8); r = ((v >>> 12) & 15) * 17; g = ((v >>> 8) & 15) * 17; b = ((v >>> 4) & 15) * 17; a = (v & 15) * 17; break; }
-              case 5: { const p = tb + m * 2; r = g = b = src[p + 1]; a = src[p]; break; }
-              case 6: { const p = tb + m * 2; r = src[p + 1]; g = src[p]; b = 0; break; }
-              case 7: r = g = b = src[tb + m]; break;
-              case 8: r = g = b = 0; a = src[tb + m]; break;
-              case 9: { const v = src[tb + m]; r = g = b = (v >>> 4) * 17; a = (v & 15) * 17; break; }
-              case 10: { const v = src[tb + (m >> 1)]; r = g = b = ((m & 1) ? v >>> 4 : v & 15) * 17; break; }
-              case 11: { const v = src[tb + (m >> 1)]; r = g = b = 0; a = ((m & 1) ? v >>> 4 : v & 15) * 17; break; }
-              case 12: case 13: {
-                const alpha = fmt === 13, sub = (fx >> 2) + 2 * (fy >> 2), sx = fx & 3, sy = fy & 3;
-                let p = tb + sub * (alpha ? 16 : 8);
-                if (alpha) {
-                  const bit = 4 * (sx * 4 + sy);
-                  const word = bit < 32 ? src[p] | (src[p + 1] << 8) | (src[p + 2] << 16) | (src[p + 3] << 24) : src[p + 4] | (src[p + 5] << 8) | (src[p + 6] << 16) | (src[p + 7] << 24);
-                  a = ((word >>> (bit & 31)) & 15) * 17;
-                  p += 8;
-                }
-                const lo = (src[p] | (src[p + 1] << 8) | (src[p + 2] << 16) | (src[p + 3] << 24)) >>> 0;
-                const hi = (src[p + 4] | (src[p + 5] << 8) | (src[p + 6] << 16) | (src[p + 7] << 24)) >>> 0;
-                etc1Texel(lo, hi, sx, sy, out, o);
-                out[o + 3] = a;
-                continue;
-              }
-            }
-            out[o] = r; out[o + 1] = g; out[o + 2] = b; out[o + 3] = a;
-          }
-        }
-      }
+      for (let tx = 0; tx < tilesX; tx++) decodeTile(src, so + (ty * tilesX + tx) * tileBytes, out, w, h, tx, ty, fmt);
     }
     return out;
+  }
+
+  // A decoded texture t whose source bytes now differ from t.raw: decode again only the tiles that changed, in
+  // place, and (track) list them in t.dirtyTiles (tile indices) for the host GPU's copy. False if most of it
+  // changed.
+  function updateTiles(t, src, so, w, h, fmt, track) {
+    const tileBytes = (64 * (TEX_BITS[fmt] || 32)) >> 3, tilesX = w >> 3, nTiles = tilesX * (h >> 3);
+    const raw = t.raw, aligned = !((so + src.byteOffset) & 3) && !(tileBytes & 3);
+    const words = tileBytes >> 2;
+    const a32 = aligned ? new Uint32Array(raw.buffer, raw.byteOffset, raw.length >> 2) : null;
+    const b32 = aligned ? new Uint32Array(src.buffer, src.byteOffset + so, raw.length >> 2) : null;
+    const changed = [];
+    for (let i = 0; i < nTiles; i++) {
+      const o = i * tileBytes;
+      let same = true;
+      if (aligned) { for (let k = o >> 2, e = k + words; k < e; k++) if (a32[k] !== b32[k]) { same = false; break; } }
+      else { for (let k = o, e = o + tileBytes; k < e; k++) if (raw[k] !== src[so + k]) { same = false; break; } }
+      if (!same) { changed.push(i); if (changed.length > nTiles >> 1) return false; }
+    }
+    for (const i of changed) {
+      const o = i * tileBytes;
+      raw.set(src.subarray(so + o, so + o + tileBytes), o);
+      decodeTile(src, so + o, t.data, w, h, i % tilesX, (i / tilesX) | 0, fmt);
+    }
+    if (changed.length && track) t.dirtyTiles = t.dirtyTiles ? t.dirtyTiles.concat(changed) : changed;
+    return true;
+  }
+
+  // Does a[0..n) equal b[off..off+n)? Word-wise when both are 4-byte aligned.
+  function sameBytes(a, b, off) {
+    const n = a.length;
+    if (off + n > b.length) return false;
+    if (!((off + b.byteOffset) & 3) && !(n & 3)) {
+      const x = new Uint32Array(a.buffer, a.byteOffset, n >> 2), y = new Uint32Array(b.buffer, b.byteOffset + off, n >> 2);
+      for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+      return true;
+    }
+    for (let i = 0; i < n; i++) if (a[i] !== b[off + i]) return false;
+    return true;
   }
 
   function wrapCoord(mode, v, size) {
@@ -420,7 +860,7 @@
     return JSON.stringify([
       st.tev.map((s) => (s.passthrough ? 0 : [s.rgbSrc, s.aSrc, s.rgbOp, s.aOp, s.rgbCmb, s.aCmb, s.rgbScale, s.aScale])),
       st.updRGB, st.updA, st.tex2uv1, !!st.lighting, st.fog, st.alphaTest ? st.alphaFunc : -1,
-      st.textures.map((t) => t && [t.wrapS, t.wrapT, t.linear, t.project]),
+      st.textures.map((t) => t && [t.wrapS, t.wrapT, t.linear, t.project, t.pow2]),
       st.blend, st.eqRGB, st.eqA, st.srcRGB, st.dstRGB, st.srcA, st.dstA, st.logic, st.colorMask, st.colorFmt,
     ]);
   }
@@ -437,7 +877,11 @@
     st.write = f.write(st, HELPERS);
   }
 
-  const HELPERS = { sampleTexture: (...a) => sampleTexture(...a) };
+  const HELPERS = {
+    H0: (x) => (x < 0 ? 0 : x), H2: (x) => (x > 255 ? 255 : x), CL: (x) => (x < 0 ? 0 : x > 255 ? 255 : x),
+    MORTON, stencilOp,
+    rightOrBottom: (vx, vy, ax, ay, bx, by) => (ay === by ? vy < ay : vx < ax + (bx - ax) * (vy - ay) / (by - ay)),
+  };
 
   // Expression for a source channel (0-3) of TEV source `src` in stage `s`
   function srcExpr(src, ch, s) {
@@ -496,11 +940,20 @@
     const o = `t${t}`;
     let code = `let ${o}R = 0, ${o}G = 0, ${o}B = 0, ${o}A = 0;\n{ let u = ${u}, v = ${v};\n`;
     if (t === 0 && T.project) code += 'const w = I[16]; if (w) { u /= w; v /= w; }\n';
-    const wrap = (mode, x, size) => {
+    // Repeat and mirror wrap with power-of-two sizes use masks: ToInt32 wraps modulo 2^32, so the result equals
+    // the floating-point modulo for every finite integer. NaN and infinities must still give NaN (an undefined
+    // texel, read as 0); with bilinear filtering their weights are NaN anyway, so the guard is only needed
+    // for nearest sampling.
+    const wrap = (mode, x, size, guardNaN) => {
+      const finite = (code) => (guardNaN ? `if (${x} - ${x} === 0) { ${code} } else ${x} = NaN;` : code);
       switch (mode) {
         case 1: return `if (${x} < 0 || ${x} >= ${size}) out = true;`;
-        case 2: return `${x} = ((${x} % ${size}) + ${size}) % ${size};`;
-        case 3: return `{ const p = ${size} * 2; ${x} = ((${x} % p) + p) % p; if (${x} >= ${size}) ${x} = p - 1 - ${x}; }`;
+        case 2:
+          if (T.pow2) return finite(`${x} &= ${size} - 1;`);
+          return `${x} = ((${x} % ${size}) + ${size}) % ${size};`;
+        case 3:
+          if (T.pow2) return finite(`${x} &= ${size} * 2 - 1; if (${x} >= ${size}) ${x} = ${size} * 2 - 1 - ${x};`);
+          return `{ const p = ${size} * 2; ${x} = ((${x} % p) + p) % p; if (${x} >= ${size}) ${x} = p - 1 - ${x}; }`;
         default: return `${x} = ${x} < 0 ? 0 : ${x} >= ${size} ? ${size} - 1 : ${x};`;
       }
     };
@@ -515,25 +968,26 @@
         ${wrapB(T.wrapS, 's0', W, 'os0')} ${wrapB(T.wrapS, 's1', W, 'os1')}
         ${wrapB(T.wrapT, 'q0', TH, 'oq0')} ${wrapB(T.wrapT, 'q1', TH, 'oq1')}
         const w00 = (1 - ax) * (1 - ay), w10 = ax * (1 - ay), w01 = (1 - ax) * ay, w11 = ax * ay;\n`;
-      const tap = (sv, qv, os, oq) => {
+      const tap = (name, sv, qv, os, oq) => {
         const cond = [T.wrapS === 1 ? os : null, T.wrapT === 1 ? oq : null].filter(Boolean).join(' || ');
-        const idx = `(${qv} * ${W} + ${sv}) * 4`;
-        return [0, 1, 2, 3].map((c) => (cond ? `(${cond} ? ${BD}[${c}] : ${D}[${idx} + ${c}])` : `${D}[${idx} + ${c}]`));
+        const fetch = `D32${t}[${qv} * ${W} + ${sv}]`;
+        code += `const ${name} = ${cond ? `${cond} ? BP${t} : ${fetch}` : fetch};\n`;
       };
-      const t00 = tap('s0', 'q0', 'os0', 'oq0'), t10 = tap('s1', 'q0', 'os1', 'oq0'), t01 = tap('s0', 'q1', 'os0', 'oq1'), t11 = tap('s1', 'q1', 'os1', 'oq1');
+      tap('x00', 's0', 'q0', 'os0', 'oq0'); tap('x10', 's1', 'q0', 'os1', 'oq0'); tap('x01', 's0', 'q1', 'os0', 'oq1'); tap('x11', 's1', 'q1', 'os1', 'oq1');
+      const ch = (x, k) => (k === 3 ? `(${x} >>> 24)` : k ? `((${x} >>> ${k * 8}) & 255)` : `(${x} & 255)`);
       ['R', 'G', 'B', 'A'].forEach((c, k) => {
-        code += `${o}${c} = (${t00[k]} * w00 + ${t10[k]} * w10 + ${t01[k]} * w01 + ${t11[k]} * w11 + 0.5) | 0;\n`;
+        code += `${o}${c} = (${ch('x00', k)} * w00 + ${ch('x10', k)} * w10 + ${ch('x01', k)} * w01 + ${ch('x11', k)} * w11 + 0.5) | 0;\n`;
       });
       return code + '}\n';
     }
     code += `let s = Math.floor(u * W${t}), q = Math.floor(v * TH${t}), out = false;\n`;
-    code += wrap(T.wrapS, 's', `W${t}`) + '\n' + wrap(T.wrapT, 'q', `TH${t}`) + '\n';
+    code += wrap(T.wrapS, 's', `W${t}`, true) + '\n' + wrap(T.wrapT, 'q', `TH${t}`, true) + '\n';
     code += `if (out) { ${o}R = BD${t}[0]; ${o}G = BD${t}[1]; ${o}B = BD${t}[2]; ${o}A = BD${t}[3]; }\n`;
-    code += `else { const i = (q * W${t} + s) * 4; ${o}R = D${t}[i] | 0; ${o}G = D${t}[i + 1] | 0; ${o}B = D${t}[i + 2] | 0; ${o}A = D${t}[i + 3] | 0; }\n}\n`;
+    code += `else { const x = D32${t}[q * W${t} + s]; ${o}R = x & 255; ${o}G = (x >>> 8) & 255; ${o}B = (x >>> 16) & 255; ${o}A = x >>> 24; }\n}\n`;
     return code;
   }
 
-  function genShade(st) {
+  function genShadeParts(st) {
     // Which sources do active stages read?
     const used = new Set();
     st.tev.forEach((s) => {
@@ -543,15 +997,14 @@
       for (let k = 0; k < nRgb; k++) used.add(s.rgbSrc[k]);
       for (let k = 0; k < nA; k++) used.add(s.aSrc[k]);
     });
-    let pre = 'const F = gpu.F, L = st.lighting, TMP = new Int32Array(4);\n';
-    pre += 'const H0 = (x) => (x < 0 ? 0 : x), H2 = (x) => (x > 255 ? 255 : x), CL = (x) => (x < 0 ? 0 : x > 255 ? 255 : x);\n';
+    let pre = 'const F = gpu.F, L = st.lighting;\n';
     let body = '';
     if (used.has(0)) body += 'const pR = (I[8] * 255 + 0.5) | 0, pG = (I[9] * 255 + 0.5) | 0, pB = (I[10] * 255 + 0.5) | 0, pA = (I[11] * 255 + 0.5) | 0;\n';
     for (let t = 0; t < 3; t++) {
       if (!used.has(3 + t)) continue;
       const T = st.textures[t];
       if (!T) { body += `const t${t}R = 0, t${t}G = 0, t${t}B = 0, t${t}A = 0;\n`; continue; }
-      pre += `const T${t} = st.textures[${t}], D${t} = T${t}.data, W${t} = T${t}.w, TH${t} = T${t}.h, BD${t} = T${t}.border;\n`;
+      pre += `const T${t} = st.textures[${t}], D32${t} = T${t}.data32, W${t} = T${t}.w, TH${t} = T${t}.h, BD${t} = T${t}.border, BP${t} = T${t}.borderPacked;\n`;
       body += genTexture(t, T, st);
     }
     if (used.has(1) || used.has(2)) {
@@ -603,13 +1056,25 @@
       body += `if (!(${cmp})) return -1;\n`;
     }
     body += 'return ((oR << 24) | (oG << 16) | (oB << 8) | oA) >>> 0;\n';
-    return `${pre}return function shade(I, depth) {\n${body}};`;
+    return { pre, body };
+  }
+
+  // Clamping helpers shared by all generated code (one identity, so call sites stay monomorphic)
+  const FRAG_HELPERS = 'const H0 = H.H0, H2 = H.H2, CL = H.CL;\n';
+
+  function genShade(st) {
+    const { pre, body } = genShadeParts(st);
+    return `${FRAG_HELPERS}${pre}return function shade(I, depth) {\n${body}};`;
   }
 
   function genWrite(st) {
+    const { pre, body } = genWriteParts(st);
+    return `${FRAG_HELPERS}${pre}return function write(c, u8, o) {\n${body}};`;
+  }
+
+  function genWriteParts(st) {
     const fmt = st.colorFmt;
-    let pre = 'const BC = st.blendConst, cR = BC[0], cG = BC[1], cB = BC[2], cA = BC[3];\n';
-    pre += 'const CL = (x) => (x < 0 ? 0 : x > 255 ? 255 : x);\n';
+    const pre = 'const BC = st.blendConst, cR = BC[0], cG = BC[1], cB = BC[2], cA = BC[3];\n';
     const needDst = st.blend || st.logic !== 3 || st.colorMask !== 0xF;
     let body = 'let r = c >>> 24, g = (c >>> 16) & 255, b = (c >>> 8) & 255, a = c & 255;\n';
     if (needDst) {
@@ -662,12 +1127,162 @@
       '{ const v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3); u8[o] = v; u8[o + 1] = v >> 8; }',
       '{ const v = ((r >> 4) << 12) | ((g >> 4) << 8) | ((b >> 4) << 4) | (a >> 4); u8[o] = v; u8[o + 1] = v >> 8; }',
     ][fmt] + '\n';
-    return `${pre}return function write(c, u8, o) {\n${body}};`;
+    return { pre, body };
+  }
+
+  // ------------------------------------------------------------------ rasterizer compiler
+  // A whole triangle rasterizer generated per state: edge setup, the covered span of each row,
+  // depth/stencil tests, perspective-correct interpolation of exactly the attributes the state
+  // needs, and the fragment program inlined into the pixel loop. It performs the same arithmetic
+  // in the same order as Gpu.rasterize (the reference path), so the output is bit-identical.
+  const rasterCache = new Map();
+
+  const cmpExpr = (func, a, b) => ['false', 'true', `${a} === ${b}`, `${a} !== ${b}`, `${a} < ${b}`, `${a} <= ${b}`, `${a} > ${b}`, `${a} >= ${b}`][func];
+
+  function rasterKey(st) {
+    return JSON.stringify([
+      fragmentKey(st), st.need, st.cull, st.scissor, !!st.color, st.colorBpp, !!st.depth, st.depthBpp, st.depthFmt,
+      st.depthTest, st.depthFunc, st.depthWrite, st.stencil, st.stencilFunc, !!st.stencilWriteMask, st.sFail, st.sZFail, st.sZPass,
+    ]);
+  }
+
+  function genRaster(st) {
+    const shade = genShadeParts(st), write = genWriteParts(st);
+    const need = st.need, lit = !!st.lighting;
+    // Interpolated attributes become locals ($aN); the fragment program reads them directly.
+    const used = new Set(need);
+    let body = shade.body.replace(/\bI\[(\d+)\]/g, (m, n) => { used.add(+n); return `$a${n}`; });
+    body = body.replace(/\bdepth\b/g, '$z');
+    body = body.replace(/return -1;/g, 'continue;');
+    body = body.replace(/return (\(\(oR << 24\)[^;]*);/, '$col = $1;');
+    if (/\breturn\b/.test(body) || /\breturn\b/.test(write.body)) throw new Error('rasterizer: unexpected return in fragment program');
+    const fogged = /\$z/.test(body);
+
+    const depth = !!st.depth, dbpp = st.depthBpp, stencil = !!st.stencil;
+    const earlyZ = st.depthTest && !stencil;
+    const needZ = fogged || (depth && (st.depthTest || st.depthWrite));
+    const cov = (x) => `($w0r + $e0a * (${x} - minX) >= 0 && $w1r + $e1a * (${x} - minX) >= 0 && $w2r + $e2a * (${x} - minX) >= 0)`;
+    const stencilWrite = (op) => (st.stencilWriteMask ? `{ const nv = SOP(${op}, sv, SREF); DU8[dAddr + 3] = (sv & ~SWM) | (nv & SWM); drawn = true; }` : '');
+
+    // Generated once per state shape; everything that varies between draws of that shape is read from st.
+    let code = `${FRAG_HELPERS}const MORTON = H.MORTON, SOP = H.stencilOp, rightOrBottom = H.rightOrBottom;
+    return function raster(st, gpu, v0, v1, v2) {
+      ${shade.pre}${write.pre}
+      const I = gpu.I;
+      const FBW = st.fbW, FBH = st.fbH, HREG = st.fbHreg, CBPP = st.colorBpp;
+      const SX0 = st.sx0, SY0 = st.sy0, SX1 = st.sx1, SY1 = st.sy1, DSCALE = st.depthScale, DOFF = st.depthOffset;
+      const CU8 = st.color && st.color.u8, COFF = st.color ? st.color.off : 0, DU8 = st.depth && st.depth.u8, DOFF8 = st.depth ? st.depth.off : 0;
+      const DMAX = st.depthFmt === 0 ? 0xFFFF : 0xFFFFFF;
+      const SREF = st.stencilRef, SWM = st.stencilWriteMask, SREFM = st.stencilRef & st.stencilMask, SMASK = st.stencilMask;
+      const x0 = Math.round(v0.x * 16), y0 = Math.round(v0.y * 16);
+      let x1 = Math.round(v1.x * 16), y1 = Math.round(v1.y * 16);
+      let x2 = Math.round(v2.x * 16), y2 = Math.round(v2.y * 16);
+      let area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+      if (area === 0) return 0;
+      ${st.cull === 1 ? 'if (area > 0) return 0;' : st.cull === 2 ? 'if (area < 0) return 0;' : ''}
+      if (area < 0) {
+        const t = v1; v1 = v2; v2 = t;
+        let tt = x1; x1 = x2; x2 = tt; tt = y1; y1 = y2; y2 = tt;
+        area = -area;
+      }
+      let minX = Math.max(0, Math.floor(Math.min(x0, x1, x2) / 16)), maxX = Math.min(FBW - 1, Math.ceil(Math.max(x0, x1, x2) / 16));
+      let minY = Math.max(0, Math.floor(Math.min(y0, y1, y2) / 16)), maxY = Math.min(FBH - 1, Math.ceil(Math.max(y0, y1, y2) / 16));
+      ${st.scissor === 3 ? 'minX = Math.max(minX, SX0); maxX = Math.min(maxX, SX1); minY = Math.max(minY, SY0); maxY = Math.min(maxY, SY1);' : ''}
+      if (minX > maxX || minY > maxY) return 0;
+      const bias0 = rightOrBottom(x0, y0, x1, y1, x2, y2) ? -1 : 0;
+      const bias1 = rightOrBottom(x1, y1, x2, y2, x0, y0) ? -1 : 0;
+      const bias2 = rightOrBottom(x2, y2, x0, y0, x1, y1) ? -1 : 0;
+      const $e0a = (y1 - y2) * 16, $e0b = (x2 - x1) * 16, $e1a = (y2 - y0) * 16, $e1b = (x0 - x2) * 16, $e2a = (y0 - y1) * 16, $e2b = (x1 - x0) * 16;
+      const px0 = minX * 16 + 8, py0 = minY * 16 + 8;
+      let $w0r = (x2 - x1) * (py0 - y1) - (y2 - y1) * (px0 - x1) + bias0;
+      let $w1r = (x0 - x2) * (py0 - y2) - (y0 - y2) * (px0 - x2) + bias1;
+      let $w2r = (x1 - x0) * (py0 - y0) - (y1 - y0) * (px0 - x0) + bias2;
+      const a0 = v0.a, iw0 = v0.iw, iw1 = v1.iw, iw2 = v2.iw;
+      let a1 = v1.a, a2 = v2.a;\n`;
+    if (lit) code += `{ const flip = (a) => { const d = a0[4] * a[4] + a0[5] * a[5] + a0[6] * a[6] + a0[7] * a[7]; if (d >= 0) return a; const c = Array.from(a); for (let k = 4; k < 8; k++) c[k] = -c[k]; return c; };
+        a1 = flip(a1); a2 = flip(a2); }\n`;
+    for (const s of need) code += `const P0_${s} = a0[${s}] * iw0, P1_${s} = a1[${s}] * iw1, P2_${s} = a2[${s}] * iw2;\n`;
+    code += `const inv = 1 / area, z0 = v0.z, z1 = v1.z, z2 = v2.z;
+      let drawn = false, frags = 0;
+      for (let y = minY; y <= maxY; y++, $w0r += $e0b, $w1r += $e1b, $w2r += $e2b) {
+        const fy = HREG - y;
+        if (fy < 0) continue;
+        // Covered span of this row: estimate from each edge, then settle on the exact boundary
+        let lo = minX, hi = maxX;\n`;
+    for (const k of [0, 1, 2]) {
+      code += `if ($e${k}a > 0) { if ($w${k}r < 0) lo = Math.max(lo, minX + Math.ceil(-$w${k}r / $e${k}a)); }
+        else if ($e${k}a < 0) { if ($w${k}r < 0) continue; hi = Math.min(hi, minX + Math.floor($w${k}r / -$e${k}a)); }
+        else if ($w${k}r < 0) continue;\n`;
+    }
+    code += `while (lo > minX && ${cov('lo - 1')}) lo--;
+        while (lo <= hi && !${cov('lo')}) lo++;
+        while (hi < maxX && ${cov('hi + 1')}) hi++;
+        while (hi >= lo && !${cov('hi')}) hi--;
+        if (lo > hi) continue;
+        const rowBase = (fy & ~7) * FBW, mrow = (fy & 7) * 8;
+        let w0 = $w0r + $e0a * (lo - minX), w1 = $w1r + $e1a * (lo - minX), w2 = $w2r + $e2a * (lo - minX);
+        for (let x = lo; x <= hi; x++, w0 += $e0a, w1 += $e1a, w2 += $e2a) {
+          ${st.scissor === 1 ? 'if (x >= SX0 && x <= SX1 && y >= SY0 && y <= SY1) continue;' : ''}
+          const pix = rowBase + (x & ~7) * 8 + MORTON[mrow + (x & 7)];
+          const b0 = w0 * inv, b1 = w1 * inv, b2 = w2 * inv;\n`;
+    if (needZ) code += `let $z = (b0 * z0 + b1 * z1 + b2 * z2) * DSCALE + DOFF;
+          $z = $z < 0 ? 0 : $z > 1 ? 1 : $z;
+          const zi = Math.round($z * DMAX);\n`;
+    if (depth) {
+      code += `const dAddr = DOFF8 + pix * ${dbpp};
+          const stored = ${dbpp === 2 ? 'DU8[dAddr] | (DU8[dAddr + 1] << 8)' : 'DU8[dAddr] | (DU8[dAddr + 1] << 8) | (DU8[dAddr + 2] << 16)'};\n`;
+      if (earlyZ) code += `if (!(${cmpExpr(st.depthFunc, 'zi', 'stored')})) continue;\n`;
+    }
+    code += 'const pw = 1 / (b0 * iw0 + b1 * iw1 + b2 * iw2);\n';
+    for (const s of used) {
+      if (need.includes(s)) code += `const $a${s} = (b0 * P0_${s} + b1 * P1_${s} + b2 * P2_${s}) * pw;\n`;
+      else code += `const $a${s} = I[${s}];\n`; // not interpolated by this state: the reference path reads the last value
+    }
+    if (lit) for (const s of need) code += `I[${s}] = $a${s};\n`; // the lighting helper reads I
+    code += `let $col = 0;\n{\n${body}}\n`;
+    if (stencil) {
+      code += `const sv = DU8[dAddr + 3];
+          if (!(${cmpExpr(st.stencilFunc, 'SREFM', '(sv & SMASK)')})) { ${stencilWrite(st.sFail)} continue; }
+          ${st.depthTest ? `if (!(${cmpExpr(st.depthFunc, 'zi', 'stored')})) { ${stencilWrite(st.sZFail)} continue; }` : ''}
+          ${stencilWrite(st.sZPass)}\n`;
+    }
+    if (st.depthWrite) code += `DU8[dAddr] = zi; DU8[dAddr + 1] = zi >>> 8;${dbpp >= 3 ? ' DU8[dAddr + 2] = zi >>> 16;' : ''}\n`;
+    code += 'drawn = true; frags++;\n';
+    if (st.colorMask) code += `{ const c = $col, u8 = CU8, o = COFF + pix * CBPP;\n${write.body}}\n`;
+    code += `}
+      }
+      if (drawn) st.drawn = true;
+      return frags;
+    };`;
+    return code;
+  }
+
+  function compileRaster(st) {
+    const key = rasterKey(st);
+    let f = rasterCache.get(key);
+    if (!f) {
+      f = new Function('H', genRaster(st))(HELPERS);
+      if (rasterCache.size > 512) rasterCache.clear();
+      rasterCache.set(key, f);
+    }
+    st.raster = f;
   }
 
   // ------------------------------------------------------------------ the GPU
   // Semantic slots in an output vertex (matching the VS output map encoding)
   const SEM = { POS: 0, QUAT: 4, COLOR: 8, UV0: 12, UV1: 14, UV0W: 16, VIEW: 18, UV2: 22, COUNT: 24 };
+
+  // Clip against the near/far planes, w > 0 and a guard band for x/y.
+  const GUARD = 16;
+  const CLIP_PLANES = [
+    (v) => -v[2],              // z <= 0
+    (v) => v[2] + v[3],        // z >= -w
+    (v) => v[3] - 1e-5,        // w > 0
+    (v) => GUARD * v[3] - v[0], (v) => GUARD * v[3] + v[0],
+    (v) => GUARD * v[3] - v[1], (v) => GUARD * v[3] + v[1],
+  ];
+  const insideClip = (v) => -v[2] >= 0 && v[2] + v[3] >= 0 && v[3] - 1e-5 >= 0 &&
+    GUARD * v[3] - v[0] >= 0 && GUARD * v[3] + v[0] >= 0 && GUARD * v[3] - v[1] >= 0 && GUARD * v[3] + v[1] >= 0;
 
   class Gpu {
     constructor(emu) {
@@ -678,13 +1293,23 @@
       this.defaults = new Float32Array(16 * 4);
       this.fixedBuf = [0, 0, 0];
       this.fixedCount = 0;
-      this.uniBuf = [];
       this.immediate = [];
+      this.uniScratch = new Int32Array(12);
+      // Geometry shader input buffer (vertex shader outputs waiting for a full primitive) and emitted vertex slots
+      this.gsIn = new Float32Array(16 * 4); this.gsFill = 0;
+      this.gsSlots = [null, null, null];
+      this.gs.onEmit = (unit) => this.gsEmit(unit);
       this.texCache = new Map();
+      this.texBytes = 0;
       this.fullViews = new WeakMap();
       this.state = null;
-      this.prim = { topology: 0, buf: [], count: 0 };
-      this.stats = { lists: 0, draws: 0, triangles: 0 };
+      this.prim = { topology: 0, buf: [], count: 0, winding: false };
+      this.stats = { lists: 0, draws: 0, triangles: 0, fragments: 0 };
+      // Host GPU renderer (EMU.GLRenderer) when drawing with WebGL; null = software rasterizer
+      this.gl = null;
+      this.lutDirty = true; this.fogDirty = true; this.lutRows = 0xFFFFFF; // lighting/fog tables changed since the renderer last read them
+      // Generated per-state rasterizers (false = the generic reference rasterizer; same output, slower)
+      this.rasterJit = true;
       this.warned = new Set();
       this.lut = new Array(24).fill(null).map(() => new Uint32Array(256)); // lighting LUTs
       this.lutIndex = 0; this.lutSel = 0;
@@ -697,6 +1322,7 @@
       };
       this.P0 = new Float64Array(SEM.COUNT); this.P1 = new Float64Array(SEM.COUNT); this.P2 = new Float64Array(SEM.COUNT);
       this.I = new Float64Array(SEM.COUNT);
+      this.outMap = null; this.outMapKey = new Float64Array(9).fill(-1);
     }
 
     get mem() { return this.emu.mem; }
@@ -746,13 +1372,35 @@
     }
 
     // Forget decoded textures overlapping [phys, phys + size).
-    invalidatePhys(phys, size) {
+    // Mark decoded textures overlapping [phys, phys + size) stale. A stale texture is re-checked against its
+    // source bytes when next used and decoded again only if they changed (games flush texture memory every
+    // frame whether or not they wrote it).
+    staleTextures(phys, size) {
       if (!this.texCache.size) return;
       const end = phys + size;
-      for (const [k, t] of this.texCache) if (t.addr < end && t.addr + t.bytes > phys) this.texCache.delete(k);
+      for (const t of this.texCache.values()) if (t.addr < end && t.addr + t.bytes > phys) t.stale = true;
     }
 
-    invalidateVirt(virt, size) { this.invalidatePhys(this.toPhys(virt), size); }
+    // [phys, phys + size) was written (by a GX command or the CPU); fill: { value, bytes } for a memory fill
+    invalidatePhys(phys, size, fill) {
+      this.staleTextures(phys, size);
+      if (this.gl) this.gl.memoryWritten(phys, size, fill);
+    }
+
+    // The CPU flushed its cache over [virt, virt + size): it may have written there. Render targets the host GPU
+    // holds newer pixels for are kept (a flush alone does not change memory).
+    cacheFlushed(virt, size) {
+      const phys = this.toPhys(virt);
+      this.staleTextures(phys, size);
+      if (this.gl) this.gl.cacheFlushed(phys, size);
+    }
+
+    // Something is about to read [virt, virt + size) from memory: render targets there must be in memory
+    syncToMemoryVirt(virt, size) {
+      if (this.gl) this.gl.syncToMemory(this.toPhys(virt), size);
+    }
+
+    invalidateVirt(virt, size, fill) { this.invalidatePhys(this.toPhys(virt), size, fill); }
 
     // ---------------------------------------------------------------- command lists
     runCommandList(virt, size) {
@@ -763,8 +1411,11 @@
         const param = words[i], hdr = words[i + 1];
         const id = hdr & 0x3FF, mask = (hdr >>> 16) & 0xF, extra = (hdr >>> 20) & 0x7FF, seq = hdr >>> 31;
         let jump = this.write(id, param, mask);
+        if (id >= 0x2C0) this.shareWithGs(id, param, mask);
         for (let k = 0; k < extra && i + 2 + k < words.length; k++) {
-          const j = this.write(seq ? (id + 1 + k) & 0x3FF : id, words[i + 2 + k], mask);
+          const reg = seq ? (id + 1 + k) & 0x3FF : id;
+          const j = this.write(reg, words[i + 2 + k], mask);
+          if (reg >= 0x2C0) this.shareWithGs(reg, words[i + 2 + k], mask);
           if (j) jump = j;
         }
         i += 2 + extra + (extra & 1);
@@ -796,12 +1447,16 @@
         case 0x110: case 0x111: this.flushTargets(); return null; // framebuffer flush / invalidate
         case 0x1C5: this.lutSel = (v >>> 8) & 0x1F; this.lutIndex = v & 0xFF; return null;
         case 0x1C8: case 0x1C9: case 0x1CA: case 0x1CB: case 0x1CC: case 0x1CD: case 0x1CE: case 0x1CF:
-          if (this.lut[this.lutSel]) this.lut[this.lutSel][this.lutIndex & 0xFF] = v;
+          if (this.lut[this.lutSel] && this.lut[this.lutSel][this.lutIndex & 0xFF] !== v) {
+            this.lut[this.lutSel][this.lutIndex & 0xFF] = v;
+            this.lutDirty = true;
+            this.lutRows |= 1 << this.lutSel; // which tables changed
+          }
           this.lutIndex++;
           return null;
         case 0x0E6: this.fogIndex = v & 0x7F; return null;
         case 0x0E8: case 0x0E9: case 0x0EA: case 0x0EB: case 0x0EC: case 0x0ED: case 0x0EE: case 0x0EF:
-          this.fogLut[this.fogIndex++ & 0x7F] = v; return null;
+          this.fogLut[this.fogIndex++ & 0x7F] = v; this.fogDirty = true; return null;
         case 0x22E: this.draw(false); return null;
         case 0x22F: this.draw(true); return null;
         case 0x232: this.fixedCount = 0; if ((v & 0xF) === 0xF) { this.immediate = []; this.startPrimitive(); } return null;
@@ -811,36 +1466,51 @@
           return { addr: (r[0x23A + n] & 0x1FFFFFFF) << 3, size: (r[0x238 + n] & 0x1FFFFF) << 3 };
         }
         case 0x25F: this.startPrimitive(); return null;
-        case 0x2C0: this.uniBuf = []; return null;
+        case 0x2C0: this.vs.uniBuf = []; return null;
         case 0x2C1: case 0x2C2: case 0x2C3: case 0x2C4: case 0x2C5: case 0x2C6: case 0x2C7: case 0x2C8:
           this.uniformData(this.vs, 0x2C0, value); return null;
         case 0x2CC: case 0x2CD: case 0x2CE: case 0x2CF: case 0x2D0: case 0x2D1: case 0x2D2: case 0x2D3:
-          this.vs.code[r[0x2CB] & 0xFFF] = value; r[0x2CB] = (r[0x2CB] + 1) & 0xFFF; this.vs.invalidate(); return null;
+          this.setShaderWord(this.vs, this.vs.code, r[0x2CB] & 0xFFF, value); r[0x2CB] = (r[0x2CB] + 1) & 0xFFF; return null;
         case 0x2D6: case 0x2D7: case 0x2D8: case 0x2D9: case 0x2DA: case 0x2DB: case 0x2DC: case 0x2DD:
-          this.vs.swizzle[r[0x2D5] & 0x7F] = value; r[0x2D5] = (r[0x2D5] + 1) & 0x7F; this.vs.invalidate(); return null;
-        // geometry shader unit (configured but not executed)
-        case 0x290: this.uniBufGs = []; return null;
+          this.setShaderWord(this.vs, this.vs.swizzle, r[0x2D5] & 0x7F, value); r[0x2D5] = (r[0x2D5] + 1) & 0x7F; return null;
+        // geometry shader unit
+        case 0x290: this.gs.uniBuf = []; return null;
+        case 0x291: case 0x292: case 0x293: case 0x294: case 0x295: case 0x296: case 0x297: case 0x298:
+          this.uniformData(this.gs, 0x290, value); return null;
         case 0x29C: case 0x29D: case 0x29E: case 0x29F: case 0x2A0: case 0x2A1: case 0x2A2: case 0x2A3:
-          this.gs.code[r[0x29B] & 0xFFF] = value; r[0x29B] = (r[0x29B] + 1) & 0xFFF; return null;
+          this.setShaderWord(this.gs, this.gs.code, r[0x29B] & 0xFFF, value); r[0x29B] = (r[0x29B] + 1) & 0xFFF; return null;
         case 0x2A6: case 0x2A7: case 0x2A8: case 0x2A9: case 0x2AA: case 0x2AB: case 0x2AC: case 0x2AD:
-          this.gs.swizzle[r[0x2A5] & 0x7F] = value; r[0x2A5] = (r[0x2A5] + 1) & 0x7F; return null;
+          this.setShaderWord(this.gs, this.gs.swizzle, r[0x2A5] & 0x7F, value); r[0x2A5] = (r[0x2A5] + 1) & 0x7F; return null;
       }
       return null;
     }
 
+    setShaderWord(unit, words, index, value) {
+      if (words[index] === value >>> 0) return; // unchanged: the compiled program stays valid
+      words[index] = value;
+      unit.invalidate();
+    }
+
+    // In shared configuration mode (0x244 bit 0 clear) program, swizzle and float uniform uploads to the
+    // vertex shader unit also reach the geometry shader unit
+    shareWithGs(id, value, mask) {
+      if (this.regs[0x244] & 1) return;
+      if ((id >= 0x2C0 && id <= 0x2C8) || (id >= 0x2CB && id <= 0x2D3) || (id >= 0x2D5 && id <= 0x2DD)) this.write(id - 0x30, value, mask);
+    }
+
     uniformData(unit, setupReg, word) {
-      const r = this.regs, setup = r[setupReg], isF32 = setup >>> 31;
-      this.uniBuf.push(word >>> 0);
+      const r = this.regs, setup = r[setupReg], isF32 = setup >>> 31, buf = unit.uniBuf;
+      buf.push(word >>> 0);
       const need = isF32 ? 4 : 3;
-      if (this.uniBuf.length < need) return;
+      if (buf.length < need) return;
       const idx = setup & 0x7F;
       if (idx < 96) {
         const o = (0x20 + idx) * 4;
-        if (isF32) for (let k = 0; k < 4; k++) unit.R[o + 3 - k] = f32(this.uniBuf[k]);
-        else unpackF24x4(this.uniBuf, unit.R, o);
+        if (isF32) for (let k = 0; k < 4; k++) unit.R[o + 3 - k] = f32(buf[k]);
+        else unpackF24x4(buf, unit.R, o);
       }
       r[setupReg] = (setup & ~0x7F) | ((idx + 1) & 0x7F);
-      this.uniBuf = [];
+      unit.uniBuf = [];
     }
 
     fixedAttr(word) {
@@ -858,7 +1528,8 @@
           for (let a = 0; a < n; a++) R.set(this.immediate[a], this.inputRegister(a) * 4);
           this.immediate = [];
           this.syncShaderUniforms();
-          this.submitVertex(this.runVertexShader());
+          if (this.gsActive()) this.gsSubmit(this.runVertexShaderRaw());
+          else this.submitVertex(this.runVertexShader());
         }
         return;
       }
@@ -873,36 +1544,102 @@
 
     // ---------------------------------------------------------------- vertex processing
     syncShaderUniforms() {
-      const r = this.regs, vs = this.vs;
-      vs.b = r[0x2B0] & 0xFFFF;
-      for (let k = 0; k < 4; k++) {
-        const v = r[0x2B1 + k];
-        vs.i[k * 3] = v & 0xFF; vs.i[k * 3 + 1] = (v >>> 8) & 0xFF; vs.i[k * 3 + 2] = (v >>> 16) & 0xFF;
+      const r = this.regs;
+      const ints = this.uniScratch;
+      for (const [unit, base] of [[this.vs, 0x2B0], [this.gs, 0x280]]) {
+        for (let k = 0; k < 4; k++) {
+          const v = r[base + 1 + k];
+          ints[k * 3] = v & 0xFF; ints[k * 3 + 1] = (v >>> 8) & 0xFF; ints[k * 3 + 2] = (v >>> 16) & 0xFF;
+        }
+        unit.setUniforms(r[base] & 0xFFFF, ints);
       }
+    }
+
+    // ---------------------------------------------------------------- geometry shader
+    // Geometry shader stage on (GPUREG_GEOSTAGE_CONFIG)
+    gsActive() { return (this.regs[0x229] & 3) === 2; }
+
+    // Vertex shader outputs as the geometry shader receives them: the enabled output registers, in order
+    runVertexShaderRaw() {
+      const r = this.regs, vs = this.vs;
+      vs.O.fill(0);
+      vs.run(r[0x2BA] & 0xFFFF);
+      const mask = r[0x2BD] & 0xFFFF, out = new Float32Array(16 * 4);
+      let n = 0;
+      for (let reg = 0; reg < 16; reg++) if (mask & (1 << reg)) { out.set(vs.O.subarray(reg * 4, reg * 4 + 4), n * 4); n++; }
+      return out;
+    }
+
+    // Point mode: vertex shader outputs (GPUREG_VSH_OUTMAP_TOTAL1 + 1 registers per vertex) are queued until the
+    // geometry shader's inputs (GPUREG_GSH_INPUTBUFFER_CONFIG) are full, then the geometry shader runs once.
+    gsSubmit(attrs) {
+      const r = this.regs, cfg = r[0x289];
+      if ((cfg >>> 8) & 3) { this.warn('gsmode', 'GPU: only the point mode of geometry shaders is emulated'); return; }
+      const perVertex = (r[0x24A] & 0xF) + 1, total = (cfg & 0xF) + 1;
+      for (let k = 0; k < perVertex && this.gsFill < total; k++) this.gsIn.set(attrs.subarray(k * 4, k * 4 + 4), (this.gsFill++) * 4);
+      if (this.gsFill < total) return;
+      this.gsFill = 0;
+      const gs = this.gs, R = gs.R;
+      for (let a = 0; a < total; a++) {
+        const reg = a < 8 ? (r[0x28B] >>> (a * 4)) & 0xF : (r[0x28C] >>> ((a - 8) * 4)) & 0xF;
+        R.set(this.gsIn.subarray(a * 4, a * 4 + 4), reg * 4);
+      }
+      gs.O.fill(0);
+      gs.run(r[0x28A] & 0xFFFF);
+    }
+
+    // EMIT: store the outputs in the selected slot; with "primitive emit" also output the slots as a triangle
+    gsEmit(unit) {
+      const slot = unit.emitVtx;
+      if (slot > 2) return;
+      this.gsSlots[slot] = this.mapOutputs(unit.O, this.regs[0x28D] & 0xFFFF);
+      if (!unit.emitPrim) return;
+      const [a, b, c] = this.gsSlots;
+      if (!a || !b || !c) return;
+      if (unit.emitWinding) this.prim.winding = true;
+      this.submitVertex(a); this.submitVertex(b); this.submitVertex(c);
     }
 
     runVertexShader() {
       const r = this.regs, vs = this.vs;
       vs.O.fill(0);
       vs.run(r[0x2BA] & 0xFFFF);
-      // Map the enabled output registers (in order) to semantics.
-      const out = new Float32Array(SEM.COUNT);
-      out[SEM.POS + 3] = 1;
-      const mask = r[0x2BD] & 0xFFFF, total = r[0x04F] & 7;
+      return this.mapOutputs(vs.O, r[0x2BD] & 0xFFFF);
+    }
+
+    // Map the enabled output registers (in order) to semantics.
+    mapOutputs(O, mask) {
+      // SEM.COUNT slots: position w = 1, the rest 0. Values come from float32 registers, so they stay float32.
+      const out = [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+      const map = this.outputMap(mask);
+      for (let k = 0; k < map.length; k += 2) out[map[k]] = O[map[k + 1]];
+      for (let c = 0; c < 4; c++) { const v = Math.abs(out[SEM.COLOR + c]); out[SEM.COLOR + c] = v > 1 ? 1 : v; }
+      return out;
+    }
+
+    // (semantic, output register component) pairs in assignment order, rebuilt when the mapping registers change
+    outputMap(mask) {
+      const r = this.regs, total = r[0x04F] & 7;
+      const key = this.outMapKey;
+      let same = key[0] === mask && key[1] === total;
+      for (let n = 0; same && n < 7; n++) same = key[2 + n] === r[0x050 + n];
+      if (same) return this.outMap;
+      key[0] = mask; key[1] = total;
+      for (let n = 0; n < 7; n++) key[2 + n] = r[0x050 + n];
+      const pairs = [];
       let n = 0;
       for (let reg = 0; reg < 16 && n < 7; reg++) {
         if (!(mask & (1 << reg))) continue;
         if (n < total) {
-          const map = r[0x050 + n];
+          const m = r[0x050 + n];
           for (let c = 0; c < 4; c++) {
-            const sem = (map >>> (c * 8)) & 0x1F;
-            if (sem < SEM.COUNT) out[sem] = vs.O[reg * 4 + c];
+            const sem = (m >>> (c * 8)) & 0x1F;
+            if (sem < SEM.COUNT) pairs.push(sem, reg * 4 + c);
           }
         }
         n++;
       }
-      for (let c = 0; c < 4; c++) { const v = Math.abs(out[SEM.COLOR + c]); out[SEM.COLOR + c] = v > 1 ? 1 : v; }
-      return out;
+      return (this.outMap = Int32Array.from(pairs));
     }
 
     draw(indexed) {
@@ -910,8 +1647,10 @@
       this.stats.draws++;
       const count = r[0x228];
       if (!count) return;
-      if ((r[0x244] & 1) || ((r[0x25E] >>> 8) & 3) === 3) this.warn('gs', 'GPU: geometry shaders are not emulated; drawing the vertex shader output as a triangle list.');
       this.syncShaderUniforms();
+      const gsOn = this.gsActive();
+      // Vertex shading on the host GPU when the renderer can run this program
+      if (this.gl && this.gl.hwVertices && !gsOn && this.gl.drawHardware(this, indexed)) return;
 
       const base = (r[0x200] & 0x1FFFFFFF) << 3;
       const fmtLo = r[0x201], fmtHi = r[0x202];
@@ -995,10 +1734,11 @@
           let out = cache ? cache.get(index) : undefined;
           if (!out) {
             loadVertex(index);
-            out = this.runVertexShader();
+            out = gsOn ? this.runVertexShaderRaw() : this.runVertexShader();
             if (cache) cache.set(index, out);
           }
-          this.submitVertex(out);
+          if (gsOn) this.gsSubmit(out);
+          else this.submitVertex(out);
         }
       } catch (e) {
         if (!(e instanceof RangeError)) throw e;
@@ -1011,6 +1751,9 @@
       this.prim.topology = (this.regs[0x25E] >>> 8) & 3;
       this.prim.buf = [];
       this.prim.count = 0;
+      this.prim.winding = false;
+      this.gsFill = 0;
+      this.gsSlots[0] = this.gsSlots[1] = this.gsSlots[2] = null;
     }
 
     submitVertex(v) {
@@ -1024,26 +1767,30 @@
         } else b.push(v);
       } else if (p.topology === 2) { // fan
         if (b.length === 2) { this.triangle(b[0], b[1], v); b[1] = v; } else b.push(v);
-      } else { // list (and geometry-shader mode)
+      } else { // list (and geometry shader output; SETEMIT's winding flag swaps the first two vertices)
         b.push(v);
-        if (b.length === 3) { this.triangle(b[0], b[1], b[2]); p.buf = []; }
+        if (b.length === 3) {
+          if (p.winding) { p.winding = false; this.triangle(b[1], b[0], b[2]); } else this.triangle(b[0], b[1], b[2]);
+          p.buf = [];
+        }
       }
     }
 
     // ---------------------------------------------------------------- clipping
     triangle(a, b, c) {
       this.stats.triangles++;
-      // Clip against the near/far planes, w > 0 and a guard band for x/y.
-      const G = 16;
-      const planes = [
-        (v) => -v[2],              // z <= 0
-        (v) => v[2] + v[3],        // z >= -w
-        (v) => v[3] - 1e-5,        // w > 0
-        (v) => G * v[3] - v[0], (v) => G * v[3] + v[0],
-        (v) => G * v[3] - v[1], (v) => G * v[3] + v[1],
-      ];
+      const st = this.state || (this.state = this.buildState());
+      if (!st) return;
+      // Most triangles need no clipping
+      if (insideClip(a) && insideClip(b) && insideClip(c)) {
+        const s0 = this.toScreen(a, st), s1 = this.toScreen(b, st), s2 = this.toScreen(c, st);
+        if (this.gl) this.gl.triangle(st, s0, s1, s2);
+        else if (st.raster) this.stats.fragments += st.raster(st, this, s0, s1, s2);
+        else this.rasterize(s0, s1, s2, st);
+        return;
+      }
       let poly = [a, b, c];
-      for (const plane of planes) {
+      for (const plane of CLIP_PLANES) {
         let allIn = true;
         for (const v of poly) if (plane(v) < 0) { allIn = false; break; }
         if (allIn) continue;
@@ -1053,18 +1800,20 @@
           const dp = plane(p), dq = plane(q);
           if (dp >= 0) out.push(p);
           if ((dp >= 0) !== (dq >= 0)) {
-            const t = dp / (dp - dq), v = new Float32Array(SEM.COUNT);
-            for (let s = 0; s < SEM.COUNT; s++) v[s] = p[s] + (q[s] - p[s]) * t;
+            const t = dp / (dp - dq), v = new Array(SEM.COUNT);
+            for (let s = 0; s < SEM.COUNT; s++) v[s] = Math.fround(p[s] + (q[s] - p[s]) * t); // float32, like the vertex values
             out.push(v);
           }
         }
         poly = out;
         if (poly.length < 3) return;
       }
-      const st = this.state || (this.state = this.buildState());
-      if (!st) return;
       const sv = poly.map((v) => this.toScreen(v, st));
-      for (let k = 1; k + 1 < sv.length; k++) this.rasterize(sv[0], sv[k], sv[k + 1], st);
+      for (let k = 1; k + 1 < sv.length; k++) {
+        if (this.gl) this.gl.triangle(st, sv[0], sv[k], sv[k + 1]);
+        else if (st.raster) this.stats.fragments += st.raster(st, this, sv[0], sv[k], sv[k + 1]);
+        else this.rasterize(sv[0], sv[k], sv[k + 1], st);
+      }
     }
 
     toScreen(v, st) {
@@ -1142,8 +1891,9 @@
         const type = t === 0 ? (param >>> 28) & 7 : 0;
         if (t === 0 && type !== 0 && type !== 3) this.warn(`textype${type}`, `GPU: texture type ${type} (cube/shadow) is sampled as 2D`);
         st.textures[t] = {
-          data: tex.data, w, h, wrapS: (param >>> 12) & 7, wrapT: (param >>> 8) & 7,
-          linear: (param >>> 1) & 1, project: type === 3,
+          entry: tex, data: tex.data, data32: tex.data32, w, h, wrapS: (param >>> 12) & 7, wrapT: (param >>> 8) & 7,
+          borderPacked: border >>> 0, // the border register holds R, G, B, A in bytes 0-3, the same order as data32
+          linear: (param >>> 1) & 1, project: type === 3, pow2: (w & (w - 1)) === 0 && (h & (h - 1)) === 0,
           border: [border & 0xFF, (border >>> 8) & 0xFF, (border >>> 16) & 0xFF, border >>> 24],
         };
       }
@@ -1177,7 +1927,8 @@
       if (st.textures[2] && !st.tex2uv1) need.push(SEM.UV2, SEM.UV2 + 1);
       if (st.lighting) need.push(SEM.QUAT, SEM.QUAT + 1, SEM.QUAT + 2, SEM.QUAT + 3, SEM.VIEW, SEM.VIEW + 1, SEM.VIEW + 2);
       st.need = need;
-      compileFragment(st, this);
+      if (this.gl) { /* drawn by the host GPU */ } else if (this.rasterJit) compileRaster(st);
+      else compileFragment(st, this);
       return st;
     }
 
@@ -1189,6 +1940,7 @@
 
     // Write back copied render targets and drop textures that alias them.
     flushTargets() {
+      if (this.gl) { this.gl.flush(); return; }
       const st = this.state;
       if (!st || !st.drawn) return;
       st.drawn = false;
@@ -1202,14 +1954,21 @@
     texture(addr, w, h, fmt) {
       if (!w || !h || !addr) return null;
       const key = `${addr}:${w}:${h}:${fmt}`;
-      let t = this.texCache.get(key);
-      if (t) return t;
       const bytes = (w * h * (TEX_BITS[fmt] || 32)) >> 3;
+      if (this.gl) this.gl.syncToMemory(addr, bytes); // rendered by the host GPU: bring it into memory first
+      let t = this.texCache.get(key);
+      if (t && !t.stale) return t;
       const sp = this.span(addr, bytes);
       if (!sp) { this.warn(`tex${hex(addr)}`, `GPU: texture at ${hex(addr)} is not mapped`); return null; }
-      t = { addr, bytes, data: decodeTexture(sp.u8, sp.off, w, h, fmt) };
-      if (this.texCache.size > 512) this.texCache.clear();
+      // Unchanged, or only some tiles changed (games animate parts of big texture atlases): keep the entry
+      if (t && updateTiles(t, sp.u8, sp.off, w, h, fmt, !!this.gl)) { t.stale = false; return t; }
+      if (t) { this.texCache.delete(key); this.texBytes -= t.cost; }
+      const data = decodeTexture(sp.u8, sp.off, w, h, fmt);
+      t = { addr, bytes, data, data32: new Uint32Array(data.buffer), raw: sp.u8.slice(sp.off, sp.off + bytes), stale: false, cost: w * h * 4 + bytes };
+      // Bounded by count and by memory (decoded RGBA8 + the source copy)
+      if (this.texCache.size >= 512 || this.texBytes > 96 * 1024 * 1024) { this.texCache.clear(); this.texBytes = 0; }
       this.texCache.set(key, t);
+      this.texBytes += t.cost;
       return t;
     }
 
@@ -1302,7 +2061,7 @@
       let a1 = v1.a, a2 = v2.a;
       const lit = st.lighting;
       if (lit) { // interpolate quaternions along the short arc
-        const flip = (a) => { const d = a0[4] * a[4] + a0[5] * a[5] + a0[6] * a[6] + a0[7] * a[7]; if (d >= 0) return a; const c = Float32Array.from(a); for (let k = 4; k < 8; k++) c[k] = -c[k]; return c; };
+        const flip = (a) => { const d = a0[4] * a[4] + a0[5] * a[5] + a0[6] * a[6] + a0[7] * a[7]; if (d >= 0) return a; const c = Array.from(a); for (let k = 4; k < 8; k++) c[k] = -c[k]; return c; };
         a1 = flip(a1); a2 = flip(a2);
       }
       const need = st.need, nN = need.length;
@@ -1362,6 +2121,7 @@
             if (dbpp >= 3) du8[dAddr + 2] = zi >>> 16;
           }
           st.drawn = true;
+          this.stats.fragments++;
 
           // Blending / logic op and color write
           if (st.colorMask) write(col, cu8, coff + pix * cbpp);
@@ -1514,6 +2274,10 @@
   }
 
   EMU.Gpu = Gpu;
+  EMU.ShaderUnit = ShaderUnit;
+  EMU.flattenShaderBody = flattenShaderBody; // for the WebGL renderer
+  EMU.SHADER_OP = OP;
   EMU.f24 = f24;
   EMU.decodeTexture = decodeTexture;
+  EMU.gpuDebug = { genRaster, rasterKey, genShade, genWrite }; // for inspecting generated code
 })(typeof window !== 'undefined' ? window.EMU : globalThis.EMU);

@@ -13,9 +13,23 @@
       this.loaded = false;
       this.halted = true;
       this.systemArchives = new Map(); // title ID (16 hex digits) -> RomFS bytes; kept across loads
+      // Per-frame timings in ms (wall clock): the whole frame, GPU command lists, and GX copies/fills.
+      // CPU + kernel + services time is frame - gpu - xfer.
+      this.perf = { frame: 0, gpu: 0, xfer: 0 };
     }
 
     addSystemArchive(titleId, romfs) { this.systemArchives.set(titleId.toLowerCase(), romfs); }
+
+    // Draw with the host GPU (an EMU.GLRenderer) or, with null, the software rasterizer. Can change while running.
+    setRenderer(renderer) {
+      this.glRenderer = renderer;
+      const gpu = this.gpu;
+      if (!gpu || gpu.gl === renderer) return;
+      if (gpu.gl) { gpu.gl.syncToMemory(0, 0xFFFFFFFF); gpu.gl.attach(null); } // everything rendered so far into memory
+      gpu.state = null;
+      gpu.gl = renderer;
+      if (renderer) renderer.attach(gpu);
+    }
 
     log(msg) { this.onLog(msg); }
 
@@ -32,6 +46,7 @@
       this.halted = false;
       this.haltReason = null;
       this.missingSystemArchive = null;
+      this.standinArchives = null; // title ID -> stand-in RomFS built for this load
       this.insnCount = 0;
       this.frame = 0;
       this.name = name;
@@ -40,6 +55,7 @@
       this.kernel = new EMU.Kernel(this);
       this.services = new EMU.Services(this);
       this.gpu = new EMU.Gpu(this);
+      if (this.glRenderer) { this.glRenderer.attach(this.gpu); this.gpu.gl = this.glRenderer; }
       const mem = this.mem;
 
       const info = EMU.loadExecutable(mem, bytes);
@@ -85,15 +101,19 @@
 
     runFrame() {
       if (this.halted) return;
+      const perf = this.perf, t0 = EMU.now();
+      perf.gpu = perf.xfer = 0;
       try {
         if (this.services.instances.has('HID')) this.services.hid.update(this.input);
         this.kernel.runUntil(this.kernel.ticks + EMU.TICKS_PER_FRAME);
         if (this.services.instances.has('gsp::Gpu')) this.services.gsp.vblank();
+        if (this.gpu.gl) this.gpu.gl.endFrame();
         this.frame++;
       } catch (e) {
         if (!(e instanceof EMU.EmuError)) console.error(e);
         this.halt(`${e.message}\n${this.dumpRegs()}`);
       }
+      perf.frame = EMU.now() - t0;
     }
 
     dumpRegs() {
@@ -106,7 +126,18 @@
       return lines.join('\n');
     }
 
+    // Draw a screen straight from the host GPU onto a 2D canvas context, when its framebuffer is there. False:
+    // use renderScreen.
+    presentGL(screen, ctx) {
+      const gl = this.gpu && this.gpu.gl;
+      const gsp = gl && this.services.instances.get('gsp::Gpu');
+      const info = gsp && gsp.screenInfo(screen);
+      if (!info || !info.fb0) return false;
+      return gl.present(this.gpu.toPhys(info.fb0), info.format, info.stride || 240 * EMU.FB_BPP[info.format & 7], screen === 0 ? 400 : 320, ctx);
+    }
+
     // Render a screen (0 = top 400x240, 1 = bottom 320x240) into RGBA pixels. Returns false if nothing to show.
+    // Pixels are written as little-endian 32-bit words (R, G, B, A bytes); conversions match EMU.decodePixel.
     renderScreen(screen, out) {
       const W = screen === 0 ? 400 : 320;
       const gsp = this.services && this.services.instances.get('gsp::Gpu');
@@ -114,17 +145,26 @@
       if (!info || !info.fb0) { out.fill(0); for (let i = 3; i < out.length; i += 4) out[i] = 255; return false; }
       const fmt = info.format & 7, bpp = EMU.FB_BPP[fmt];
       const stride = info.stride || 240 * bpp;
+      const size = stride * (W - 1) + 240 * bpp;
+      this.gpu.syncToMemoryVirt(info.fb0, size);
+      if (!this.fbScratch || this.fbScratch.length < size) this.fbScratch = new Uint8Array(size);
       let data;
-      try { data = this.mem.readBytes(info.fb0, stride * (W - 1) + 240 * bpp); }
+      try { data = this.mem.readInto(info.fb0, this.fbScratch.subarray(0, size)); }
       catch (e) { out.fill(0); return false; }
+      const out32 = new Uint32Array(out.buffer, out.byteOffset, W * 240);
       for (let x = 0; x < W; x++) {
         const col = x * stride;
-        for (let y = 0; y < 240; y++) {
-          const o = col + (239 - y) * bpp, p = (y * W + x) * 4;
-          if (fmt === 1) { out[p] = data[o + 2]; out[p + 1] = data[o + 1]; out[p + 2] = data[o]; }
-          else if (fmt === 0) { out[p] = data[o + 3]; out[p + 1] = data[o + 2]; out[p + 2] = data[o + 1]; }
-          else { const c = EMU.decodePixel(fmt, data, o); out[p] = c[0]; out[p + 1] = c[1]; out[p + 2] = c[2]; }
-          out[p + 3] = 255;
+        for (let y = 0, o = col + 239 * bpp, p = x; y < 240; y++, o -= bpp, p += W) {
+          let r, g, b;
+          switch (fmt) {
+            case 0: r = data[o + 3]; g = data[o + 2]; b = data[o + 1]; break;
+            case 1: r = data[o + 2]; g = data[o + 1]; b = data[o]; break;
+            case 2: { const v = data[o] | (data[o + 1] << 8); r = ((v >> 11) & 31) * 255 / 31 | 0; g = ((v >> 5) & 63) * 255 / 63 | 0; b = (v & 31) * 255 / 31 | 0; break; }
+            case 3: { const v = data[o] | (data[o + 1] << 8); r = ((v >> 11) & 31) * 255 / 31 | 0; g = ((v >> 6) & 31) * 255 / 31 | 0; b = ((v >> 1) & 31) * 255 / 31 | 0; break; }
+            case 4: { const v = data[o] | (data[o + 1] << 8); r = ((v >> 12) & 15) * 17; g = ((v >> 8) & 15) * 17; b = ((v >> 4) & 15) * 17; break; }
+            default: r = g = b = 0;
+          }
+          out32[p] = (r | (g << 8) | (b << 16) | 0xFF000000) >>> 0;
         }
       }
       return true;

@@ -212,6 +212,11 @@
   EMU.SYSTEM_ARCHIVE_NAMES = {
     '0004009b00010202': 'Mii data',
     '0004009b00014002': 'shared font (JPN/USA/EUR)',
+    '0004009b00014102': 'shared font (CHN)',
+    '0004009b00014202': 'shared font (KOR)',
+    '0004009b00014302': 'shared font (TWN)',
+    '0004009b00010402': 'region manifest / country list',
+    '000400db00010302': 'bad word list',
   };
 
   // A system data archive (e.g. Mii data, shared font): the decrypted .app content of a data-only title.
