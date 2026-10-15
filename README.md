@@ -2,6 +2,8 @@
 
 # Pica3DS
 
+**Try it in your browser: [pica3ds.netlify.app](https://pica3ds.netlify.app/)** (nothing to install; your games stay on your computer)
+
 An experimental Nintendo 3DS emulator written from scratch in JavaScript. It runs in the browser with no build step, no install and no server.
 
 It runs homebrew built with devkitARM/libctru and some commercial games, with 3D graphics drawn on your graphics card (WebGL 2), sound, and a software reference renderer that the fast paths are tested against.
@@ -9,6 +11,8 @@ It runs homebrew built with devkitARM/libctru and some commercial games, with 3D
 > **Bring your own games.** This repository contains no Nintendo games, firmware, system files or encryption keys. Use dumps of games and system data you own, decrypted on your own console.
 
 ## Quick start
+
+Open [pica3ds.netlify.app](https://pica3ds.netlify.app/), or run it locally:
 
 1. Download or clone this repository.
 2. Open `index.html` in a browser. Double-clicking it usually works; if your browser blocks something when opened from a file, serve the folder instead (for example `npx serve` or `python -m http.server`) and open the address it prints.
