@@ -541,8 +541,21 @@
       s = Math.max(0.3, Math.min((availW - fw) / w, (availH - fh) / h));
       if (!$('smooth').checked && s > 1) s = Math.floor(s * 4) / 4; // quarter steps keep pixels even-ish
     } else s = parseFloat(choice);
-    topCanvas.style.width = 400 * s + 'px'; topCanvas.style.height = 240 * s + 'px';
-    bottomCanvas.style.width = 320 * s + 'px'; bottomCanvas.style.height = 240 * s + 'px';
+    const setSize = () => {
+      topCanvas.style.width = 400 * s + 'px'; topCanvas.style.height = 240 * s + 'px';
+      bottomCanvas.style.width = 320 * s + 'px'; bottomCanvas.style.height = 240 * s + 'px';
+    };
+    setSize();
+    if (choice === 'auto') {
+      // Whatever the measurements missed (bars, safe areas, controls): shrink until nothing spills off the stage
+      const stage = $('stage'), h = layout === 'stacked' ? 480 : 240;
+      for (let i = 0; i < 3; i++) {
+        const over = stage.scrollHeight - stage.clientHeight;
+        if (over <= 1 || s <= 0.3) break;
+        s = Math.max(0.3, s - (over + 1) / h);
+        setSize();
+      }
+    }
     layoutDisplay();
   }
 
@@ -573,7 +586,8 @@
   $('show-hud').addEventListener('change', () => { store.set('hud', $('show-hud').checked ? '1' : '0'); $('hud').hidden = !$('show-hud').checked; });
   $('hud').hidden = !$('show-hud').checked;
   window.addEventListener('resize', queueFit);
-  new ResizeObserver(queueFit).observe($('stage'));
+  window.addEventListener('fitscreens', queueFit);
+  { const ro = new ResizeObserver(queueFit); ro.observe($('stage')); ro.observe($('vpad')); }
 
   // Fullscreen: the browser's fullscreen mode where there is one; iPhones have none for pages, so there the
   // top bar is hidden instead (adding the page to the home screen hides the browser's own bars too)

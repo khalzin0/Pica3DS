@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0d0f13">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#161a21">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -43,10 +43,15 @@
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
   html, body { overscroll-behavior: none; }
+  *, *::before, *::after { touch-action: manipulation; }
   html { touch-action: manipulation; -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
   /* Pinned to the screen's edges: iOS reports 100vh short when opened from the home screen */
   body { display: flex; flex-direction: column; position: fixed; inset: 0; overflow: hidden; }
+  /* Anything iOS leaves outside the page (the strip under a home-screen app) blends into the stage */
+  html { background: var(--bg); }
+  /* Home-screen app on iOS: the page already ends above the home bar, so the controls need no extra room for it */
+  html.short-view body.touch .vpad { padding-bottom: 4px; }
   button, select, input { font: inherit; color: inherit; }
   svg { display: block; }
 
@@ -484,6 +489,39 @@
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <div class="drop-hint">Drop a game to play it</div>
 
+<script>
+// iOS: block double-tap and pinch zoom on everything, without eating taps.
+(function () {
+  // Home-screen app on iOS: the page is given less than the full screen (it stops above the home bar), so the
+  // on-screen controls can drop the space they keep for it
+  const app = navigator.standalone === true || matchMedia('(display-mode: standalone), (display-mode: fullscreen)').matches;
+  if (app) {
+    const root = document.documentElement;
+    const size = () => {
+      const landscape = matchMedia('(orientation: landscape)').matches;
+      const full = landscape ? Math.min(screen.width, screen.height) : Math.max(screen.width, screen.height);
+      const short = full - document.documentElement.clientHeight;
+      root.classList.toggle('short-view', short > 8 && short <= 100);
+      dispatchEvent(new Event('fitscreens'));
+    };
+    size();
+    addEventListener('resize', size);
+    addEventListener('orientationchange', () => setTimeout(size, 300));
+    addEventListener('pageshow', size);
+  }
+  let last = 0;
+  document.addEventListener('touchend', e => {
+    const now = e.timeStamp, t = e.target;
+    if (now - last < 350 && e.changedTouches.length === 1 && !t.closest('input, textarea, select, [contenteditable]')) {
+      e.preventDefault();
+      if (t.closest('button, a, label, summary, [role=button], [role=tab]')) t.click();
+    }
+    last = now;
+  }, { passive: false });
+  for (const ev of ['gesturestart', 'gesturechange', 'gestureend']) document.addEventListener(ev, e => e.preventDefault(), { passive: false });
+  document.addEventListener('dblclick', e => e.preventDefault(), { passive: false });
+})();
+</script>
 <script src="src/memory.js"></script>
 <script src="src/cpu.js"></script>
 <script src="src/kernel.js"></script>
