@@ -213,8 +213,8 @@
   body.touch .device { padding: 6px; gap: 6px; border-radius: 14px; }
   body.touch .screen { padding: 0; border-radius: 3px; overflow: hidden; }
   body.touch .hinge { display: none; }
-  body.touch .vpad { display: flex; justify-content: space-between; align-items: flex-end; width: 100%; max-width: 560px; flex: none; padding: 0 2px calc(4px + env(safe-area-inset-bottom)); }
-  .vp-side { display: flex; flex-direction: column; align-items: center; gap: calc(var(--u) * .22); }
+  body.touch .vpad { display: flex; justify-content: space-between; align-items: stretch; width: 100%; max-width: 560px; flex: none; padding: 0 2px calc(4px + env(safe-area-inset-bottom)); }
+  .vp-side { display: flex; flex-direction: column; align-items: center; justify-content: space-between; gap: calc(var(--u) * .22); }
   .vp-row { display: flex; gap: 8px; width: 100%; justify-content: center; }
   .vp-btn { display: grid; place-items: center; color: rgba(255, 255, 255, .9); background: rgba(40, 45, 58, .8); border: 1px solid rgba(255, 255, 255, .13); box-shadow: 0 2px 0 rgba(0, 0, 0, .35); font: 700 calc(var(--u) * .3)/1 system-ui, -apple-system, sans-serif; transition: transform .05s, background .05s; }
   .vp-btn.on { background: var(--accent); border-color: var(--accent-2); color: #fff; transform: scale(.93); }
@@ -227,12 +227,14 @@
   .vp-face [data-b=B] { bottom: 0; left: calc(50% - var(--u) / 2); }
   .vp-face [data-b=Y] { left: 0; top: calc(50% - var(--u) / 2); }
   .vp-face [data-b=A] { right: 0; top: calc(50% - var(--u) / 2); }
-  .vp-stick { position: relative; flex: none; width: calc(var(--u) * 2.7); height: calc(var(--u) * 2.7); border-radius: 50%; display: grid; place-items: center; background: radial-gradient(circle, rgba(40, 45, 58, .5), rgba(22, 25, 32, .8)); border: 1px solid rgba(255, 255, 255, .1); }
+  .vp-stick { position: relative; flex: none; width: calc(var(--u) * 2.9); height: calc(var(--u) * 2.9); border-radius: 50%; display: grid; place-items: center; background: radial-gradient(circle, rgba(40, 45, 58, .5), rgba(22, 25, 32, .8)); border: 1px solid rgba(255, 255, 255, .1); }
   .vp-stick i { width: calc(var(--u) * 1.2); height: calc(var(--u) * 1.2); border-radius: 50%; background: rgba(72, 78, 94, .96); border: 1px solid rgba(255, 255, 255, .2); box-shadow: 0 3px 8px rgba(0, 0, 0, .45); will-change: transform; }
   .vp-stick.on i { background: #5d6479; }
-  .vp-dpad { position: relative; flex: none; width: calc(var(--u) * 2.7); height: calc(var(--u) * 2.7); }
+  .vp-dpad { position: relative; flex: none; width: calc(var(--u) * 2.9); height: calc(var(--u) * 2.9); }
   .vp-dpad span { position: absolute; width: calc(var(--u) * .92); height: calc(var(--u) * .92); background: rgba(40, 45, 58, .8); border: 1px solid rgba(255, 255, 255, .13); }
   .vp-dpad span::after { content: ""; position: absolute; inset: 0; margin: auto; width: 0; height: 0; border: calc(var(--u) * .13) solid transparent; }
+  .vp-dpad [data-k=DUP], .vp-dpad [data-k=DDOWN] { height: calc(var(--u) * .99); }
+  .vp-dpad [data-k=DLEFT], .vp-dpad [data-k=DRIGHT] { width: calc(var(--u) * .99); }
   .vp-dpad [data-k=DUP] { top: 0; left: calc(50% - var(--u) * .46); border-radius: 8px 8px 0 0; border-bottom: 0; }
   .vp-dpad [data-k=DDOWN] { bottom: 0; left: calc(50% - var(--u) * .46); border-radius: 0 0 8px 8px; border-top: 0; }
   .vp-dpad [data-k=DLEFT] { left: 0; top: calc(50% - var(--u) * .46); border-radius: 8px 0 0 8px; border-right: 0; }
@@ -241,7 +243,7 @@
   .vp-dpad [data-k=DDOWN]::after { border-top-color: rgba(255, 255, 255, .7); margin-bottom: calc(var(--u) * .14); }
   .vp-dpad [data-k=DLEFT]::after { border-right-color: rgba(255, 255, 255, .7); margin-left: calc(var(--u) * .14); }
   .vp-dpad [data-k=DRIGHT]::after { border-left-color: rgba(255, 255, 255, .7); margin-right: calc(var(--u) * .14); }
-  .vp-dpad i { position: absolute; inset: calc(var(--u) * .9); background: rgba(40, 45, 58, .8); }
+  .vp-dpad i { position: absolute; inset: calc(var(--u) * .99); background: rgba(40, 45, 58, .8); }
   .vp-dpad span.on { background: var(--accent); }
   /* Sideways: the controls sit either side of the screens */
   @media (orientation: landscape) {
