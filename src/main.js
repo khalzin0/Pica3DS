@@ -558,12 +558,44 @@
   });
   updateStates();
 
+  // What each added title is (name, kind, used), kept with the files: titleId -> { name, kind, used }
+  const titleMeta = new Map();
+  const KIND_LABELS = { app: 'Built-in apps', applet: 'Applets', data: 'System data', module: 'System modules (not used: Pica3DS replaces them)',
+    firmware: 'Firmware (not used)', ds: 'DS mode titles (not used)' };
   function updateSysStatus() {
-    const ids = new Set([...emu.systemArchives.keys(), ...(emu.titleExefs ? emu.titleExefs.keys() : [])]);
-    const names = [...ids].map((id) => EMU.SYSTEM_ARCHIVE_NAMES[id] || id.toUpperCase());
-    if (homeMenu) names.unshift('HOME Menu');
-    $('sys-status').textContent = names.length ? `Added (${names.length}): ${names.join(', ')}` : 'None added (built-in stand-ins are used).';
-    $('sys-clear').disabled = !names.length;
+    const ids = new Set([...emu.systemArchives.keys(), ...(emu.titleExefs ? emu.titleExefs.keys() : []), ...titleMeta.keys()]);
+    if (homeMenu) ids.add(homeMenu.id);
+    const box = $('sys-status');
+    box.textContent = '';
+    $('sys-clear').disabled = !ids.size;
+    if (!ids.size) { box.textContent = 'None added (built-in stand-ins are used).'; return; }
+    const groups = {};
+    for (const id of ids) {
+      const m = titleMeta.get(id) || { name: EMU.SYSTEM_ARCHIVE_NAMES[id] || '', kind: id.startsWith('00040030') ? 'applet' : id.startsWith('00040010') ? 'app' : 'data', used: true };
+      (groups[m.kind] || (groups[m.kind] = [])).push([id, m.name]);
+    }
+    const used = [...ids].filter((id) => !titleMeta.has(id) || titleMeta.get(id).used).length;
+    const head = document.createElement('div');
+    head.textContent = `Added ${ids.size} system titles (${used} used by Pica3DS)`;
+    box.appendChild(head);
+    for (const kind of Object.keys(KIND_LABELS)) {
+      const list = groups[kind];
+      if (!list) continue;
+      list.sort((a, b) => (a[1] || a[0]).localeCompare(b[1] || b[0]));
+      const d = document.createElement('details'), s = document.createElement('summary');
+      s.textContent = `${KIND_LABELS[kind]}: ${list.length}`;
+      d.appendChild(s);
+      const ul = document.createElement('ul');
+      for (const [id, name] of list) {
+        const li = document.createElement('li');
+        li.innerHTML = '<span></span><code></code>';
+        li.firstChild.textContent = name ? name.charAt(0).toUpperCase() + name.slice(1) : 'Unknown';
+        li.lastChild.textContent = id.toUpperCase();
+        ul.appendChild(li);
+      }
+      d.appendChild(ul);
+      box.appendChild(d);
+    }
   }
 
   // Adds the bytes if they are a decrypted system data file.
@@ -587,6 +619,13 @@
     let info;
     try { info = EMU.parseSystemArchive(bytes); } catch (e) { return { ok: false, error: e.message }; }
     if (info.executable && !allowTitles) return { ok: false };
+    const meta = { name: info.name || '', kind: info.kind || 'data', used: info.used !== false };
+    titleMeta.set(info.titleId, meta);
+    dbDo('readwrite', (s) => s.put(meta, 'meta:' + info.titleId));
+    if (!meta.used) { // recognised and listed, but not stored: Pica3DS has no use for it
+      logLine(`Recognised ${info.titleId.toUpperCase()} (${meta.name}) from ${name}: not used by Pica3DS`);
+      return { ok: true };
+    }
     if (HOME_MENU_IDS.includes(info.titleId)) { // kept whole, to be started
       homeMenu = { id: info.titleId, bytes };
       dbDo('readwrite', (s) => s.put(bytes, 'home:' + info.titleId));
@@ -608,13 +647,14 @@
       else { logLine(`${f.name}: ${r.error || 'not a system data file'}`, 'err'); toast(`${f.name}: ${r.error || 'not a system data file'}`, true, 5000); }
     }
     updateSysStatus();
-    if (added) toast(romBytes ? `Added ${added} system file(s). Restart the game to use them.` : `Added ${added} system file(s).`);
+    if (added) toast(romBytes ? `Added ${added} system file(s). Restart the game to use them.` : `Added ${added} system file(s). See the list under Settings → System files.`);
   }
 
   $('sysfiles').addEventListener('change', (e) => { addSystemFiles([...e.target.files]); e.target.value = ''; });
   $('sys-clear').addEventListener('click', () => {
     emu.systemArchives.clear();
     if (emu.titleExefs) emu.titleExefs.clear();
+    titleMeta.clear();
     homeMenu = null; showHomeButtons();
     dbDo('readwrite', (s) => s.clear());
     updateSysStatus();
@@ -626,7 +666,8 @@
       const c = req.result;
       if (!c) { updateSysStatus(); return; }
       const key = String(c.key);
-      if (key.startsWith('home:')) { homeMenu = { id: key.slice(5), bytes: new Uint8Array(c.value) }; showHomeButtons(); updateSysStatus(); }
+      if (key.startsWith('meta:')) titleMeta.set(key.slice(5), c.value);
+      else if (key.startsWith('home:')) { homeMenu = { id: key.slice(5), bytes: new Uint8Array(c.value) }; showHomeButtons(); updateSysStatus(); }
       else if (key.endsWith(':exefs')) emu.addTitleExefs(key.slice(0, -6), c.value);
       else emu.addSystemArchive(key, new Uint8Array(c.value));
       c.continue();

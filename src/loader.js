@@ -73,7 +73,7 @@
 
   // English short title from an SMDH icon file.
   function smdhTitle(smdh) {
-    if (smdh.length < 0x2000 || String.fromCharCode(...smdh.subarray(0, 4)) !== 'SMDH') return null;
+    if (smdh.length < 0x288 || String.fromCharCode(...smdh.subarray(0, 4)) !== 'SMDH') return null;
     const dv = new DataView(smdh.buffer, smdh.byteOffset, smdh.byteLength);
     let s = '';
     for (let o = 0x208; o < 0x288; o += 2) { const c = dv.getUint16(o, true); if (!c) break; s += String.fromCharCode(c); }
@@ -299,11 +299,82 @@
     '0004009b00014302': 'shared font (TWN)',
     '0004009b00010402': 'region manifest / country list',
     '000400db00010302': 'bad word list',
+    '0004009b00010602': 'public CA certificates',
+    '0004009b00011202': 'keyboard dictionary (Dutch)',
+    '0004009b00011302': 'keyboard dictionary (English)',
+    '0004009b00011502': 'keyboard dictionary (French)',
+    '0004009b00011702': 'keyboard dictionary (German)',
+    '0004009b00011802': 'keyboard dictionary (Italian)',
+    '0004009b00011b02': 'keyboard dictionary (Portuguese)',
+    '0004009b00011c02': 'keyboard dictionary (Russian)',
+    '0004009b00011d02': 'keyboard dictionary (Spanish)',
+    '0004009b00012102': 'system data tables',
+    '0004009b00013102': 'system messages',
+    '0004009b00015102': 'system data (LZ tables)',
+    '000400db00010502': 'Nintendo Zone hotspot list',
+    '000400db00016102': 'system version (NVer)',
+    '000400db00017102': 'system version and parental key (CVer)',
+    '0004001b00010002': 'SSL client certificate (ClCertA)',
+    '0004001b00010702': 'title blacklists (NS CFA)',
+    '0004001b00010802': 'dummy data',
+    '0004001b00018002': 'offline help pages',
+    '0004001b00018102': 'offline browser pages',
+    '0004001b00018202': 'web browser engine and fonts',
+    '0004001b00019002': 'Fangate updater',
+  };
+
+  // Applets (0004003x) and system modules / firmware (00040130, 00040138), by low title ID without the region digit
+  // where it varies; names from their internal (exheader) names. Apps and applets with an icon use its name instead.
+  const APPLET_NAMES = {
+    0x8202: 'HOME Menu', 0x8f02: 'HOME Menu', 0x9802: 'HOME Menu', 0xa102: 'HOME Menu', 0xa902: 'HOME Menu', 0xb102: 'HOME Menu',
+    0x8a02: 'error display', 0x8a03: 'error display (safe mode)', 0x9902: 'Camera applet',
+    0xc502: 'error / EULA applet', 0xc503: 'error / EULA applet (safe mode)', 0xcd02: 'Circle Pad Pro calibration',
+    0xd002: 'software keyboard', 0xd003: 'software keyboard (safe mode)', 0xd102: 'Mii selector',
+    0xd302: 'photo selector', 0xd402: 'sound selector', 0xd602: 'eShop applet', 0xf602: 'notes library applet',
+  };
+  const MODULE_NAMES = {
+    am: 'title manager', camera: 'camera', cfg: 'system config', codec: 'audio/touch codec', dsp: 'sound processor',
+    gpio: 'GPIO', gsp: 'graphics', hid: 'input', i2c: 'I2C bus', mcu: 'power and battery controller', mic: 'microphone',
+    pdn: 'power domains', ptm: 'power and time', spi: 'SPI bus', ac: 'network connection', cecd: 'StreetPass',
+    csnd: 'sound', dlp: 'Download Play', http: 'HTTP', mp: 'local wireless (DS)', ndm: 'network daemons', nim: 'eShop and updates',
+    nwm: 'wireless', socket: 'sockets', ssl: 'SSL', ps: 'crypto (PS)', friends: 'friends', ir: 'infrared', boss: 'SpotPass',
+    news: 'notifications', ro: 'code modules', act: 'Nintendo Network ID', nfc: 'NFC (amiibo)', ns: 'title launcher',
+    f_native: '3DS firmware (NATIVE_FIRM)', f_twl: 'DS mode firmware (TWL_FIRM)', f_agb: 'GBA mode firmware (AGB_FIRM)',
+  };
+
+  // What a system title is: { name, kind, used } (kind: app, applet, data, module, firmware, ds; used: whether Pica3DS
+  // uses it). iconName / exName: the title's own names, when known.
+  EMU.describeSystemTitle = function (titleId, iconName, exName) {
+    const id = titleId.toLowerCase(), hi = id.slice(0, 8), low = parseInt(id.slice(8), 16);
+    if (hi === '00040138') {
+      const name = MODULE_NAMES[exName] || exName || 'firmware';
+      return { name: (id.endsWith('03') && exName === 'f_native' ? 'safe mode firmware (SAFE_MODE_FIRM)' : name), kind: 'firmware', used: false };
+    }
+    if (hi === '00040130') {
+      const name = `system module: ${MODULE_NAMES[exName] || exName || id.slice(8)}${id.endsWith('03') ? ' (safe mode)' : ''}`;
+      return { name, kind: 'module', used: false };
+    }
+    if (/^00048/.test(hi)) return { name: `DS mode title ${String.fromCharCode(...[0, 8, 16, 24].map((s) => (low >>> (24 - s)) & 0xFF))}`, kind: 'ds', used: false };
+    const own = iconName && /[A-Za-z]{2}/.test(iconName) && iconName.trim() !== exName ? iconName.trim() : null; // not '???' or blank
+    if (hi === '00040030') return { name: (own && own !== 'MINT' ? own : null) || APPLET_NAMES[low & 0xFFFF] || exName || 'applet', kind: 'applet', used: true };
+    if (hi === '00040010') return { name: own || (exName ? `system app (${exName})` : 'system app'), kind: 'app', used: true };
+    return { name: EMU.SYSTEM_ARCHIVE_NAMES[id] || 'system data', kind: 'data', used: true };
   };
 
   // A system data archive (e.g. Mii data, shared font): the decrypted .app content of a data-only title.
   EMU.parseSystemArchive = function (bytes) {
-    if (isCia(bytes)) { const c = ciaLayout(bytes); if (!c.need) bytes = bytes.subarray(c.offset, c.offset + c.size); }
+    if (isCia(bytes)) {
+      const c = ciaLayout(bytes);
+      if (!c.need) {
+        bytes = bytes.subarray(c.offset, c.offset + c.size);
+        // DS-mode (DSi) titles hold a DS program, not an NCCH: recognised, not used
+        if (/^00048/.test(c.titleId) && String.fromCharCode(...bytes.subarray(0x100, 0x104)) !== 'NCCH') {
+          const about = EMU.describeSystemTitle(c.titleId), title = String.fromCharCode(...bytes.subarray(0, 12)).replace(/[^ -~]/g, '').trim();
+          if (title) about.name = `DS mode title: ${title}`; // from the DS program header
+          return Object.assign({ titleId: c.titleId, romfs: null, exefs: {}, executable: true }, about);
+        }
+      }
+    }
     const ascii = (o, n) => String.fromCharCode(...bytes.subarray(o, o + n));
     if (bytes.length < 0x200 || ascii(0x100, 4) !== 'NCCH') throw new EMU.EmuError('Not a system data file (expected a decrypted .app containing an NCCH)');
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -332,7 +403,8 @@
     if (!(flags[7] & 4) && !plainRomfs && !(executable && plainExefs)) throw new EMU.EmuError(`System file ${titleId} is encrypted. Decrypt it on your 3DS first (GodMode9: "NCCH image options" -> "Decrypt file").`);
     const hasRomfs = romfsOff && romfsSize > 0x1000 && !(flags[7] & 2) && romfsOff + romfsSize <= bytes.length;
     if (!hasRomfs && !executable) throw new EMU.EmuError(`System file ${titleId} has no RomFS`);
-    return { titleId, romfs: hasRomfs ? bytes.slice(romfsOff + 0x1000, romfsOff + romfsSize) : null, exefs, executable, name: EMU.SYSTEM_ARCHIVE_NAMES[titleId] || null };
+    const about = EMU.describeSystemTitle(titleId, exefs.icon ? smdhTitle(exefs.icon) : null, executable ? ascii(0x200, 8).replace(/\0.*$/, '') : null);
+    return Object.assign({ titleId, romfs: hasRomfs ? bytes.slice(romfsOff + 0x1000, romfsOff + romfsSize) : null, exefs, executable }, about);
   };
 
   // Part of a large file read on demand (games too big to load whole): 1 MB chunks of a Blob fetched
