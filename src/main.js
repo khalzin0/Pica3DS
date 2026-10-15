@@ -325,6 +325,7 @@
     // The game's own saves from earlier sessions go back in before it runs its first frame
     const gen = emu.loadGeneration, key = emu.titleKey;
     paused = true;
+    loadShaderCache(key, gen);
     dbGet('saves', key).then((saves) => {
       if (emu.loadGeneration !== gen) return;
       if (saves) { emu.setSaves(saves); logLine('Restored this game\'s saves from the browser.'); }
@@ -362,9 +363,9 @@
   // ------------------------------------------------------------------ system files (kept in IndexedDB)
   function openDb() {
     return new Promise((resolve, reject) => {
-      const req = indexedDB.open('emu3ds', 2);
+      const req = indexedDB.open('emu3ds', 3);
       req.onupgradeneeded = () => {
-        for (const s of ['sysdata', 'saves', 'states']) if (!req.result.objectStoreNames.contains(s)) req.result.createObjectStore(s);
+        for (const s of ['sysdata', 'saves', 'states', 'shaders']) if (!req.result.objectStoreNames.contains(s)) req.result.createObjectStore(s);
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
@@ -402,6 +403,28 @@
   setInterval(() => { if (emu.savesDirty && performance.now() - savesTimer > 1500) { savesTimer = performance.now(); flushSaves(); } }, 500);
   window.addEventListener('pagehide', flushSaves);
   document.addEventListener('visibilitychange', () => { if (document.hidden) flushSaves(); });
+
+  // Shader cache: the GPU shaders each game uses are kept, and built in the background when it starts again
+  let shaderList = [], shaderKey = null, shaderSaved = 0;
+  function loadShaderCache(key, gen) {
+    shaderList = []; shaderKey = key; shaderSaved = 0;
+    const cur = emu.gpu && emu.gpu.gl;
+    if (cur) { cur.takeShaderPairs(); cur.knownPairs.clear(); } // what is recorded from now on is this game's
+    dbGet('shaders', key).then((list) => {
+      if (emu.loadGeneration !== gen || !Array.isArray(list)) return;
+      shaderList = list.concat(shaderList); shaderSaved = list.length;
+      const gl = emu.gpu && emu.gpu.gl;
+      if (gl && list.length) gl.warmShaders(list, (n) => logLine(`Shader cache: built ${n} shaders for this game ahead of time.`));
+    });
+  }
+  setInterval(() => {
+    const gl = emu.loaded && emu.gpu && emu.gpu.gl;
+    if (!gl || emu.titleKey !== shaderKey) return;
+    const fresh = gl.takeShaderPairs();
+    if (fresh.length) shaderList.push(...fresh);
+    if (shaderList.length > 4000) shaderList = shaderList.slice(-4000);
+    if (shaderList.length !== shaderSaved) { shaderSaved = shaderList.length; dbPut('shaders', shaderKey, shaderList.slice()); }
+  }, 8000);
 
   const SLOTS = 4;
   const stateKey = (slot) => `${emu.titleKey}#${slot}`;

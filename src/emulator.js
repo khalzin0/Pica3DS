@@ -101,6 +101,7 @@
 
       this.kernel.createThread(info.entry, 0, 0x10000000, info.priority || 0x30);
       this.loaded = true;
+      if (info.cryptoFlagUnset) this.log('This game is marked as encrypted in its header, but its contents are decrypted: loading it anyway.');
       this.title = info.title || null;
       this.titleKey = info.programId || name; // which game: saves and save states are kept per game
       const extras = [info.title && `"${info.title}"`, info.programId && `title ID ${info.programId}`, info.romfs && `RomFS ${(info.romfs.length / 1024).toFixed(0)} KB`].filter(Boolean).join(', ');

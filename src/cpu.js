@@ -40,16 +40,20 @@
       // The interpreter's own steps for one instruction; leave the block if it changed control flow
       const generic = () => `c.curPC = ${PC}; c.pc = ${(PC + 4) >>> 0}; r[15] = ${(PC + 8) >>> 0}; ` +
         `${cond === 15 ? `c.execArmUncond(${insn}, ${PC});` : `c.execArm(${insn}, ${PC});`}` +
-        ` if (c.pc !== ${(PC + 4) >>> 0} || c.t || c.stop) return ${n + 1};`;
+        ` if (c.pc !== ${(PC + 4) >>> 0} || c.t || c.stop) return done + ${n + 1};`;
       let body = null;
       const op3 = (insn >>> 25) & 7;
       if (cond === 15) body = generic();
       else if (op3 === 5) { // B / BL ends the block
         const target = (PC + 8 + ((insn << 8) >> 6)) >>> 0;
-        const taken = `${insn & 0x01000000 ? `r[14] = ${(PC + 4) >>> 0}; ` : ''}c.pc = ${target};`;
+        // A loop back to this block's start runs again right here while the budget lasts, instead of going back
+        // through the dispatcher (and re-checking the code) on every pass
+        const loop = target === start && !(insn & 0x01000000);
+        const taken = loop ? `done += ${n + 1}; if (done + ${n + 1} <= budget) continue; c.pc = ${target}; return done;`
+          : `${insn & 0x01000000 ? `r[14] = ${(PC + 4) >>> 0}; ` : ''}c.pc = ${target};`;
         code += `c.curPC = ${PC}; r[15] = ${(PC + 8) >>> 0};\n`;
         code += cond === 14 ? `${taken}\n` : `if (${COND_EXPR[cond]}) { ${taken} } else c.pc = ${(PC + 4) >>> 0};\n`;
-        code += `return ${n + 1};\n`;
+        code += `return done + ${n + 1};\n`;
         n++; ended = true;
         break;
       } else body = specialise(insn, PC, R) || generic();
@@ -57,8 +61,9 @@
       n++;
       pc = (pc + 4) >>> 0;
     }
-    if (!ended) code += `c.pc = ${pc}; c.curPC = ${(pc - 4) >>> 0}; r[15] = ${(pc + 4) >>> 0}; return ${n};\n`;
-    const src = `return function block(c, r, mem, P) {\nif (${checks}) return -1;\n${code}};`;
+    if (!ended) code += `c.pc = ${pc}; c.curPC = ${(pc - 4) >>> 0}; r[15] = ${(pc + 4) >>> 0}; return done + ${n};\n`;
+    // budget: instructions the caller allows; a block is only entered when one pass fits
+    const src = `return function block(c, r, mem, P, budget) {\nif (${checks}) return -1;\nlet done = 0;\nfor (;;) {\n${code}}\n};`;
     const fn = new Function(src)();
     return { fn, n, idx, start };
   }
@@ -72,17 +77,25 @@
     while (n < BLOCK_MAX && (pc >>> 12) === idx) {
       const insn = page[(pc & 0xFFF) >>> 1];
       checks += `${n ? ' || ' : ''}P[${(pc & 0xFFF) >>> 1}] !== ${insn}`;
+      // B / B<cond> back to the block's start: run the loop again here while the budget lasts (@N: block length)
+      const branch = (insn >>> 12) === 0xE ? (insn & 0x0800) === 0 : (insn >>> 12) === 0xD && ((insn >>> 8) & 0xF) < 0xE;
+      const exit = branch
+        ? `{ const d = done + ${n + 1}; if (c.pc === ${start} && c.t === 1 && !c.stop && d + @N <= budget) { done = d; continue; } return d; }`
+        : `return done + ${n + 1};`;
       code += `c.curPC = ${pc}; c.pc = ${(pc + 2) >>> 0}; r[15] = ${(pc + 4) >>> 0}; c.execThumb(${insn}, ${pc});` +
-        ` if (c.pc !== ${(pc + 2) >>> 0} || c.t === 0 || c.stop) return ${n + 1};
+        ` if (c.pc !== ${(pc + 2) >>> 0} || c.t === 0 || c.stop) ${exit}
 `;
       n++;
       pc = (pc + 2) >>> 0;
     }
-    code += `return ${n};
+    code += `return done + ${n};
 `;
-    const fn = new Function(`return function thumbBlock(c, r, mem, P) {
+    const fn = new Function(`return function thumbBlock(c, r, mem, P, budget) {
 if (${checks}) return -1;
-${code}};`)();
+let done = 0;
+for (;;) {
+${code.split('@N').join(String(n))}}
+};`)();
     return { fn, n, idx, start, thumb: true };
   }
 
@@ -305,7 +318,7 @@ ${code}};`)();
           }
           if (b !== null && b.n <= max - i) {
             const P = b.thumb ? mem.pages16[b.idx] : pages32[b.idx];
-            const k = P === null ? -1 : b.fn(this, r, mem, P);
+            const k = P === null ? -1 : b.fn(this, r, mem, P, max - i);
             if (k >= 0) { i += k; continue; }
             this.blockTab[slot] = null; // the code changed: compile again once it is hot
           }

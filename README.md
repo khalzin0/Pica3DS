@@ -30,7 +30,7 @@ Open `index.html?demo` to start the demo automatically.
 | Homebrew (libctru, citro2d/citro3d) | Commercial games: see [Games tested](#games-tested) | Audio effects (reverb, delay) and per-voice filters |
 | 3D graphics on your graphics card (vertex shaders, textures, lighting, fog, blending, depth/stencil) | Speed: most tested scenes run at full speed; video and some busy scenes are slower | Procedural textures, gas rendering |
 | | Geometry shaders: point mode (the mode citro3d uses); variable- and fixed-size primitive modes are not emulated yet | |
-| Save data and extra data (kept in memory) | System applets: the Mii selector picks a stand-in Mii; the keyboard and error display close straight away | Networking, camera, the stereoscopic 3D effect |
+| Save data and extra data (kept in the browser), save states | System applets: the Mii selector picks a stand-in Mii; the keyboard and error display close straight away | Networking, camera, the stereoscopic 3D effect |
 | Sound: 24 DSP voices, PCM8/PCM16/DSP-ADPCM, mixing and volume | Microphone (records silence), video (`y2r` colour conversion) | |
 | System files from your own console, or built-in stand-ins | Code modules loaded at run time (`ldr:ro` / CRO) | `.cia` files and encrypted games |
 
@@ -57,6 +57,7 @@ Tested with dumps of games we own, decrypted on our own console, using the defau
 |---|---|---|
 | *New Super Mario Bros. 2* (EUR) | Playable | Intro, menus, world map and levels. World 1-1 runs at 60 FPS. Sound works |
 | *Cut the Rope: Triple Treat* (EUR) | Playable | Intro video, menus and levels. Video intros and some menus run below full speed on slower PCs |
+| *Mario Kart 7* (EUR) | Boots | Title screen and menus (Grand Prix, Time Trials, battles) with 3D graphics; races not tested yet |
 | *Super Mario 3D Land* | Boots | Reaches its menus; selecting a Mii uses a built-in stand-in Mii |
 | *Pokémon Ultra Moon* (USA) | In progress | A 4 GB cartridge: loads, starts up (80 MB memory mode) and loads its code modules (`ldr:ro`); getting in-game is not confirmed yet |
 | Bundled demo and libctru examples | Works | Graphics, input, threads, RomFS |

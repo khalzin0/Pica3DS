@@ -1667,7 +1667,26 @@
     }
   }
 
-  class StubService extends Service {}
+  // Commands of otherwise stubbed services that hand out an event to wait on: the game gets a real event (never
+  // signalled) instead of handle 0, which it would fail to wait on
+  const STUB_EVENTS = {
+    'cecd:u': [0x0F, 0x10], 'cecd:s': [0x0F, 0x10], // GetCecInfoEventHandle, GetChangeStateEventHandle
+    'ir:USER': [0x0C, 0x0D, 0x0E],                // GetReceiveEvent, GetSendEvent, GetConnectionStatusEvent
+  };
+
+  class StubService extends Service {
+    handle(ipc, id) {
+      const evs = STUB_EVENTS[this.name];
+      if (evs && evs.includes(id)) {
+        const map = this.events || (this.events = new Map());
+        if (!map.has(id)) map.set(id, new EMU.KEvent(0, `${this.name} event ${hex(id, 4)}`));
+        ipc.reply(id, [0], [0, this.kernel.createHandle(map.get(id))]);
+        return true;
+      }
+      if (this.name.startsWith('cecd:') && id === 0x0E) { ipc.reply(id, [0, 1]); return true; } // GetCecStateAbbreviated: idle
+      return false;
+    }
+  }
 
   // ------------------------------------------------------------------ registry
   class Services {

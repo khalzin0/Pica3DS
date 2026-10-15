@@ -109,6 +109,22 @@
   }
   EMU.blzDecompress = blzDecompress;
 
+  // True when an NCCH's ExeFS header and extended header read as plain data (encrypted ones look random)
+  function looksDecrypted(bytes, exefs) {
+    if (!exefs || exefs + 0x200 > bytes.length) return false;
+    let names = 0;
+    for (let i = 0; i < 10; i++) {
+      const e = exefs + i * 16;
+      if (bytes[e] === 0) continue;
+      for (let j = 0; j < 8; j++) { const ch = bytes[e + j]; if (ch !== 0 && (ch < 0x20 || ch > 0x7E)) return false; }
+      names++;
+    }
+    if (!names) return false;
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const textAddr = dv.getUint32(0x210, true), stack = dv.getUint32(0x21C, true);
+    return textAddr >= 0x100000 && textAddr < 0x10000000 && (textAddr & 0xFFF) === 0 && stack < 0x4000000;
+  }
+
   // NCCH (CXI) executable partition, as found inside .3ds/.cci images or as a bare .cxi.
   function loadNcch(mem, bytes, mediaUnit = 0x200) {
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -117,10 +133,14 @@
     if (ascii(0x100, 4) !== 'NCCH') throw new EMU.EmuError('Bad NCCH header');
     const flags = bytes.subarray(0x188, 0x190);
     if (!(flags[5] & 2)) throw new EMU.EmuError('This NCCH partition has no executable code (it is a data-only archive).');
-    if (!(flags[7] & 4)) {
+    if (u32(0x180) < 0x400) throw new EMU.EmuError('NCCH has no extended header');
+    // Decrypted or not is judged by the contents: some decryption tools leave the "no crypto" flag unset. Plain
+    // contents have readable ExeFS file names (".code", "icon", ...) and a sane code layout in the extended header.
+    const plain = looksDecrypted(bytes, u32(0x1A0) * mediaUnit);
+    if (!plain) {
       throw new EMU.EmuError('This .3ds/.cxi is encrypted. Only decrypted images are supported. Decrypt your own dump on your 3DS first (e.g. GodMode9: "Decrypt file").');
     }
-    if (u32(0x180) < 0x400) throw new EMU.EmuError('NCCH has no extended header');
+    const flagMismatch = !(flags[7] & 4);
 
     // Extended header: code set layout, stack size, main thread priority.
     const ex = 0x200;
@@ -174,6 +194,7 @@
       stackSize, priority: priority || 0x30,
       title: files.icon ? smdhTitle(files.icon) : null,
       programId: dv.getBigUint64(0x118, true).toString(16).padStart(16, '0'),
+      cryptoFlagUnset: flagMismatch,
     };
   }
 
@@ -230,8 +251,10 @@
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const flags = bytes.subarray(0x188, 0x190);
     const titleId = dv.getBigUint64(0x108, true).toString(16).padStart(16, '0');
-    if (!(flags[7] & 4)) throw new EMU.EmuError(`System file ${titleId} is encrypted. Decrypt it on your 3DS first (GodMode9: "NCCH image options" -> "Decrypt file").`);
     const romfsOff = dv.getUint32(0x1B0, true) * 0x200, romfsSize = dv.getUint32(0x1B4, true) * 0x200;
+    // Judged by the contents (a plain RomFS starts with "IVFC"), as some tools leave the "no crypto" flag unset
+    const plainRomfs = romfsOff && romfsOff + 4 <= bytes.length && ascii(romfsOff, 4) === 'IVFC';
+    if (!(flags[7] & 4) && !plainRomfs) throw new EMU.EmuError(`System file ${titleId} is encrypted. Decrypt it on your 3DS first (GodMode9: "NCCH image options" -> "Decrypt file").`);
     if (!romfsOff || romfsSize <= 0x1000 || (flags[7] & 2) || romfsOff + romfsSize > bytes.length) throw new EMU.EmuError(`System file ${titleId} has no RomFS`);
     return { titleId, romfs: bytes.slice(romfsOff + 0x1000, romfsOff + romfsSize), executable: !!(flags[5] & 2), name: EMU.SYSTEM_ARCHIVE_NAMES[titleId] || null };
   };

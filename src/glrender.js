@@ -410,6 +410,17 @@ void main() {
       this.hwVertices = true; // shade vertices on the host GPU when possible (false: on the CPU)
       this.warned = new Set();
       this.scratch = new Uint8Array(0);
+      // Shader cache: compiled shaders by source and linked programs by shader pair, so a shader is only ever built
+      // once. The pairs a game uses are recorded (takeShaderPairs) and kept per game, then built again in the
+      // background when the game next starts (warmShaders), before it needs them: no stutter the first time an effect
+      // appears. With KHR_parallel_shader_compile the driver builds them on its own threads.
+      this.parallelCompile = !!gl.getExtension('KHR_parallel_shader_compile');
+      this.shaderBySrc = new Map();   // source -> { shader, id, src, checked }
+      this.shaderInfo = new WeakMap(); // WebGLShader -> that entry
+      this.programByPair = new Map(); // "vsId|fsId" -> { prog, checked }
+      this.shaderIds = 1;
+      this.newPairs = [];             // [vertex source, fragment source] linked for the first time
+      this.knownPairs = new Set();    // "vsId|fsId" already recorded or warmed
 
       this.vbo = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
@@ -511,20 +522,78 @@ void main() {
       return loc;
     }
 
+    // Start building a shader without waiting for the result (see compile)
+    startShader(type, src) {
+      let e = this.shaderBySrc.get(src);
+      if (e) return e;
+      const gl = this.gl, sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      e = { shader: sh, id: this.shaderIds++, src, type, checked: false };
+      this.shaderBySrc.set(src, e);
+      this.shaderInfo.set(sh, e);
+      return e;
+    }
+
     compile(type, src) {
-      const gl = this.gl, s = gl.createShader(type);
-      gl.shaderSource(s, src);
-      gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(`GL shader: ${gl.getShaderInfoLog(s)}\n${src}`);
-      return s;
+      const e = this.startShader(type, src);
+      if (!e.checked) {
+        const gl = this.gl;
+        if (!gl.getShaderParameter(e.shader, gl.COMPILE_STATUS)) {
+          this.shaderBySrc.delete(src);
+          throw new Error(`GL shader: ${gl.getShaderInfoLog(e.shader)}\n${src}`);
+        }
+        e.checked = true;
+      }
+      return e.shader;
+    }
+
+    startLink(vs, fs) {
+      const a = this.shaderInfo.get(vs), b = this.shaderInfo.get(fs), key = `${a.id}|${b.id}`;
+      let e = this.programByPair.get(key);
+      if (!e) {
+        const gl = this.gl, p = gl.createProgram();
+        gl.attachShader(p, vs); gl.attachShader(p, fs);
+        gl.linkProgram(p);
+        e = { prog: p, checked: false, key };
+        this.programByPair.set(key, e);
+      }
+      return e;
     }
 
     link(vs, fs) {
-      const gl = this.gl, p = gl.createProgram();
-      gl.attachShader(p, vs); gl.attachShader(p, fs);
-      gl.linkProgram(p);
-      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(`GL link: ${gl.getProgramInfoLog(p)}`);
-      return p;
+      const e = this.startLink(vs, fs);
+      if (!e.checked) {
+        const gl = this.gl;
+        if (!gl.getProgramParameter(e.prog, gl.LINK_STATUS)) {
+          this.programByPair.delete(e.key);
+          throw new Error(`GL link: ${gl.getProgramInfoLog(e.prog)}`);
+        }
+        e.checked = true;
+      }
+      return e.prog;
+    }
+
+    // Shader pairs linked since the last call, to keep for this game: [[vertex source, fragment source], ...]
+    takeShaderPairs() { const out = this.newPairs; this.newPairs = []; return out; }
+
+    // Build a game's recorded shaders ahead of time, a few per call so the page stays responsive. Results are only
+    // checked when a draw first uses them (by then the driver has usually finished them on its own threads).
+    warmShaders(pairs, done) {
+      const gl = this.gl;
+      let i = 0;
+      const step = () => {
+        const end = Math.min(pairs.length, i + (this.parallelCompile ? 40 : 6));
+        for (; i < end; i++) {
+          const [vsSrc, fsSrc] = pairs[i];
+          try {
+            const v = this.startShader(gl.VERTEX_SHADER, vsSrc), f = this.startShader(gl.FRAGMENT_SHADER, fsSrc);
+            this.knownPairs.add(this.startLink(v.shader, f.shader).key);
+          } catch (e) { /* context lost: give up quietly */ return; }
+        }
+        if (i < pairs.length) setTimeout(step, 0); else if (done) done(pairs.length);
+      };
+      step();
     }
 
     floatTexture(w, h) {
@@ -968,7 +1037,7 @@ void main() {
       let f = this.fragShaders.get(key);
       if (!f) {
         f = { key, shader: this.compile(this.gl.FRAGMENT_SHADER, genFragment(st)) };
-        if (this.fragShaders.size > 400) this.fragShaders.clear();
+        if (this.fragShaders.size > 2000) this.fragShaders.delete(this.fragShaders.keys().next().value);
         this.fragShaders.set(key, f);
       }
       st.glFrag = f;
@@ -982,6 +1051,11 @@ void main() {
       if (!p) {
         const gl = this.gl;
         const prog = this.link(vert.shader, frag.shader);
+        const pairKey = `${this.shaderInfo.get(vert.shader).id}|${this.shaderInfo.get(frag.shader).id}`;
+        if (!this.knownPairs.has(pairKey)) {
+          this.knownPairs.add(pairKey);
+          this.newPairs.push([this.shaderInfo.get(vert.shader).src, this.shaderInfo.get(frag.shader).src]);
+        }
         const loc = (n) => gl.getUniformLocation(prog, n);
         p = { prog, u: {} };
         for (const n of ['uSize', 'uTex0', 'uTex1', 'uTex2', 'uLut', 'uFogLut', 'uBorder', 'uK', 'uBufInit', 'uAlphaRef', 'uFogColor',
@@ -989,7 +1063,7 @@ void main() {
         gl.useProgram(prog);
         gl.uniform1i(p.u.uTex0, 0); gl.uniform1i(p.u.uTex1, 1); gl.uniform1i(p.u.uTex2, 2);
         gl.uniform1i(p.u.uLut, 3); gl.uniform1i(p.u.uFogLut, 4);
-        if (this.programs.size > 400) this.programs.clear();
+        if (this.programs.size > 2000) this.programs.delete(this.programs.keys().next().value); // oldest
         this.programs.set(key, p);
       }
       return p;
