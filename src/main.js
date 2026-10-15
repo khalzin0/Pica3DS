@@ -7,7 +7,7 @@
   const $ = (id) => document.getElementById(id);
 
   const topCanvas = $('top'), bottomCanvas = $('bottom');
-  const topCtx = topCanvas.getContext('2d'), bottomCtx = bottomCanvas.getContext('2d');
+  const topCtx = topCanvas.getContext('2d', { alpha: false }), bottomCtx = bottomCanvas.getContext('2d', { alpha: false });
   const topImg = topCtx.createImageData(400, 240), bottomImg = bottomCtx.createImageData(320, 240);
   const logEl = $('log');
 
@@ -217,11 +217,13 @@
       setStatus('halted', crashed ? 'Stopped' : 'Finished');
       $('pause').disabled = true;
       audio.clear();
+      updateWakeLock();
     },
   });
   emu.onAudio = (L, R) => audio.push(L, R);
 
   // ------------------------------------------------------------------ UI state
+  let fitQueued = false; // a screen fit is waiting for the next animation frame
   let romBytes = null, romName = '', romFs = null; // romFs: RomFS read on demand for large games
   let paused = false;
   let layout = store.get('layout', 'stacked'); // stacked, side, top-only
@@ -253,6 +255,21 @@
     setStatus(paused ? 'paused' : 'running', paused ? 'Paused' : 'Running');
     lastTime = performance.now(); acc = 0;
     if (paused) audio.clear();
+    updateWakeLock();
+  }
+
+  // Keep the screen on while a game runs (phones dim and lock otherwise)
+  let wakeLock = null, wakeBusy = false;
+  async function updateWakeLock() {
+    if (!navigator.wakeLock || wakeBusy) return;
+    const want = emu.loaded && !emu.halted && !paused && document.visibilityState === 'visible';
+    if (want === !!wakeLock) return;
+    wakeBusy = true;
+    try {
+      if (want) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); }
+      else { const w = wakeLock; wakeLock = null; await w.release(); }
+    } catch (e) { wakeLock = null; } // refused (battery saver, no permission): not important
+    wakeBusy = false;
   }
 
   // Renderer: the host graphics card through WebGL 2 (default when available) or the software rasterizer
@@ -315,6 +332,7 @@
     start(bytes, 'demo.3dsx');
   }
 
+  if (/iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) $('file').removeAttribute('accept');
   $('file').addEventListener('change', (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); e.target.value = ''; });
   $('ov-demo').addEventListener('click', runDemo);
   $('reset').addEventListener('click', () => { audio.unlock(); if (romBytes) start(romBytes, romName, romFs); });
@@ -402,15 +420,21 @@
   for (const t of TABS) $('tab-' + t).addEventListener('click', () => selectTab(t));
   selectTab(TABS.includes(store.get('tab', 'perf')) ? store.get('tab', 'perf') : 'perf');
 
+  // On narrow screens the panel is a sheet over the screens: it starts closed and its state is not remembered
+  const narrow = matchMedia('(max-width: 960px)');
+  const panelOpen = () => !$('app').classList.contains('panel-hidden');
   function showPanel(show) {
     $('app').classList.toggle('panel-hidden', !show);
     $('panel-toggle').classList.toggle('active', show);
     $('panel-toggle').setAttribute('aria-pressed', String(show));
-    store.set('panel', show ? '1' : '0');
+    if (!narrow.matches) store.set('panel', show ? '1' : '0');
+    if (show) requestAnimationFrame(() => { if (!$('pane-perf').hidden) drawGraph(); });
     fitScreens();
   }
-  $('panel-toggle').addEventListener('click', () => showPanel($('app').classList.contains('panel-hidden')));
-  showPanel(store.get('panel', '1') !== '0');
+  $('panel-toggle').addEventListener('click', () => showPanel(!panelOpen()));
+  $('panel-close').addEventListener('click', () => showPanel(false));
+  $('scrim').addEventListener('click', () => showPanel(false));
+  showPanel(!narrow.matches && store.get('panel', '1') !== '0');
 
   $('clear-log').addEventListener('click', () => { logEl.textContent = ''; });
   $('copy-log').addEventListener('click', () => {
@@ -447,6 +471,9 @@
     $('gpu-name').textContent = 'WebGL 2 unavailable';
     $('gpu-accel').innerHTML = '<i></i>Not accelerated'; $('gpu-accel').className = 'pill halted';
   }
+  let pauseHidden = store.get('pause-hidden', '1') !== '0';
+  $('pause-hidden').checked = pauseHidden;
+  $('pause-hidden').addEventListener('change', () => { pauseHidden = $('pause-hidden').checked; store.set('pause-hidden', pauseHidden ? '1' : '0'); });
   $('jit').checked = useJit;
   $('jit').addEventListener('change', () => { useJit = $('jit').checked; store.set('jit', useJit ? '1' : '0'); applyJit(); });
 
@@ -484,15 +511,22 @@
   });
 
   // Scale both screens together: a fixed factor, or as large as fits the stage
+  function queueFit() { if (!fitQueued) { fitQueued = true; requestAnimationFrame(fitScreens); } }
   function fitScreens() {
+    fitQueued = false;
     const choice = $('scale').value;
     let s;
     if (choice === 'auto') {
-      // Fixed space around the pixels: stage padding (24 each side), device padding (16), screen bezels (8),
-      // and the gaps and hinge between the screens (12 + 6 + 12); none of the outer ones in fullscreen
-      const stage = $('stage'), full = document.fullscreenElement === stage;
-      const outer = full ? 0 : 48 + 32, two = 16 * 2 + 30, one = 16;
-      const availW = stage.clientWidth - outer, availH = stage.clientHeight - outer;
+      // Space around the pixels: stage and device padding, screen bezels, and the gaps and hinge between the
+      // screens (all smaller on phones, none of the outer ones in fullscreen); below them, the on-screen controls
+      const stage = $('stage'), dev = $('device'), vpad = $('vpad');
+      const cs = (el) => getComputedStyle(el), sum = (st, a, b) => (parseFloat(st[a]) || 0) + (parseFloat(st[b]) || 0);
+      const ss = cs(stage), ds = cs(dev), sc = cs(dev.querySelector('.screen')), hinge = dev.querySelector('.hinge');
+      const availW = stage.clientWidth - sum(ss, 'paddingLeft', 'paddingRight') - sum(ds, 'paddingLeft', 'paddingRight') - sum(ds, 'borderLeftWidth', 'borderRightWidth');
+      let availH = stage.clientHeight - sum(ss, 'paddingTop', 'paddingBottom') - sum(ds, 'paddingTop', 'paddingBottom') - sum(ds, 'borderTopWidth', 'borderBottomWidth');
+      if (vpad.offsetHeight && cs(vpad).position !== 'absolute') availH -= vpad.offsetHeight + (parseFloat(ss.rowGap) || 0);
+      const one = sum(sc, 'paddingLeft', 'paddingRight'), gap = parseFloat(ds.rowGap) || 0;
+      const two = one * 2 + gap * 2 + (layout === 'side' ? hinge.offsetWidth : hinge.offsetHeight);
       const [w, fw, h, fh] = layout === 'side' ? [720, two, 240, one] : layout === 'stacked' ? [400, one, 480, two] : [400, one, 240, one];
       s = Math.max(0.5, Math.min((availW - fw) / w, (availH - fh) / h));
       if (!$('smooth').checked && s > 1) s = Math.floor(s * 4) / 4; // quarter steps keep pixels even-ish
@@ -510,15 +544,24 @@
   $('show-hud').checked = store.get('hud', '0') === '1';
   $('show-hud').addEventListener('change', () => { store.set('hud', $('show-hud').checked ? '1' : '0'); $('hud').hidden = !$('show-hud').checked; });
   $('hud').hidden = !$('show-hud').checked;
-  window.addEventListener('resize', fitScreens);
-  new ResizeObserver(fitScreens).observe($('stage'));
+  window.addEventListener('resize', queueFit);
+  new ResizeObserver(queueFit).observe($('stage'));
 
+  // Fullscreen: the browser's fullscreen mode where there is one; iPhones have none for pages, so there the
+  // top bar is hidden instead (adding the page to the home screen hides the browser's own bars too)
+  const fullElement = () => document.fullscreenElement || document.webkitFullscreenElement;
+  function setPseudoFull(on) { document.body.classList.toggle('pseudo-full', on); queueFit(); }
   function toggleFullscreen() {
-    if (document.fullscreenElement) document.exitFullscreen();
-    else $('stage').requestFullscreen().catch((e) => toast(`Fullscreen is not available: ${e.message}`, true));
+    if (document.body.classList.contains('pseudo-full')) { setPseudoFull(false); return; }
+    if (fullElement()) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); return; }
+    const stage = $('stage'), req = stage.requestFullscreen || stage.webkitRequestFullscreen;
+    if (!req || !(document.fullscreenEnabled || document.webkitFullscreenEnabled)) { setPseudoFull(true); return; }
+    const p = req.call(stage, { navigationUI: 'hide' });
+    if (p && p.catch) p.catch(() => setPseudoFull(true));
   }
   $('fullscreen').addEventListener('click', toggleFullscreen);
-  document.addEventListener('fullscreenchange', fitScreens);
+  document.addEventListener('fullscreenchange', queueFit);
+  document.addEventListener('webkitfullscreenchange', queueFit);
   applyLayout();
 
   // drag & drop
@@ -601,10 +644,130 @@
     else if (e.code === 'KeyM') toggleMute();
   });
   window.addEventListener('keyup', (e) => { const b = codeToButton.get(e.code); if (b) held.delete(b); });
-  window.addEventListener('blur', () => held.clear());
-  // Browsers only start sound after a user gesture
+  window.addEventListener('blur', () => { held.clear(); vpRelease(); });
+  // Browsers only start sound after a user gesture (iOS: only some events count, touchend among them)
   window.addEventListener('pointerdown', () => audio.unlock(), { capture: true });
+  window.addEventListener('touchend', () => audio.unlock(), { capture: true });
   window.addEventListener('keydown', () => audio.unlock(), { capture: true });
+
+  // In the background: pause (saves battery, and phones throttle background pages anyway), silence the sound,
+  // and let go of everything held; carry on when the page is visible again
+  let autoPaused = false;
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      if (pauseHidden && emu.loaded && !emu.halted && !paused) { setPaused(true); autoPaused = true; }
+      if (audio.ctx && audio.ctx.state === 'running') audio.ctx.suspend();
+      held.clear(); vpRelease();
+    } else {
+      if (audio.ctx && audio.ctx.state === 'suspended' && audio.enabled) audio.ctx.resume();
+      if (autoPaused) { autoPaused = false; setPaused(false); }
+    }
+    updateWakeLock();
+  });
+
+  // ------------------------------------------------------------------ on-screen controls
+  // Every finger is tracked on its own. A finger that lands on a button can slide onto the next one (A to B
+  // and so on); one that lands on the Circle Pad or D-Pad keeps steering it until it lifts.
+  const vpad = $('vpad'), vpStick = $('vp-stick'), vpKnob = vpStick.firstElementChild, vpDpad = $('vp-dpad');
+  const vpButtons = [...vpad.querySelectorAll('[data-b], [data-k]')];
+  const fingers = new Map(); // pointer id -> { kind: 'stick' | 'dpad' | 'btn' | 'act' | 'none', ... }
+  const vp = { keys: 0, x: 0, y: 0 };
+  let vpMode = store.get('vpad', 'auto');            // auto, on, off
+  let vpLeft = store.get('vpad-left', 'stick');      // stick or dpad
+  let vpVibrate = store.get('vpad-vibrate', '0') === '1';
+  const coarse = matchMedia('(pointer: coarse)');
+
+  function vpHit(x, y) {
+    const el = document.elementFromPoint(x, y);
+    return el && vpad.contains(el) ? el.closest('[data-b], [data-act], .vp-stick, .vp-dpad') : null;
+  }
+  function vpFinger(e, f) {
+    if (f && (f.kind === 'stick' || f.kind === 'dpad')) {
+      const dx = e.clientX - f.cx, dy = e.clientY - f.cy;
+      if (f.kind === 'stick') {
+        const len = Math.hypot(dx, dy) / f.r, k = len > 1 ? 1 / len : 1;
+        f.x = dx / f.r * k; f.y = dy / f.r * k;
+        if (len < 0.12) f.x = f.y = 0; // dead zone
+      } else {
+        f.bits = 0;
+        if (Math.hypot(dx, dy) > f.r * 0.2) { // eight directions
+          const oct = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) & 7;
+          if (oct === 7 || oct === 0 || oct === 1) f.bits |= K.DRIGHT;
+          if (oct >= 1 && oct <= 3) f.bits |= K.DDOWN;
+          if (oct >= 3 && oct <= 5) f.bits |= K.DLEFT;
+          if (oct >= 5) f.bits |= K.DUP;
+        }
+      }
+      return f;
+    }
+    const el = vpHit(e.clientX, e.clientY);
+    if (f && f.kind === 'act') return f; // runs when the finger lifts
+    if (!f && el && el.dataset.act) return { kind: 'act', act: el.dataset.act };
+    if (!f && el && (el === vpStick || el === vpDpad)) {
+      const r = el.getBoundingClientRect();
+      return vpFinger(e, { kind: el === vpStick ? 'stick' : 'dpad', cx: r.left + r.width / 2, cy: r.top + r.height / 2, r: r.width / 2 * 0.8, x: 0, y: 0, bits: 0 });
+    }
+    return { kind: el && el.dataset.b ? 'btn' : 'none', bits: el && el.dataset.b ? K[el.dataset.b] : 0 };
+  }
+  function vpUpdate() {
+    let keys = 0, x = 0, y = 0, stick = false;
+    for (const f of fingers.values()) {
+      keys |= f.bits || 0;
+      if (f.kind === 'stick') { x += f.x; y += f.y; stick = true; }
+    }
+    if (vpVibrate && (keys & ~vp.keys) && navigator.vibrate) navigator.vibrate(10);
+    vp.keys = keys; vp.x = Math.max(-1, Math.min(1, x)); vp.y = Math.max(-1, Math.min(1, -y));
+    for (const el of vpButtons) el.classList.toggle('on', !!(keys & K[el.dataset.b || el.dataset.k]));
+    vpStick.classList.toggle('on', stick);
+    vpKnob.style.transform = stick ? `translate(${x * 45}%, ${y * 45}%)` : '';
+  }
+  function vpRelease() { if (fingers.size || vp.keys || vp.x || vp.y) { fingers.clear(); vpUpdate(); } }
+  vpad.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    try { vpad.setPointerCapture(e.pointerId); } catch (err) { /* finger already gone */ }
+    fingers.set(e.pointerId, vpFinger(e, null));
+    vpUpdate();
+  });
+  vpad.addEventListener('pointermove', (e) => {
+    const f = fingers.get(e.pointerId);
+    if (!f) return;
+    fingers.set(e.pointerId, vpFinger(e, f));
+    vpUpdate();
+  });
+  const vpUp = (e) => {
+    const f = fingers.get(e.pointerId);
+    if (!f) return;
+    fingers.delete(e.pointerId);
+    vpUpdate();
+    // Fullscreen needs a gesture the browser counts as one, which for touch is lifting the finger
+    if (e.type === 'pointerup' && f.kind === 'act') {
+      const el = vpHit(e.clientX, e.clientY);
+      if (el && el.dataset.act === f.act) {
+        if (f.act === 'full') toggleFullscreen();
+        else if (f.act === 'swap') setVpLeft(vpLeft === 'stick' ? 'dpad' : 'stick');
+      }
+    }
+  };
+  vpad.addEventListener('pointerup', vpUp);
+  vpad.addEventListener('pointercancel', vpUp);
+  vpad.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  function applyVpad() {
+    const show = vpMode === 'on' || (vpMode === 'auto' && coarse.matches && !padName);
+    document.body.classList.toggle('touch', show);
+    vpStick.hidden = vpLeft !== 'stick';
+    vpDpad.hidden = vpLeft !== 'dpad';
+    for (const b of $('vpad-left').querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.v === vpLeft));
+    if (!show) vpRelease();
+    queueFit();
+  }
+  function setVpLeft(v) { vpLeft = v; store.set('vpad-left', v); vpRelease(); applyVpad(); }
+  $('vpad-mode').value = ['auto', 'on', 'off'].includes(vpMode) ? vpMode : 'auto';
+  $('vpad-mode').addEventListener('change', () => { vpMode = $('vpad-mode').value; store.set('vpad', vpMode); applyVpad(); });
+  $('vpad-left').addEventListener('click', (e) => { const v = e.target.dataset && e.target.dataset.v; if (v) setVpLeft(v); });
+  $('vpad-vibrate').checked = vpVibrate;
+  $('vpad-vibrate').addEventListener('change', () => { vpVibrate = $('vpad-vibrate').checked; store.set('vpad-vibrate', vpVibrate ? '1' : '0'); });
+  if (coarse.addEventListener) coarse.addEventListener('change', applyVpad);
 
   let touch = null;
   function touchFromEvent(e) {
@@ -637,13 +800,15 @@
       padName = name;
       $('pad-status').textContent = name ? `Connected: ${name}` : 'No gamepad detected. Connect one and press a button.';
       if (name) toast('Gamepad connected');
+      applyVpad(); // on-screen controls make way for a gamepad (in Auto)
     }
     return { keys, x, y };
   }
+  applyVpad();
 
   function updateInput() {
     const pad = readGamepad();
-    let cx = pad.x, cy = pad.y, keys = pad.keys;
+    let cx = pad.x + vp.x, cy = pad.y + vp.y, keys = pad.keys | vp.keys;
     for (const b of held) {
       if (STICK[b]) { cx += STICK[b][0]; cy += STICK[b][1]; } else keys |= K[b];
     }
@@ -697,6 +862,12 @@
     const avg = n ? ms.reduce((a, b) => a + b, 0) / n : 0, p95 = n ? ms[Math.min(n - 1, Math.floor(n * 0.95))] : 0;
     const fps = n * 1000 / dt, speed = Math.round(fps / 59.83 * 100);
     const running = emu.loaded && !emu.halted && !paused;
+    $('hud').textContent = running ? `${fps.toFixed(0)} FPS · ${speed}%` : paused ? 'Paused' : '';
+    if (panelOpen() && !$('pane-perf').hidden) showPerfPane(running, fps, speed, n, avg, p95, dt);
+    Object.assign(stat, { time: now, frames: 0, presents: 0, insns: 0, cpu: 0, gpu: 0, xfer: 0, present: 0, frameMs: [] });
+  }
+
+  function showPerfPane(running, fps, speed, n, avg, p95, dt) {
     $('fps').textContent = running ? fps.toFixed(0) : '–';
     $('host-fps').textContent = running ? (stat.presents * 1000 / dt).toFixed(0) : '–';
     $('speed').textContent = running ? speed + '%' : '–';
@@ -710,9 +881,7 @@
       $('bar-' + k).style.width = Math.min(100, parts[k] / 16.7 * 100) + '%';
       $('val-' + k).textContent = n ? parts[k].toFixed(1) + ' ms' : '–';
     }
-    $('hud').textContent = running ? `${fps.toFixed(0)} FPS · ${speed}%` : paused ? 'Paused' : '';
-    if (!$('pane-perf').hidden) drawGraph();
-    Object.assign(stat, { time: now, frames: 0, presents: 0, insns: 0, cpu: 0, gpu: 0, xfer: 0, present: 0, frameMs: [] });
+    drawGraph();
   }
 
   function loop(now) {

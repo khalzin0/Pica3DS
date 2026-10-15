@@ -21,6 +21,8 @@ Open [pica3ds.netlify.app](https://pica3ds.netlify.app/), or run it locally:
 
 Open `index.html?demo` to start the demo automatically.
 
+**On a phone or tablet:** on-screen controls appear automatically (Circle Pad or D-Pad, A/B/X/Y, L/R, ZL/ZR, Start/Select), in portrait or landscape. For the most screen space, use your browser's *Add to Home Screen*: it opens full screen without the browser's bars. Speed depends heavily on the phone; recent high-end phones do best.
+
 ## Status
 
 | Works | Partly works | Not yet |
@@ -45,7 +47,7 @@ Open `index.html?demo` to start the demo automatically.
 | Services (HLE) | `src/services.js` | `srv:`, `APT` (parameters, shared font, library applets), `gsp::Gpu`, `hid`, `fs` (RomFS, save data, extra data, SD card), `dsp` (with `src/audio.js`), `y2r:u` (YUV to RGB for video), `mic:u` (silence), `ldr:ro` (code modules), `cfg`, `ptm`, `err:f`. Other services are stubbed |
 | System data | `src/sysdata.js` | RomFS builder, plus stand-ins for missing system data (Mii data, system fonts, bad word list) and an empty archive for any other |
 | Loader | `src/loader.js` | `.3dsx`, ARM ELF, and decrypted `.3ds`/`.cci` (NCSD) and `.cxi` (NCCH), including compressed code and RomFS. Games over 256 MB (up to 4 GB cartridges) are not read whole: the code is loaded and game data is read from the file in 1 MB chunks as the game asks for it |
-| Front-end | `index.html`, `src/main.js` | Both screens (stacked, side by side or top only; fit to window or fixed size; fullscreen), sound with volume, rebindable keyboard controls, gamepad, performance graph, settings, system files manager, and a log |
+| Front-end | `index.html`, `src/main.js` | Both screens (stacked, side by side or top only; fit to window or fixed size; fullscreen), sound with volume, rebindable keyboard controls, on-screen touch controls for phones, gamepad, performance graph, settings, system files manager, and a log |
 
 ## Games tested
 

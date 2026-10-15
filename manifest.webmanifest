@@ -1,0 +1,13 @@
+{
+  "name": "Pica3DS",
+  "short_name": "Pica3DS",
+  "description": "A 3DS emulator that runs in your browser",
+  "start_url": "./",
+  "scope": "./",
+  "display": "fullscreen",
+  "display_override": ["fullscreen", "standalone"],
+  "orientation": "any",
+  "background_color": "#0d0f13",
+  "theme_color": "#161a21",
+  "icons": [{ "src": "assets/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

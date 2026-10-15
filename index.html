@@ -2,7 +2,13 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#161a21">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Pica3DS">
+<link rel="manifest" href="manifest.webmanifest">
 <title>Pica3DS</title>
 <link rel="icon" href="assets/icon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -34,13 +40,14 @@
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
+  html { touch-action: manipulation; -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+  body { display: flex; flex-direction: column; height: 100vh; height: 100dvh; overflow: hidden; }
   button, select, input { font: inherit; color: inherit; }
   svg { display: block; }
 
   /* ---------------------------------------------------------------- top bar */
-  .topbar { display: flex; align-items: center; gap: 14px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; position: relative; z-index: 2; }
+  .topbar { display: flex; align-items: center; gap: 14px; padding: max(10px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) 10px max(16px, env(safe-area-inset-left)); background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; position: relative; z-index: 2; }
   .brand { display: flex; align-items: center; gap: 10px; }
   .brand img { width: 30px; height: auto; filter: drop-shadow(0 0 8px rgba(255, 20, 60, .45)); }
   /* Wordmark: "Pica" in light grey, "3DS" in red, as in the logo */
@@ -79,11 +86,15 @@
   .app { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 360px; grid-template-rows: minmax(0, 1fr); min-height: 0; }
   .app.panel-hidden { grid-template-columns: minmax(0, 1fr) 0; }
   .app.panel-hidden .panel { display: none; }
+  .sheet-close, .scrim { display: none; }
   @media (max-width: 960px) {
-    body { height: auto; min-height: 100vh; overflow: auto; }
-    .app, .app.panel-hidden { grid-template-columns: 1fr; grid-template-rows: auto; }
-    .stage { height: 78vh; padding: 12px; }
-    .panel { border-left: 0; border-top: 1px solid var(--border); }
+    .app, .app.panel-hidden { grid-template-columns: minmax(0, 1fr); }
+    .stage { padding: 12px; }
+    /* The side panel slides up over the screens as a sheet */
+    .panel { position: fixed; left: 0; right: 0; bottom: 0; height: 72vh; height: 72dvh; z-index: 15; border-left: 0; border-top: 1px solid var(--border-2); border-radius: 16px 16px 0 0; box-shadow: var(--shadow); padding-bottom: env(safe-area-inset-bottom); }
+    .app:not(.panel-hidden) + .scrim { display: block; position: fixed; inset: 0; background: rgba(0, 0, 0, .5); z-index: 14; }
+    .tabs { overflow-x: auto; scrollbar-width: none; align-items: center; }
+    .sheet-close { display: inline-flex; margin-left: auto; flex: none; }
     .game-title { max-width: 50vw; }
   }
 
@@ -181,7 +192,67 @@
 
   .drop-hint { position: fixed; inset: 0; background: rgba(228, 0, 43, .1); border: 3px dashed var(--accent); display: none; align-items: center; justify-content: center; font-size: 22px; font-weight: 650; z-index: 30; pointer-events: none; }
   body.dragging .drop-hint { display: flex; }
-  @media (max-width: 600px) { .sep { display: none; } input[type=range] { width: 70px; } .topbar { gap: 10px; } }
+  @media (max-width: 600px) {
+    .sep, .volume input[type=range], .pill { display: none; }
+    .topbar { gap: 8px; flex-wrap: nowrap; padding-left: max(10px, env(safe-area-inset-left)); padding-right: max(10px, env(safe-area-inset-right)); padding-bottom: 8px; }
+    .toolbar { flex-wrap: nowrap; gap: 4px; }
+    .game-title { max-width: none; font-size: 13px; }
+  }
+  @media (max-width: 420px) { .brand .wordmark, .btn .lbl { display: none; } .toolbar label.btn.primary { width: 38px; padding: 0; } }
+  /* Bigger targets for fingers */
+  @media (pointer: coarse) {
+    .btn { height: 38px; } .btn.icon { width: 38px; } .btn.small { height: 34px; }
+    .seg button { padding: 8px 11px; } select { padding: 8px 10px; } .field { padding: 10px 0; } .tab { padding: 10px 12px; }
+    .keycap { height: 34px; }
+  }
+
+  /* ---------------------------------------------------------------- on-screen controls (touch screens) */
+  .vpad { display: none; --u: clamp(40px, 12.5vw, 60px); user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: none; z-index: 2; }
+  body.touch .stage { flex-direction: column; justify-content: space-between; align-items: center; gap: 8px; padding: 8px; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+  body.touch .overlay { touch-action: auto; user-select: auto; -webkit-user-select: auto; z-index: 3; }
+  body.touch .device { padding: 6px; gap: 6px; border-radius: 14px; }
+  body.touch .screen { padding: 0; border-radius: 3px; overflow: hidden; }
+  body.touch .hinge { display: none; }
+  body.touch .vpad { display: flex; justify-content: space-between; align-items: flex-end; width: 100%; max-width: 560px; flex: none; padding: 0 2px calc(4px + env(safe-area-inset-bottom)); }
+  .vp-side { display: flex; flex-direction: column; align-items: center; gap: calc(var(--u) * .22); }
+  .vp-row { display: flex; gap: 8px; width: 100%; justify-content: center; }
+  .vp-btn { display: grid; place-items: center; color: rgba(255, 255, 255, .9); background: rgba(40, 45, 58, .8); border: 1px solid rgba(255, 255, 255, .13); box-shadow: 0 2px 0 rgba(0, 0, 0, .35); font: 700 calc(var(--u) * .3)/1 system-ui, -apple-system, sans-serif; transition: transform .05s, background .05s; }
+  .vp-btn.on { background: var(--accent); border-color: var(--accent-2); color: #fff; transform: scale(.93); }
+  .vp-sh { flex: 1; min-width: calc(var(--u) * 1.15); height: calc(var(--u) * .62); border-radius: 10px; font-size: calc(var(--u) * .27); }
+  .vp-small { height: calc(var(--u) * .52); min-width: calc(var(--u) * .8); padding: 0 calc(var(--u) * .22); border-radius: 999px; font-size: calc(var(--u) * .23); font-weight: 650; }
+  .vp-small svg { width: calc(var(--u) * .3); height: calc(var(--u) * .3); }
+  .vp-face { position: relative; width: calc(var(--u) * 2.9); height: calc(var(--u) * 2.9); flex: none; }
+  .vp-face .vp-btn { position: absolute; width: var(--u); height: var(--u); border-radius: 50%; font-size: calc(var(--u) * .4); }
+  .vp-face [data-b=X] { top: 0; left: calc(50% - var(--u) / 2); }
+  .vp-face [data-b=B] { bottom: 0; left: calc(50% - var(--u) / 2); }
+  .vp-face [data-b=Y] { left: 0; top: calc(50% - var(--u) / 2); }
+  .vp-face [data-b=A] { right: 0; top: calc(50% - var(--u) / 2); }
+  .vp-stick { position: relative; flex: none; width: calc(var(--u) * 2.7); height: calc(var(--u) * 2.7); border-radius: 50%; display: grid; place-items: center; background: radial-gradient(circle, rgba(40, 45, 58, .5), rgba(22, 25, 32, .8)); border: 1px solid rgba(255, 255, 255, .1); }
+  .vp-stick i { width: calc(var(--u) * 1.2); height: calc(var(--u) * 1.2); border-radius: 50%; background: rgba(72, 78, 94, .96); border: 1px solid rgba(255, 255, 255, .2); box-shadow: 0 3px 8px rgba(0, 0, 0, .45); will-change: transform; }
+  .vp-stick.on i { background: #5d6479; }
+  .vp-dpad { position: relative; flex: none; width: calc(var(--u) * 2.7); height: calc(var(--u) * 2.7); }
+  .vp-dpad span { position: absolute; width: calc(var(--u) * .92); height: calc(var(--u) * .92); background: rgba(40, 45, 58, .8); border: 1px solid rgba(255, 255, 255, .13); }
+  .vp-dpad span::after { content: ""; position: absolute; inset: 0; margin: auto; width: 0; height: 0; border: calc(var(--u) * .13) solid transparent; }
+  .vp-dpad [data-k=DUP] { top: 0; left: calc(50% - var(--u) * .46); border-radius: 8px 8px 0 0; border-bottom: 0; }
+  .vp-dpad [data-k=DDOWN] { bottom: 0; left: calc(50% - var(--u) * .46); border-radius: 0 0 8px 8px; border-top: 0; }
+  .vp-dpad [data-k=DLEFT] { left: 0; top: calc(50% - var(--u) * .46); border-radius: 8px 0 0 8px; border-right: 0; }
+  .vp-dpad [data-k=DRIGHT] { right: 0; top: calc(50% - var(--u) * .46); border-radius: 0 8px 8px 0; border-left: 0; }
+  .vp-dpad [data-k=DUP]::after { border-bottom-color: rgba(255, 255, 255, .7); margin-top: calc(var(--u) * .14); }
+  .vp-dpad [data-k=DDOWN]::after { border-top-color: rgba(255, 255, 255, .7); margin-bottom: calc(var(--u) * .14); }
+  .vp-dpad [data-k=DLEFT]::after { border-right-color: rgba(255, 255, 255, .7); margin-left: calc(var(--u) * .14); }
+  .vp-dpad [data-k=DRIGHT]::after { border-left-color: rgba(255, 255, 255, .7); margin-right: calc(var(--u) * .14); }
+  .vp-dpad i { position: absolute; inset: calc(var(--u) * .9); background: rgba(40, 45, 58, .8); }
+  .vp-dpad span.on { background: var(--accent); }
+  /* Sideways: the controls sit either side of the screens */
+  @media (orientation: landscape) {
+    .vpad { --u: clamp(34px, 10.5vh, 58px); }
+    body.touch .stage { --side: calc(var(--u) * 3.3); justify-content: center; padding-left: calc(var(--side) + 8px + env(safe-area-inset-left)); padding-right: calc(var(--side) + 8px + env(safe-area-inset-right)); }
+    body.touch .vpad { position: absolute; inset: 0; max-width: none; align-items: stretch; pointer-events: none; padding: 8px calc(6px + env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) calc(6px + env(safe-area-inset-left)); }
+    body.touch .vp-side { pointer-events: auto; width: var(--side); justify-content: space-between; }
+  }
+  /* Fullscreen without the browser's fullscreen API (iPhone): hide the top bar */
+  body.pseudo-full .topbar { display: none; }
+  body.pseudo-full .stage { padding-top: calc(8px + env(safe-area-inset-top)); }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
 </head>
@@ -194,7 +265,7 @@
   </div>
   <div class="toolbar">
     <label class="btn primary" for="file" title="Open a game (.3ds, .cci, .cxi, .3dsx, .elf)">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Open
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span class="lbl">Open</span>
     </label>
     <button class="btn icon" id="pause" disabled title="Pause (P)" aria-label="Pause">
       <svg id="pause-icon" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
@@ -234,6 +305,20 @@
       </div>
     </div>
 
+    <div class="vpad" id="vpad" aria-hidden="true">
+      <div class="vp-side left">
+        <div class="vp-row"><div class="vp-btn vp-sh" data-b="L">L</div><div class="vp-btn vp-sh" data-b="ZL">ZL</div></div>
+        <div class="vp-stick" id="vp-stick"><i></i></div>
+        <div class="vp-dpad" id="vp-dpad" hidden><span data-k="DUP"></span><span data-k="DLEFT"></span><span data-k="DRIGHT"></span><span data-k="DDOWN"></span><i></i></div>
+        <div class="vp-row"><div class="vp-btn vp-small" data-b="SELECT">Select</div><div class="vp-btn vp-small" data-act="swap" title="Circle Pad / D-Pad"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4 3 8l4 4M3 8h14M17 20l4-4-4-4M21 16H7"/></svg></div></div>
+      </div>
+      <div class="vp-side right">
+        <div class="vp-row"><div class="vp-btn vp-sh" data-b="ZR">ZR</div><div class="vp-btn vp-sh" data-b="R">R</div></div>
+        <div class="vp-face"><div class="vp-btn" data-b="X">X</div><div class="vp-btn" data-b="Y">Y</div><div class="vp-btn" data-b="A">A</div><div class="vp-btn" data-b="B">B</div></div>
+        <div class="vp-row"><div class="vp-btn vp-small" data-b="START">Start</div><div class="vp-btn vp-small" data-act="full" title="Fullscreen"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></div></div>
+      </div>
+    </div>
+
     <div class="overlay" id="overlay">
       <div class="card" id="welcome">
         <div class="hero"><img src="assets/icon.svg" alt=""><h2 class="wordmark">Pica<b>3DS</b></h2></div>
@@ -268,6 +353,9 @@
       <button class="tab" role="tab" id="tab-settings" aria-controls="pane-settings" aria-selected="false">Settings</button>
       <button class="tab" role="tab" id="tab-controls" aria-controls="pane-controls" aria-selected="false">Controls</button>
       <button class="tab" role="tab" id="tab-log" aria-controls="pane-log" aria-selected="false">Log<span class="badge" id="log-badge" hidden>0</span></button>
+      <button class="btn icon small sheet-close" id="panel-close" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="m6 6 12 12M18 6 6 18"/></svg>
+      </button>
     </div>
 
     <div class="pane" id="pane-perf" role="tabpanel">
@@ -325,6 +413,7 @@
         </div>
         <div class="field"><label for="jit">Compilers (JIT)<small>Turn off only to troubleshoot: same output, slower</small></label><span class="switch"><input type="checkbox" id="jit" checked><i></i></span></div>
         <div class="field"><label for="idle-skip">Skip busy background threads<small>Saves CPU when a game keeps a low-priority thread busy (e.g. Cut the Rope menus). Turn off if something in a game runs too slowly</small></label><span class="switch"><input type="checkbox" id="idle-skip" checked><i></i></span></div>
+        <div class="field"><label for="pause-hidden">Pause in the background<small>Pause when you switch tabs or apps, and carry on when you come back</small></label><span class="switch"><input type="checkbox" id="pause-hidden" checked><i></i></span></div>
         <div class="field"><label for="audio-on">Sound</label><span class="switch"><input type="checkbox" id="audio-on" checked><i></i></span></div>
         <div class="field"><span>Graphics device<small id="gpu-name">–</small></span><span class="pill" id="gpu-accel">–</span></div>
       </div>
@@ -341,6 +430,16 @@
 
     <div class="pane" id="pane-controls" role="tabpanel" hidden>
       <div class="section">
+        <h4>On-screen controls</h4>
+        <div class="field"><label for="vpad-mode">Show<small>Auto: on touch screens, unless a gamepad is connected</small></label>
+          <select id="vpad-mode"><option value="auto">Auto</option><option value="on">Always</option><option value="off">Never</option></select>
+        </div>
+        <div class="field"><span>Left side</span>
+          <div class="seg" id="vpad-left"><button data-v="stick" aria-pressed="true">Circle Pad</button><button data-v="dpad" aria-pressed="false">D-Pad</button></div>
+        </div>
+        <div class="field"><label for="vpad-vibrate">Vibrate on press<small>On phones that support it</small></label><span class="switch"><input type="checkbox" id="vpad-vibrate"><i></i></span></div>
+      </div>
+      <div class="section">
         <div class="row"><h4 style="margin:0">Keyboard</h4><button class="btn small" id="keys-reset">Reset to defaults</button></div>
         <p class="note" style="margin:6px 0 10px">Click a key, then press the key you want to use. Esc cancels.</p>
         <div class="bindings" id="bindings"></div>
@@ -351,7 +450,7 @@
       </div>
       <div class="section">
         <h4>Other</h4>
-        <p class="note">Touch screen: mouse or finger on the bottom screen. Shortcuts: <kbd>P</kbd> pause, <kbd>F</kbd> fullscreen, <kbd>M</kbd> mute (when not used by a binding).</p>
+        <p class="note">Touch screen: mouse or finger on the bottom screen. On a phone, the on-screen buttons can be slid across, and the arrows button next to Select swaps the Circle Pad for a D-Pad. Shortcuts: <kbd>P</kbd> pause, <kbd>F</kbd> fullscreen, <kbd>M</kbd> mute (when not used by a binding).</p>
       </div>
     </div>
 
@@ -362,6 +461,7 @@
     </div>
   </aside>
 </main>
+<div class="scrim" id="scrim"></div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <div class="drop-hint">Drop a game to play it</div>
 

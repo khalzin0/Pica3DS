@@ -482,6 +482,14 @@ void main() {
 
     warn(key, msg) { if (!this.warned.has(key)) { this.warned.add(key); if (this.gpu) this.gpu.warn(key, msg); } }
 
+    // Uniform location, looked up once per program (these are called every frame)
+    uni(prog, name) {
+      const cache = prog.uniCache || (prog.uniCache = new Map());
+      let loc = cache.get(name);
+      if (loc === undefined) { loc = this.gl.getUniformLocation(prog, name); cache.set(name, loc); }
+      return loc;
+    }
+
     compile(type, src) {
       const gl = this.gl, s = gl.createShader(type);
       gl.shaderSource(s, src);
@@ -681,8 +689,8 @@ void main() {
       gl.bindTexture(gl.TEXTURE_2D, this.depthTex);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32F, w, h, 0, gl.RG, gl.FLOAT, data);
       gl.useProgram(this.depthProg);
-      gl.uniform1i(gl.getUniformLocation(this.depthProg, 'uDepth'), 0);
-      const bitLoc = gl.getUniformLocation(this.depthProg, 'uBit');
+      gl.uniform1i(this.uni(this.depthProg, 'uDepth'), 0);
+      const bitLoc = this.uni(this.depthProg, 'uBit');
       gl.viewport(0, 0, w, h);
       gl.bindVertexArray(this.quadVao);
       gl.colorMask(false, false, false, false);
@@ -796,9 +804,9 @@ void main() {
       gl.useProgram(this.transferProg);
       gl.activeTexture(gl.TEXTURE0); gl.bindSampler(0, null); gl.bindTexture(gl.TEXTURE_2D, src.tex);
       const scale = (flags >> 24) & 3;
-      gl.uniform1i(gl.getUniformLocation(this.transferProg, 'uSrc'), 0);
-      gl.uniform4i(gl.getUniformLocation(this.transferProg, 'uIn'), inW, inH, src.h, scale === 2 ? 1 : 0);
-      gl.uniform4i(gl.getUniformLocation(this.transferProg, 'uOut'), outW, outH, flags & 1, scale ? 1 : 0);
+      gl.uniform1i(this.uni(this.transferProg, 'uSrc'), 0);
+      gl.uniform4i(this.uni(this.transferProg, 'uIn'), inW, inH, src.h, scale === 2 ? 1 : 0);
+      gl.uniform4i(this.uni(this.transferProg, 'uOut'), outW, outH, flags & 1, scale ? 1 : 0);
       gl.bindVertexArray(this.quadVao);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       gl.bindVertexArray(this.vao);
@@ -823,8 +831,8 @@ void main() {
       gl.colorMask(true, true, true, true);
       gl.useProgram(this.presentProg);
       gl.activeTexture(gl.TEXTURE0); gl.bindSampler(0, null); gl.bindTexture(gl.TEXTURE_2D, s.tex);
-      gl.uniform1i(gl.getUniformLocation(this.presentProg, 'uSrc'), 0);
-      gl.uniform2i(gl.getUniformLocation(this.presentProg, 'uOrigin'), col, row);
+      gl.uniform1i(this.uni(this.presentProg, 'uSrc'), 0);
+      gl.uniform2i(this.uni(this.presentProg, 'uOrigin'), col, row);
       gl.bindVertexArray(this.quadVao);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       gl.bindVertexArray(this.vao);
