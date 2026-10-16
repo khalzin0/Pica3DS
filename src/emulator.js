@@ -23,6 +23,7 @@
       this.loaded = false;
       this.halted = true;
       this.systemArchives = new Map(); // title ID (16 hex digits) -> RomFS bytes; kept across loads
+      this.installedTitles = new Map(); // title ID -> size: the titles the user added, reported as installed (AM)
       // Per-frame timings in ms (wall clock): the whole frame, GPU command lists, and GX copies/fills.
       // CPU + kernel + services time is frame - gpu - xfer.
       this.perf = { frame: 0, gpu: 0, xfer: 0 };
@@ -48,6 +49,27 @@
 
     debugOutput(s) { this.onDebug(s); }
 
+    // A title asks for another one to run: the HOME Menu starting an app or applet ({ titleId } or { appId }), or a
+    // title going back to the HOME Menu ({ home: true }). The page (onLaunch) loads it; this one stops quietly.
+    // False when nothing handles it.
+    requestLaunch(req) {
+      if (!this.onLaunch || this.halted) return false;
+      this.halted = true;
+      this.haltReason = 'launch';
+      this.kernel.cpu.stop = true;
+      this.onLaunch(req);
+      return true;
+    }
+
+    // The HOME button: tells the running title (which then saves and goes back to the HOME Menu). False when it
+    // can't be told (not running, or it hasn't set up APT).
+    pressHome() {
+      const apt = !this.halted && this.services && this.services.instances.get('APT');
+      if (!apt || !apt.appId || apt.appId === 0x101) return false;
+      apt.notify(1);
+      return true;
+    }
+
     halt(reason) {
       if (this.halted) return;
       this.halted = true;
@@ -65,6 +87,9 @@
       this.standinArchives = null; // title ID -> stand-in RomFS built for this load
       this.fsVolumes = null;       // the game's save data, extdata and SD card (see setSaves)
       this.savesDirty = false;
+      // The parameter the HOME Menu started this title with (given with its first wake-up), for this load only
+      this.startParam = this.nextStartParam || null;
+      this.nextStartParam = null;
       this.pendingReads = 0;       // game file reads in flight (a save state waits for them)
       this.insnCount = 0;
       this.frame = 0;
@@ -106,6 +131,7 @@
       // Shared page (time, 3D slider, ...).
       const sp = new DataView(mem.alloc(0x1FF81000, 0x1000, 1, 3, 'shared page').buffer);
       sp.setUint32(0x04, 1, true); // RUNNING_HW: retail
+      sp.setUint8(0x85, 1 | (5 << 2)); // battery: adapter connected, full (else the HOME Menu warns of a low battery)
       const msSince1900 = Date.now() - new Date(Date.UTC(1900, 0, 1)).getTime() + -new Date().getTimezoneOffset() * 60000;
       for (const off of [0x20, 0x40]) { // osTimeRef_s[2]: value_ms, value_tick, sysclock_hz, drift_ms
         sp.setUint32(off, msSince1900 % 4294967296, true);
@@ -142,7 +168,9 @@
         vol.dirs = new Set(s.dirs);
         store.set(key, vol);
       }
-      this.fsVolumes = store.size ? store : null;
+      // What the system creates on a console (shared extdata), where the saves lack it
+      for (const [key, vol] of EMU.classes.FsService.defaultVolumes()) if (!store.has(key)) store.set(key, vol);
+      this.fsVolumes = store;
     }
 
     runFrame() {

@@ -342,6 +342,9 @@
     f_native: '3DS firmware (NATIVE_FIRM)', f_twl: 'DS mode firmware (TWL_FIRM)', f_agb: 'GBA mode firmware (AGB_FIRM)',
   };
 
+  // Built-in apps without a name in their icon, by internal name
+  const APP_NAMES = { CARDBOAR: 'System Transfer' };
+
   // What a system title is: { name, kind, used } (kind: app, applet, data, module, firmware, ds; used: whether Pica3DS
   // uses it). iconName / exName: the title's own names, when known.
   EMU.describeSystemTitle = function (titleId, iconName, exName) {
@@ -357,7 +360,7 @@
     if (/^00048/.test(hi)) return { name: `DS mode title ${String.fromCharCode(...[0, 8, 16, 24].map((s) => (low >>> (24 - s)) & 0xFF))}`, kind: 'ds', used: false };
     const own = iconName && /[A-Za-z]{2}/.test(iconName) && iconName.trim() !== exName ? iconName.trim() : null; // not '???' or blank
     if (hi === '00040030') return { name: (own && own !== 'MINT' ? own : null) || APPLET_NAMES[low & 0xFFFF] || exName || 'applet', kind: 'applet', used: true };
-    if (hi === '00040010') return { name: own || (exName ? `system app (${exName})` : 'system app'), kind: 'app', used: true };
+    if (hi === '00040010') return { name: own || APP_NAMES[exName] || (exName ? `system app (${exName})` : 'system app'), kind: 'app', used: true };
     return { name: EMU.SYSTEM_ARCHIVE_NAMES[id] || 'system data', kind: 'data', used: true };
   };
 

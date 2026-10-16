@@ -77,6 +77,12 @@
       this.appletNames = { 0x201: 'software keyboard', 0x401: 'software keyboard', 0x202: 'Mii selector', 0x402: 'Mii selector', 0x206: 'error/EULA display', 0x406: 'error/EULA display' };
     }
 
+    // Notify the running title (InquireNotification): 1 = the HOME button was pressed
+    notify(n) {
+      (this.notifs || (this.notifs = [])).push(n);
+      this.kernel.signal(this.notifEvent);
+    }
+
     // Deliver a parameter (APT message) to the application.
     sendToApp(param) {
       this.params.push(param);
@@ -170,13 +176,15 @@
       return this.font;
     }
 
-    // Is this applet running (1) or not (0)? Under a game: the game, the HOME Menu behind it, and library applets
-    // (started on demand). When the HOME Menu itself runs, no application is.
+    // Is this applet running (1) or not (0)? Under a game or a system applet: itself, the HOME Menu behind it, and
+    // library applets (started on demand). When the HOME Menu itself runs, nothing else is.
     registered(appId) {
       const self = this.appId || 0x300;
       if (appId === self) return 1;
-      if (self === 0x300) return appId === 0x101 || (appId >= 0x200 && appId < 0x300) ? 1 : 0;
-      return 0;
+      if (self === 0x101) return 0;
+      // 0x4xx: a library applet the title preloaded (0x400: any)
+      if (appId >= 0x400 && appId < 0x500) return this.preloaded && (appId === 0x400 || appId === this.preloaded) ? 1 : 0;
+      return appId === 0x101 || (appId >= 0x200 && appId < 0x300) ? 1 : 0;
     }
 
     handle(ipc, id) {
@@ -186,10 +194,11 @@
         case 0x2: // Initialize(appId, attributes)
           this.appId = ipc.get(1); // 0x300 for applications, 0x101 when the HOME Menu itself runs
           ipc.reply(id, [0], [0x04000000, k.createHandle(this.notifEvent), k.createHandle(this.paramEvent)]);
-          this.sendToApp({ sender: 0x101, signal: 1, buffer: new Uint8Array(0), object: null }); // HOME menu: wakeup
-          // The HOME Menu reads a wake-up twice at start: in its start-up code, then in its message handler, which
+          // HOME Menu: wake-up, with the parameter it started this title with
+          this.sendToApp({ sender: 0x101, signal: 1, buffer: this.emu.startParam || new Uint8Array(0), object: null });
+          // The HOME Menu (and the system applets it starts) reads a wake-up twice at start: in its start-up code, then in its message handler, which
           // only accepts touch and buttons after receiving a wake-up there (else it stays as if in the background)
-          if (this.appId === 0x101) this.sendToApp({ sender: 0x101, signal: 1, buffer: new Uint8Array(0), object: null });
+          if (this.appId >= 0x100 && this.appId < 0x200) this.sendToApp({ sender: 0x101, signal: 1, buffer: new Uint8Array(0), object: null });
           return true;
         case 0x3: ipc.reply(id, [0]); return true; // Enable
         case 0x6: { // GetAppletInfo(appId) -> title ID, media type, registered, loaded, attributes; "not found" if not running
@@ -200,7 +209,9 @@
           return true;
         }
         case 0x9: ipc.reply(id, [0, this.registered(ipc.get(1))]); return true; // IsRegistered
-        case 0xB: ipc.reply(id, [0, 0]); return true; // InquireNotification
+        // GetAppletManInfo(position) -> position, requested applet, HOME Menu applet, active applet
+        case 0x5: { const self = this.appId || 0x300; ipc.reply(id, [0, self === 0x300 ? 0 : 1, self, 0x101, self]); return true; }
+        case 0xB: ipc.reply(id, [0, (this.notifs && this.notifs.shift()) || 0]); return true; // InquireNotification
         case 0xD: case 0xE: { // ReceiveParameter / GlanceParameter(appId, bufferSize)
           const p = this.params[0];
           if (!p) { ipc.reply(id, [0xC8A0CFEF, 0, 0, 0], [0, 0, 2, 0]); return true; }
@@ -219,24 +230,55 @@
           const buf = size ? this.mem.readBytes(ipc.get(8), size) : new Uint8Array(0);
           if (dstApp >= 0x200 && dstApp < 0x500) this.appletRequest(dstApp, signal, buf);
           ipc.reply(id, [0]);
+          // To the HOME Menu after PrepareToJumpToHomeMenu: the title is going back to it (it would wait for the
+          // HOME Menu, which does not run beside it here)
+          if (dstApp === 0x101 && this.jumpingHome) this.emu.requestLaunch({ home: true });
           return true;
         }
-        case 0x16: case 0x17: case 0x18: ipc.reply(id, [0]); return true; // Preload/FinishPreloading/PrepareToStart library applet
+        case 0x16: this.preloaded = ipc.get(1); ipc.reply(id, [0]); return true; // PreloadLibraryApplet(appId)
+        case 0x17: case 0x18: ipc.reply(id, [0]); return true; // FinishPreloading/PrepareToStart library applet
         case 0x1E: { // StartLibraryApplet(appId, size, handle, buffer)
           const applet = ipc.get(1), size = ipc.get(2), buf = size ? this.mem.readBytes(ipc.get(6), size) : new Uint8Array(0);
           ipc.reply(id, [0]);
           this.appletStart(applet, buf);
           return true;
         }
-        case 0x3B: ipc.reply(id, [0]); return true; // CancelLibraryApplet
+        case 0x3B: // CancelLibraryApplet: the preloaded applet closes, waking the title (WakeupByCancel)
+          ipc.reply(id, [0]);
+          if (this.preloaded) this.sendToApp({ sender: this.preloaded, signal: 0xC, buffer: new Uint8Array(0), object: null });
+          this.preloaded = 0;
+          return true;
+        // Starting another title (the HOME Menu starting an app or a system applet such as Friend List): the page
+        // loads that title in place of this one
+        case 0x15: { // PrepareToStartApplication(title ID, media type, ..., flags)
+          const t = ipc.get(2).toString(16).padStart(8, '0') + ipc.get(1).toString(16).padStart(8, '0');
+          this.nextLaunch = { titleId: t, media: ipc.get(3) & 0xFF };
+          ipc.reply(id, [0]);
+          return true;
+        }
+        case 0x19: this.nextLaunch = { appId: ipc.get(1) }; ipc.reply(id, [0]); return true; // PrepareToStartSystemApplet
+        case 0x1B: case 0x1F: { // StartApplication / StartSystemApplet(appId, size, handle, parameter)
+          // The parameter goes to the started title with its wake-up
+          const size = id === 0x1F ? ipc.get(2) : 0;
+          const param = size ? this.mem.readBytes(ipc.get(6), Math.min(size, 0x1000)) : null;
+          ipc.reply(id, [0]);
+          if (this.nextLaunch) this.emu.requestLaunch(Object.assign(this.nextLaunch, param ? { param } : {}));
+          this.nextLaunch = null;
+          return true;
+        }
+        case 0x22: case 0x26: ipc.reply(id, [0]); return true; // PrepareToClose(System)Applet
+        case 0x2B: this.jumpingHome = true; ipc.reply(id, [0]); return true; // PrepareToJumpToHomeMenu
+        case 0x29: case 0x2C: // CloseSystemApplet, JumpToHomeMenu: back to the HOME Menu
+          ipc.reply(id, [0]);
+          this.emu.requestLaunch({ home: true });
+          return true;
         // PrepareToStartNewestHomeMenu: the running HOME Menu is the newest ("already exists"); any other answer
         // makes it restart the system to switch to a newer one
         case 0x1A: ipc.reply(id, [0xC8A0CCBE]); return true;
         case 0xF: ipc.reply(id, [0, 1]); return true; // CancelParameter
-        case 0x27: case 0x28: // CloseApplication
+        case 0x27: case 0x28: // CloseApplication: back to the HOME Menu when there is one, else the end
           ipc.reply(id, [0]);
-          this.emu.halt('Application closed (APT_CloseApplication)');
-          k.cpu.stop = true;
+          if (!this.emu.requestLaunch({ home: true })) { this.emu.halt('Application closed (APT_CloseApplication)'); k.cpu.stop = true; }
           return true;
         case 0x43: ipc.reply(id, [0]); return true; // NotifyToWait
         case 0x3E: ipc.reply(id, [0]); return true; // ReplySleepQuery
@@ -249,6 +291,7 @@
         case 0x4F: ipc.reply(id, [0]); return true; // SetAppCpuTimeLimit
         case 0x50: ipc.reply(id, [0, 80]); return true; // GetAppCpuTimeLimit
         case 0x101: case 0x102: ipc.reply(id, [0, 0]); return true; // CheckNew3DS
+        case 0x105: ipc.reply(id, [0, 1]); return true; // IsTitleAllowed(title ID, media type): yes
       }
       return false;
     }
@@ -732,16 +775,18 @@
 
     // Volumes outlive fs sessions; keyed by archive id (+ path for extdata).
     volume(archiveId, pathKey, create) {
-      const store = this.emu.fsVolumes || (this.emu.fsVolumes = this.defaultVolumes());
+      const store = this.emu.fsVolumes || (this.emu.fsVolumes = FsService.defaultVolumes());
       const key = `${hex(archiveId)}:${pathKey}`;
       let vol = store.get(key);
       if (!vol && create) { vol = new Volume(); store.set(key, vol); }
       return vol || null;
     }
 
-    // Data the system creates on a real console: shared extdata F000000B with the Play Coin file.
-    defaultVolumes() {
+    // Data the system creates on a real console during setup: the shared extdata (photos, sounds, Play Coins, HOME
+    // Menu data, ...), F000000B with the Play Coin file
+    static defaultVolumes() {
       const store = new Map(), shared = new Volume();
+      for (const id of ['f0000001', 'f0000002', 'f0000009', 'f000000c', 'f000000d', 'f000000e']) store.set(`${hex(6)}:${id}`, new Volume());
       const coins = new Uint8Array(0x14), dv = new DataView(coins.buffer);
       dv.setUint32(0, 0x4F00, true); dv.setUint16(4, 10, true);                       // magic, total coins
       dv.setUint16(0x10, 2014, true); coins[0x12] = 12; coins[0x13] = 29;           // last coin date
@@ -765,6 +810,7 @@
         }
         case 6: case 7: case 0x12345678: case 0x12345679: { // ExtSaveData (created via CreateExtSaveData)
           const vol = this.volume(6, FsService.extdataKey(pathKey), false);
+          if (!vol) this.emu.log(`fs: extdata ${FsService.extdataKey(pathKey).toUpperCase()} does not exist yet`);
           return vol ? { vol } : { err: ERR_EXTDATA_MISSING };
         }
         case 8: case 0x567890B2: case 0x567890B4: // System save data
@@ -1729,12 +1775,95 @@
     }
   }
 
+  // ------------------------------------------------------------------ CSND (sound channels, used by system apps)
+  // No sound is played: the shared memory and its lock are handed out, and commands are marked done.
+  class CsndService extends Service {
+    handle(ipc, id) {
+      const k = this.kernel;
+      switch (id) {
+        case 0x1: { // Initialize(shared memory size, offsets) -> mutex, shared memory
+          const size = Math.max(0x1000, (ipc.get(1) + 0xFFF) & ~0xFFF);
+          this.shared = new Uint8Array(size);
+          const pages = [];
+          for (let o = 0; o < size; o += 0x1000) pages.push(this.shared.subarray(o, o + 0x1000));
+          this.lock = new EMU.KMutex();
+          ipc.reply(id, [0], [0x04000000, k.createHandle(this.lock), k.createHandle(new EMU.KMemBlock(pages, size))]);
+          return true;
+        }
+        case 0x3: { // ExecuteCommands(offset): each command (0x20 bytes: next offset, ID, done flag, ...) marked done
+          const sh = this.shared;
+          for (let o = ipc.get(1), n = 0; sh && o + 0x20 <= sh.length && n < 64; n++) {
+            sh[o + 4] |= 1;
+            const next = sh[o] | (sh[o + 1] << 8);
+            if (!next || next === o) break;
+            o = next;
+          }
+          ipc.reply(id, [0]);
+          return true;
+        }
+        case 0x5: ipc.reply(id, [0, 0xFFFFFF00]); return true; // AcquireSoundChannels: channels 8-31
+        case 0x7: ipc.reply(id, [0, 0]); return true;          // AcquireCapUnit: unit 0
+      }
+      return false;
+    }
+  }
+
+  // ------------------------------------------------------------------ AM (title manager)
+  // The titles installed on the console: the system titles the user added (emu.installedTitles: title ID -> size),
+  // all on the internal memory (NAND). Nothing on the SD card or game card.
+  const ERR_TITLE_NOT_FOUND = 0xD8A083FA;
+  class AmService extends Service {
+    titles(media) {
+      if ((media & 0xFF) !== 0 || !this.emu.installedTitles) return [];
+      return [...this.emu.installedTitles.keys()].sort();
+    }
+
+    handle(ipc, id) {
+      const m = this.mem;
+      const put64 = (a, t) => { m.w32(a >>> 0, parseInt(t.slice(8), 16) >>> 0); m.w32((a + 4) >>> 0, parseInt(t.slice(0, 8), 16) >>> 0); };
+      const get64 = (a) => m.r32((a + 4) >>> 0).toString(16).padStart(8, '0') + m.r32(a >>> 0).toString(16).padStart(8, '0');
+      switch (id) {
+        case 0x1: ipc.reply(id, [0, this.titles(ipc.get(1)).length]); return true; // GetNumPrograms(media)
+        case 0x2: { // GetProgramList(count, media) -> number written, title IDs
+          const list = this.titles(ipc.get(2)).slice(0, ipc.get(1)), out = ipc.get(4);
+          list.forEach((t, i) => put64(out + i * 8, t));
+          ipc.reply(id, [0, list.length], [ipc.get(3), out]);
+          return true;
+        }
+        case 0x3: { // GetProgramInfos(media, count, title IDs) -> per title: ID, size, version, type (0x18 bytes)
+          const media = ipc.get(1) & 0xFF, n = ipc.get(2), src = ipc.get(4), out = ipc.get(6);
+          const have = this.emu.installedTitles || new Map();
+          let res = 0;
+          for (let i = 0; i < n; i++) {
+            const t = get64(src + i * 8), o = out + i * 0x18;
+            for (let j = 0; j < 0x18; j += 4) m.w32((o + j) >>> 0, 0);
+            if (media !== 0 || !have.has(t)) { res = ERR_TITLE_NOT_FOUND; continue; }
+            put64(o, t);
+            m.w32((o + 8) >>> 0, have.get(t) >>> 0);
+          }
+          ipc.reply(id, [res], [ipc.get(3), src, ipc.get(5), out]);
+          return true;
+        }
+        case 0x8: ipc.reply(id, [0, this.titles(0).length]); return true; // GetNumTickets
+        case 0x9: { // GetTicketList(count, skip) -> number written, title IDs that have a ticket
+          const skip = ipc.get(2), list = this.titles(0).slice(skip, skip + ipc.get(1)), out = ipc.get(4);
+          list.forEach((t, i) => put64(out + i * 8, t));
+          ipc.reply(id, [0, list.length], [ipc.get(3), out]);
+          return true;
+        }
+        case 0x13: ipc.reply(id, [0, 0]); return true; // NeedsCleanup(media): no
+      }
+      return false;
+    }
+  }
+
   // Commands of otherwise stubbed services that hand out an event to wait on: the game gets a real event (never
   // signalled) instead of handle 0, which it would fail to wait on
   const STUB_EVENTS = {
     'cecd:u': [0x0F, 0x10], 'cecd:s': [0x0F, 0x10], // GetCecInfoEventHandle, GetChangeStateEventHandle
     'ir:USER': [0x0C, 0x0D, 0x0E],                // GetReceiveEvent, GetSendEvent, GetConnectionStatusEvent
     'nim:u': [0x05, 0x06],                        // GetBackgroundEventForMenu, GetBackgroundEventForNews
+    'cam:u': [0x05, 0x06, 0x07],                  // GetVsyncInterruptEvent, GetBufferErrorInterruptEvent, SetReceiving
   };
   // Commands that start an asynchronous task and hand out its "done" event: the task finishes at once (signalled),
   // with nothing to do (no network)
@@ -1760,6 +1889,14 @@
       }
       if (this.name === 'nim:u' && id === 0x13) { ipc.reply(id, [0, 0, 0]); return true; } // GetAsyncResult: success
       if (this.name.startsWith('cecd:') && id === 0x0E) { ipc.reply(id, [0, 1]); return true; } // GetCecStateAbbreviated: idle
+      // ConnectAsync / CloseAsync(process ID, event): finish at once (the event is signalled). Left waiting, the
+      // HOME Menu never starts an app: it first cancels the connection and waits for it to end.
+      if (this.name.startsWith('ac:') && (id === 0x4 || id === 0x8)) {
+        const ev = this.kernel.getObj(ipc.get(4));
+        if (ev instanceof EMU.KEvent) this.kernel.signalEvent(ev);
+        ipc.reply(id, [0]);
+        return true;
+      }
       return false;
     }
   }
@@ -1798,6 +1935,8 @@
           case 'y2r:u': svc = new Y2rService(this.emu, name); break;
           case 'mic:u': svc = new MicService(this.emu, name); break;
           case 'ldr:ro': svc = new RoService(this.emu, name); break;
+          case 'csnd:SND': svc = new CsndService(this.emu, name); break;
+          case 'am:sys': case 'am:u': case 'am:net': case 'am:app': svc = new AmService(this.emu, name); break;
           default: svc = new StubService(this.emu, name); this.emu.log(`Service "${name}" is stubbed`);
         }
         this.instances.set(key, svc);
@@ -1823,5 +1962,5 @@
   EMU.Services = Services;
   EMU.Volume = Volume;
   // Classes a save state can hold (see state.js)
-  Object.assign(EMU.classes || (EMU.classes = {}), { Ipc, Service, SrvService, ErrFService, AptService, GspService, HidService, FileService, Volume, VolumeFileService, DirectoryService, FsService, DspService, CfgService, PtmService, Y2rService, MicService, RoService, StubService, Services });
+  Object.assign(EMU.classes || (EMU.classes = {}), { Ipc, Service, SrvService, ErrFService, AptService, GspService, HidService, FileService, Volume, VolumeFileService, DirectoryService, FsService, DspService, CfgService, PtmService, Y2rService, MicService, RoService, CsndService, AmService, StubService, Services });
 })(typeof window !== 'undefined' ? window.EMU : globalThis.EMU);

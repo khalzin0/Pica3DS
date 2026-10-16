@@ -63,7 +63,8 @@ Tested with dumps of games we own, decrypted on our own console, using the defau
 | *Super Mario 3D Land* | Boots | Reaches its menus; selecting a Mii uses a built-in stand-in Mii |
 | *Pokémon Ultra Moon* (USA) | In progress | A 4 GB cartridge: loads, starts up (80 MB memory mode) and loads its code modules (`ldr:ro`); getting in-game is not confirmed yet |
 | Bundled demo and libctru examples | Works | Graphics, input, threads, RomFS |
-| *HOME Menu* (EUR, from our own console) | In progress | Starts at full speed with the real system font; touch and buttons work; first-run tips. Launching apps and the installed-title list are not done yet, and the first-time "Creating HOME Menu management information" screen runs very slowly |
+| *HOME Menu* (EUR, from our own console) | In progress | Lists the added system apps and starts them; the HOME button goes back. The first-time "Creating HOME Menu management information" screen runs slowly |
+| *System apps* (from our own console) | In progress | Start from the HOME Menu: System Settings, Mii Maker, Camera (no camera image), Sound, Activity Log, Download Play, Health and Safety, System Transfer, Nintendo Zone, Face Raiders, AR Games, Friend List, Notifications, Game Notes. eShop shows its no-connection error. Internet Browser and Nintendo Network ID Settings stop at start-up; StreetPass Mii Plaza and amiibo Settings show nothing yet |
 
 Statuses: **Playable** = can be played through what was tested; **Boots** = starts and shows menus; **In progress** = starts, does not reach gameplay yet.
 
@@ -81,7 +82,7 @@ Settings that help with speed: **Settings → Renderer** (graphics card is much 
 | ZL / ZR | 1 / 2 |
 | Touch screen | Mouse or finger on the bottom screen |
 
-Keys can be changed in the **Controls** tab. Gamepads use the standard browser mapping. Shortcuts: **P** pause, **F** fullscreen, **M** mute, **Shift+F1–F4** / **F1–F4** save / load a state (when the key is not bound to a button). Browsers start sound only after a click or key press on the page.
+Keys can be changed in the **Controls** tab. Gamepads use the standard browser mapping. Shortcuts: **P** pause, **F** fullscreen, **M** mute, **H** back to the HOME Menu (when it is added), **Shift+F1–F4** / **F1–F4** save / load a state (when the key is not bound to a button). Browsers start sound only after a click or key press on the page.
 
 ## Saves and save states
 
@@ -113,7 +114,7 @@ The 3DS HOME Menu can be started from your own console's files:
 2. Add them all at once with **Settings → System files → Add system files…**.
 3. Press **Start HOME Menu** (on the welcome screen or in Settings → System files).
 
-First-time setup is reported as done, so the HOME Menu goes straight to its menus. It runs, draws, plays its first-run tips and reacts to touch and buttons. Starting apps from it, the list of installed games and online features (SpotPass, StreetPass, eShop) are not emulated yet. The HOME Menu checks that each app's start-up logo is signed by Nintendo, so apps it shows must be added from your console (stand-in icons are used for the rest).
+First-time setup is reported as done, so the HOME Menu goes straight to its menus. It lists every title you added as installed, and starts apps and system applets (Friend List, Notifications, ...) from them: the chosen title replaces the HOME Menu while it runs. The **HOME** button (toolbar, or the H key) tells the running title to go back to the HOME Menu, and closes it if it doesn't within 3 seconds; closing an app also goes back. Extdata, system save data and the SD card are shared between all titles, as on a console (the HOME Menu, Mii Maker and Friend List see the same data); each title's own save data stays its own. Games are not listed in the HOME Menu, and online features (SpotPass, StreetPass, eShop) are not emulated. The HOME Menu checks that each app's start-up logo is signed by Nintendo, so apps it shows must be added from your console (stand-in icons are used for the rest).
 
 ## Development
 

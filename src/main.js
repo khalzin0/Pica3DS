@@ -221,6 +221,7 @@
     },
   });
   emu.onAudio = (L, R) => audio.push(L, R);
+  if (new URLSearchParams(location.search).has('debug')) window.emu = emu; // for inspecting from the browser console
 
   // ------------------------------------------------------------------ UI state
   let fitQueued = false; // a screen fit is waiting for the next animation frame
@@ -347,7 +348,7 @@
     const gen = emu.loadGeneration, key = emu.titleKey;
     paused = true;
     loadShaderCache(key, gen);
-    dbGet('saves', key).then((saves) => {
+    savesFor(key).then((saves) => {
       if (emu.loadGeneration !== gen) return;
       if (saves) { emu.setSaves(saves); logLine('Restored this game\'s saves from the browser.'); }
       paused = true; setPaused(false);
@@ -384,9 +385,9 @@
   // ------------------------------------------------------------------ system files (kept in IndexedDB)
   function openDb() {
     return new Promise((resolve, reject) => {
-      const req = indexedDB.open('emu3ds', 3);
+      const req = indexedDB.open('emu3ds', 4);
       req.onupgradeneeded = () => {
-        for (const s of ['sysdata', 'saves', 'states', 'shaders']) if (!req.result.objectStoreNames.contains(s)) req.result.createObjectStore(s);
+        for (const s of ['sysdata', 'saves', 'states', 'shaders', 'titles']) if (!req.result.objectStoreNames.contains(s)) req.result.createObjectStore(s);
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
@@ -414,12 +415,24 @@
 
   // ------------------------------------------------------------------ game saves and save states
   // The game's saves are written to the browser shortly after the game changes them
+  // Its own save data is kept per game; extdata, system save data and the SD card are shared by every game and
+  // system title, as on a console (the HOME Menu, System Settings and Mii Maker see each other's data)
   let savesTimer = 0;
+  const SHARED_SAVES = '*shared*', OWN_SAVE = EMU.hex(4) + ':';
   function flushSaves() {
     if (!emu.loaded || !emu.savesDirty) return;
     emu.savesDirty = false;
-    dbPut('saves', emu.titleKey, emu.getSaves());
+    const all = emu.getSaves(), own = {}, shared = {};
+    for (const k of Object.keys(all)) (k.startsWith(OWN_SAVE) ? own : shared)[k] = all[k];
+    dbPut('saves', emu.titleKey, own);
+    dbPut('saves', SHARED_SAVES, shared);
     $('saves-delete').disabled = false;
+  }
+  // The saves a title starts with: its own, and the shared ones (newer than any copy kept with the title before
+  // they were shared)
+  async function savesFor(key) {
+    const [own, shared] = await Promise.all([dbGet('saves', key), dbGet('saves', SHARED_SAVES)]);
+    return own || shared ? Object.assign({}, own, shared) : null;
   }
   setInterval(() => { if (emu.savesDirty && performance.now() - savesTimer > 1500) { savesTimer = performance.now(); flushSaves(); } }, 500);
   window.addEventListener('pagehide', flushSaves);
@@ -563,6 +576,9 @@
   const KIND_LABELS = { app: 'Built-in apps', applet: 'Applets', data: 'System data', module: 'System modules (not used: Pica3DS replaces them)',
     firmware: 'Firmware (not used)', ds: 'DS mode titles (not used)' };
   function updateSysStatus() {
+    // What AM reports as installed: every title added (and the HOME Menu)
+    emu.installedTitles = new Map([...titleMeta].map(([id, m]) => [id, m.size || 0]));
+    if (homeMenu) emu.installedTitles.set(homeMenu.id, homeMenu.bytes.length);
     const ids = new Set([...emu.systemArchives.keys(), ...(emu.titleExefs ? emu.titleExefs.keys() : []), ...titleMeta.keys()]);
     if (homeMenu) ids.add(homeMenu.id);
     const box = $('sys-status');
@@ -603,7 +619,7 @@
   const HOME_MENU_IDS = ['0004003000008202', '0004003000008f02', '0004003000009802', '000400300000a102', '000400300000a902', '000400300000b102'];
   let homeMenu = null; // { id, bytes }
   function showHomeButtons() {
-    $('ov-home').hidden = $('sys-home').hidden = !homeMenu;
+    $('ov-home').hidden = $('sys-home').hidden = $('home-btn').hidden = !homeMenu;
     if (homeMenu) $('sys-home').title = `HOME Menu ${homeMenu.id.toUpperCase()}`;
   }
   function startHomeMenu() {
@@ -613,13 +629,53 @@
   }
   $('ov-home').addEventListener('click', startHomeMenu);
   $('sys-home').addEventListener('click', startHomeMenu);
+  // The HOME button: closes what runs (its saves are kept) and goes back to the HOME Menu
+  // The title is told first, and closes itself back to the HOME Menu; one that doesn't within 3 seconds is closed.
+  function goHome() {
+    if (!homeMenu || (emu.loaded && !emu.halted && romName === 'HOME Menu')) return;
+    const gen = emu.loadGeneration;
+    if (emu.pressHome()) {
+      setTimeout(() => { if (emu.loadGeneration === gen && !emu.halted) { flushSaves(); startHomeMenu(); } }, 3000);
+      return;
+    }
+    flushSaves();
+    startHomeMenu();
+  }
+  $('home-btn').addEventListener('click', goHome);
+
+  // A title started another: the HOME Menu starting an app or a system applet, or an app closing back to it
+  const SYSTEM_APPLETS = { 0x110: /camera/i, 0x112: /friend/i, 0x113: /game notes/i, 0x114: /browser/i, 0x115: /manual/i,
+    0x116: /notification/i, 0x117: /^miiverse/i, 0x118: /post to miiverse/i, 0x119: /amiibo/i };
+  emu.onLaunch = async (req) => {
+    flushSaves();
+    if (req.home || req.appId === 0x101) {
+      if (homeMenu) { logLine('Back to the HOME Menu'); startHomeMenu(); }
+      else { setStatus('halted', 'Finished'); showMessage('Game finished', 'The game closed itself.'); }
+      return;
+    }
+    let id = req.titleId;
+    if (!id && SYSTEM_APPLETS[req.appId]) {
+      for (const [t, m] of titleMeta) if (m.kind === 'applet' && SYSTEM_APPLETS[req.appId].test(m.name)) { id = t; break; }
+    }
+    const meta = id && titleMeta.get(id), what = meta ? meta.name : id ? id.toUpperCase() : `system applet ${EMU.hex(req.appId, 3)}`;
+    const bytes = id && await dbGet('titles', id);
+    if (!bytes) {
+      logLine(`Can't start ${what}: add its file from your 3DS under Settings → System files`, 'err');
+      toast(`Can't start ${what}: its file isn't added (Settings → System files)`, true, 5000);
+      if (homeMenu) startHomeMenu();
+      return;
+    }
+    logLine(`Starting ${what}`);
+    emu.nextStartParam = req.param || null;
+    start(new Uint8Array(bytes), what);
+  };
 
   // allowTitles: also programs (e.g. System Settings for the HOME Menu); dropped files that are programs are run instead
   function tryAddSystemFile(bytes, name, allowTitles = false) {
     let info;
     try { info = EMU.parseSystemArchive(bytes); } catch (e) { return { ok: false, error: e.message }; }
     if (info.executable && !allowTitles) return { ok: false };
-    const meta = { name: info.name || '', kind: info.kind || 'data', used: info.used !== false };
+    const meta = { name: info.name || '', kind: info.kind || 'data', used: info.used !== false, size: bytes.length };
     titleMeta.set(info.titleId, meta);
     dbDo('readwrite', (s) => s.put(meta, 'meta:' + info.titleId));
     if (!meta.used) { // recognised and listed, but not stored: Pica3DS has no use for it
@@ -633,6 +689,7 @@
       showHomeButtons();
       return { ok: true };
     }
+    if (info.executable) dbPut('titles', info.titleId, bytes); // kept whole, for the HOME Menu to start
     if (info.romfs) { emu.addSystemArchive(info.titleId, info.romfs); dbDo('readwrite', (s) => s.put(info.romfs, info.titleId)); }
     if (Object.keys(info.exefs).length) { emu.addTitleExefs(info.titleId, info.exefs); dbDo('readwrite', (s) => s.put(info.exefs, info.titleId + ':exefs')); }
     logLine(`Added ${info.executable ? 'title' : 'system file'} ${info.titleId.toUpperCase()}${info.name ? ` (${info.name})` : ''} from ${name}`);
@@ -657,6 +714,7 @@
     titleMeta.clear();
     homeMenu = null; showHomeButtons();
     dbDo('readwrite', (s) => s.clear());
+    dbDo('readwrite', (s) => s.clear(), 'titles');
     updateSysStatus();
     toast('Removed all system files.');
   });
@@ -945,6 +1003,7 @@
     const fk = /^F([1-4])$/.exec(e.code);
     if (fk) { e.preventDefault(); if (e.shiftKey) saveSlot(+fk[1]); else loadSlot(+fk[1]); return; }
     if (e.code === 'KeyP') { audio.unlock(); setPaused(!paused); }
+    else if (e.code === 'KeyH') { audio.unlock(); goHome(); }
     else if (e.code === 'KeyF') toggleFullscreen();
     else if (e.code === 'KeyM') toggleMute();
   });
@@ -1081,9 +1140,21 @@
     const y = Math.floor(((e.clientY - rect.top) / rect.height) * 240);
     return { x: Math.max(0, Math.min(319, x)), y: Math.max(0, Math.min(239, y)) };
   }
-  bottomCanvas.addEventListener('pointerdown', (e) => { bottomCanvas.setPointerCapture(e.pointerId); touch = touchFromEvent(e); e.preventDefault(); });
-  bottomCanvas.addEventListener('pointermove', (e) => { if (touch) touch = touchFromEvent(e); });
-  const endTouch = () => { touch = null; };
+  // A quick click can be shorter than a frame: each touch lasts at least 3 frames (like a finger tap), or the
+  // game never sees it pressed (buttons such as the HOME Menu's "Open" act on release)
+  let touchDown = false, touchStart = 0;
+  bottomCanvas.addEventListener('pointerdown', (e) => {
+    bottomCanvas.setPointerCapture(e.pointerId);
+    touch = touchFromEvent(e); touchDown = true; touchStart = performance.now();
+    e.preventDefault();
+  });
+  bottomCanvas.addEventListener('pointermove', (e) => { if (touchDown) touch = touchFromEvent(e); });
+  const endTouch = () => {
+    touchDown = false;
+    const left = 50 - (performance.now() - touchStart);
+    if (left > 0) setTimeout(() => { if (!touchDown) touch = null; }, left);
+    else touch = null;
+  };
   bottomCanvas.addEventListener('pointerup', endTouch);
   bottomCanvas.addEventListener('pointercancel', endTouch);
 
