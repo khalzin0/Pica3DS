@@ -52,7 +52,7 @@ Notes:
 | Homebrew (libctru, citro2d/citro3d) | Commercial games: see [Games tested](#games-tested) | Audio effects (reverb, delay) and per-voice filters |
 | 3D graphics on your graphics card (vertex shaders, textures, lighting, fog, blending, depth/stencil) | Speed: most tested scenes run at full speed; video and some busy scenes are slower | Procedural textures, gas rendering |
 | | Geometry shaders: point mode (the mode citro3d uses); variable- and fixed-size primitive modes are not emulated yet | |
-| Save data and extra data (kept in the browser), save states | System applets: the Mii selector picks a stand-in Mii; the keyboard and error display close straight away | Networking, camera, the stereoscopic 3D effect |
+| Save data and extra data (kept in the browser), save states | System applets: the Mii selector picks a stand-in Mii; the software keyboard asks for the text in a browser text box; the error display closes straight away | Networking, camera, the stereoscopic 3D effect |
 | Sound: 24 DSP voices, PCM8/PCM16/DSP-ADPCM, mixing and volume | Microphone (records silence), video (`y2r` colour conversion) | |
 | System files from your own console, or built-in stand-ins | Code modules loaded at run time (`ldr:ro` / CRO); the HOME Menu (see below) | Encrypted games and encrypted `.cia` files |
 

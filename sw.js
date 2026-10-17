@@ -3,7 +3,7 @@
 // Each request goes to the network first (so updates arrive straight away) and falls back to the cache when the
 // network is slow or missing.
 'use strict';
-const CACHE = 'pica3ds-v18';
+const CACHE = 'pica3ds-v19';
 const APP = [
   './', 'index.html', 'manifest.webmanifest',
   'assets/icon.svg', 'assets/icon-180.png', 'assets/icon-192.png', 'assets/icon-512.png', 'assets/icon-maskable-512.png',

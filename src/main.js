@@ -221,6 +221,11 @@
     },
   });
   emu.onAudio = (L, R) => audio.push(L, R);
+  // The 3DS software keyboard: a text box from the browser
+  emu.onKeyboard = ({ hint, maxLength, initial }) => {
+    const text = window.prompt(`${hint || 'Enter text'}${maxLength ? ` (up to ${maxLength} characters)` : ''}`, initial || '');
+    return text === null ? null : text.slice(0, maxLength || 1000);
+  };
   if (new URLSearchParams(location.search).has('debug')) window.emu = emu; // for inspecting from the browser console
 
   // ------------------------------------------------------------------ UI state

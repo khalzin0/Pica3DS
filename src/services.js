@@ -100,7 +100,38 @@
       }
     }
 
-    appletStart(applet, buffer) {
+    // Software keyboard: the page asks for the text (emu.onKeyboard({ hint, maxLength, initial }) -> text, or null
+    // when cancelled). Config (0x400 bytes): buttons - 1 at 0x04, max length at 0x20, hint (UTF-16) at 0x90, initial
+    // text offset at 0x120, result at 0x138, text offset at 0x144 and length at 0x148; the text goes in the shared
+    // memory. False when there is no page to ask.
+    keyboard(applet, buffer, block) {
+      if (!this.emu.onKeyboard || buffer.length < 0x14C || !block) return false;
+      const cfg = buffer.slice(), dv = new DataView(cfg.buffer);
+      const buttons = Math.min(3, Math.max(1, dv.getInt32(4, true) + 1)), maxLength = dv.getUint16(0x20, true) || 256;
+      const str = (read, o, n) => { let s = ''; for (let i = 0; i < n; i++) { const c = read(o + i * 2); if (!c) break; s += String.fromCharCode(c); } return s; };
+      const sharedByte = (o) => (o >= 0 && o < block.size ? block.pages[o >>> 12][o & 0xFFF] : 0);
+      const hint = str((o) => dv.getUint16(o, true), 0x90, 64);
+      const initOff = dv.getInt32(0x120, true);
+      const initial = initOff >= 0 ? str((o) => sharedByte(o) | (sharedByte(o + 1) << 8), initOff, maxLength) : '';
+      let text = this.emu.onKeyboard({ hint, maxLength, initial });
+      let result;
+      if (text === null || text === undefined) { text = ''; result = buttons === 1 ? 0 : buttons === 2 ? 1 : 3; } // cancel (left button)
+      else { text = String(text).slice(0, maxLength); result = buttons === 1 ? 0 : buttons === 2 ? 2 : 5; } // OK (right button)
+      for (let i = 0; i <= text.length && (i + 1) * 2 <= block.size; i++) {
+        const c = i < text.length ? text.charCodeAt(i) : 0, o = i * 2;
+        block.pages[o >>> 12][o & 0xFFF] = c & 0xFF; block.pages[(o + 1) >>> 12][(o + 1) & 0xFFF] = c >> 8;
+      }
+      dv.setInt32(0x138, result, true);
+      dv.setUint32(0x144, 0, true);
+      dv.setUint16(0x148, text.length, true);
+      this.emu.log(`APT: software keyboard ${hex(applet, 3)}: ${text ? `entered "${text}"` : 'cancelled or empty'}`);
+      this.sendToApp({ sender: applet, signal: 0xA, buffer: cfg, object: null });
+      return true;
+    }
+
+    appletStart(applet, buffer, block) {
+      this.preloaded = 0; // it closes straight away (below)
+      if ((applet & 0xFF) === 1 && this.keyboard(applet, buffer, block)) return;
       const name = this.appletNames[applet] || 'applet';
       let detail = '';
       if ((applet & 0xFF) === 6 && buffer.length >= 8) { // error/EULA config: type, error code, ..., text at 0xC
@@ -235,12 +266,13 @@
           if (dstApp === 0x101 && this.jumpingHome) this.emu.requestLaunch({ home: true });
           return true;
         }
-        case 0x16: this.preloaded = ipc.get(1); ipc.reply(id, [0]); return true; // PreloadLibraryApplet(appId)
-        case 0x17: case 0x18: ipc.reply(id, [0]); return true; // FinishPreloading/PrepareToStart library applet
+        case 0x16: case 0x18: this.preloaded = ipc.get(1); ipc.reply(id, [0]); return true; // Preload/PrepareToStart library applet(appId)
+        case 0x17: ipc.reply(id, [0]); return true; // FinishPreloadingLibraryApplet
         case 0x1E: { // StartLibraryApplet(appId, size, handle, buffer)
           const applet = ipc.get(1), size = ipc.get(2), buf = size ? this.mem.readBytes(ipc.get(6), size) : new Uint8Array(0);
+          const block = k.getObj(ipc.get(4)); // shared memory (the keyboard's text)
           ipc.reply(id, [0]);
-          this.appletStart(applet, buf);
+          this.appletStart(applet, buf, block instanceof EMU.KMemBlock ? block : null);
           return true;
         }
         case 0x3B: // CancelLibraryApplet: the preloaded applet closes, waking the title (WakeupByCancel)

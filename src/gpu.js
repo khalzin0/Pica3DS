@@ -1949,7 +1949,7 @@ ${code}
 
     // Write back copied render targets and drop textures that alias them.
     flushTargets() {
-      if (this.gl) { this.gl.flush(); return; }
+      if (this.gl) { this.gl.flush(); this.gl.listDone(); return; }
       const st = this.state;
       if (!st || !st.drawn) return;
       st.drawn = false;

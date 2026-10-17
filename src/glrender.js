@@ -752,6 +752,8 @@ void main() {
       const filled = s.fill;
       s.fill = null;
       if (s.kind === 'color') {
+        // What memory held, so that writing back skips the pixels no draw changed (see writeBack)
+        s.base = u8.slice(base, base + s.bytes);
         // Every pixel the same (always after a fill that lines up): a clear instead of an upload
         let same = true;
         if (!filled) for (let o = base + bpp; o < base + s.bytes && same; o += bpp) for (let k = 0; k < bpp; k++) if (u8[o + k] !== u8[base + k]) { same = false; break; }
@@ -834,9 +836,19 @@ void main() {
       return this.scratch.subarray(0, n);
     }
 
+    // End of a command list: small render targets (drawn into to make textures: icons, Mii faces, ...) go back to
+    // memory now, where the GPU's pixels would be by now; the game may free and reuse that memory right after,
+    // and a late write-back would then overwrite it (Mii Maker's heap). Large ones (the screens) stay on the host
+    // GPU until something reads them, which keeps frames fast.
+    listDone() {
+      for (const s of this.surfaces) if (s.dirty && s.kind === 'color' && s.w * s.h <= 128 * 128) this.writeBack(s);
+    }
+
     // Graphics card -> memory
     writeBack(s) {
       s.dirty = false;
+      const rect = s.drawnRect || { x0: 0, y0: 0, x1: s.w, y1: s.h }; // what was drawn (see drawn)
+      s.drawnRect = null;
       if (s.kind === 'linear') { this.writeBackLinear(s); return; }
       if (s.kind !== 'color') { this.warn('depthread', 'GPU (WebGL): depth buffers are not copied back to memory'); return; }
       const sp = this.span(s);
@@ -848,22 +860,39 @@ void main() {
       gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
       // One loop per format; pixels are read as 32-bit words (R, G, B, A bytes)
       const p32 = new Uint32Array(px.buffer, px.byteOffset, w * h), fmt = s.fmt, tilesX = w >> 3;
+      // Only pixels that differ from what was loaded from memory are written: like the GPU, which writes only what
+      // it draws. Memory the game reused in the meantime keeps its new bytes (Mii Maker keeps heap data past the
+      // part of a render target it draws in)
+      const prev = s.base && s.base.length === s.bytes ? s.base : new Uint8Array(s.bytes).fill(0xA5);
+      if (!s.base) s.base = prev;
+      const prev32 = fmt === 0 ? new Uint32Array(prev.buffer, prev.byteOffset, s.bytes >> 2) : null;
       const out32 = fmt === 0 && !((u8.byteOffset + base) & 3) ? new Uint32Array(u8.buffer, u8.byteOffset + base, s.bytes >> 2) : null;
-      for (let y = 0; y < h; y++) {
+      for (let y = rect.y0; y < rect.y1; y++) {
         const row = h - 1 - y, rowTile = (row >> 3) * tilesX, m = (row & 7) * 8;
-        for (let x = 0, p = y * w; x < w; x++, p++) {
+        for (let x = rect.x0, p = y * w + rect.x0; x < rect.x1; x++, p++) {
           const i = ((rowTile + (x >> 3)) << 6) + MORTON[m + (x & 7)], v = p32[p];
           if (fmt === 0) {
             const word = ((v & 255) << 24 | ((v >>> 8) & 255) << 16 | ((v >>> 16) & 255) << 8 | (v >>> 24)) >>> 0; // A, B, G, R in memory
+            if (prev32[i] === word) continue;
+            prev32[i] = word;
             if (out32) out32[i] = word; else { const o = base + i * 4; u8[o] = word; u8[o + 1] = word >>> 8; u8[o + 2] = word >>> 16; u8[o + 3] = word >>> 24; }
             continue;
           }
           const r = v & 255, g = (v >>> 8) & 255, b = (v >>> 16) & 255, a = v >>> 24;
-          if (fmt === 1) { const o = base + i * 3; u8[o] = b; u8[o + 1] = g; u8[o + 2] = r; continue; }
-          const o = base + i * 2;
+          if (fmt === 1) {
+            const q = i * 3;
+            if (prev[q] === b && prev[q + 1] === g && prev[q + 2] === r) continue;
+            prev[q] = b; prev[q + 1] = g; prev[q + 2] = r;
+            const o = base + q; u8[o] = b; u8[o + 1] = g; u8[o + 2] = r;
+            continue;
+          }
           const c = fmt === 2 ? ((r >> 3) << 11) | ((g >> 3) << 6) | ((b >> 3) << 1) | (a >> 7)
             : fmt === 3 ? ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
               : ((r >> 4) << 12) | ((g >> 4) << 8) | ((b >> 4) << 4) | (a >> 4);
+          const q = i * 2;
+          if ((prev[q] | (prev[q + 1] << 8)) === c) continue;
+          prev[q] = c; prev[q + 1] = c >> 8;
+          const o = base + q;
           u8[o] = c; u8[o + 1] = c >> 8;
         }
       }
@@ -905,7 +934,7 @@ void main() {
       let dst = this.surfaces.find((x) => x.kind === 'linear' && x.phys === dstPhys && x.w === outW && x.h === outH && x.fmt === outFmt);
       for (const o of this.surfaces) { // anything else held for the destination memory is replaced
         if (o === dst || o === src || o.phys >= dstPhys + bytes || o.phys + o.bytes <= dstPhys) continue;
-        o.dirty = false; o.stale = true;
+        o.dirty = false; o.stale = true; o.drawnRect = null;
       }
       const gl = this.gl;
       if (!dst) {
@@ -1042,7 +1071,7 @@ void main() {
           this.writeBack(s);
           if (saved) mem.writeBytes(virt, saved);
         }
-        s.dirty = false; s.stale = true;
+        s.dirty = false; s.stale = true; s.drawnRect = null;
         // A fill covering the whole surface with a pattern that lines up with its pixels: every pixel is the same
         const covers = fill && s.phys >= phys && s.phys + s.bytes <= phys + size;
         s.fill = covers && s.bpp % fill.bytes === 0 && (s.phys - phys) % fill.bytes === 0 ? fill : null;
@@ -1208,7 +1237,20 @@ void main() {
 
     // Mark what a draw wrote
     drawn(st, p) {
-      if (p.color && p.cm) p.color.dirty = true;
+      if (p.color && p.cm) {
+        const s = p.color;
+        s.dirty = true;
+        // The part draws can reach (viewport and scissor): only that goes back to memory. A game may declare a
+        // render target larger than its buffer and draw in part of it; the GPU never writes the rest (Mii Maker:
+        // writing it all overwrote its heap)
+        let x0 = st.offX, y0 = st.offY, x1 = st.offX + st.halfW * 2, y1 = st.offY + st.halfH * 2;
+        if (st.scissor === 3) { x0 = Math.max(x0, st.sx0); y0 = Math.max(y0, st.sy0); x1 = Math.min(x1, st.sx1 + 1); y1 = Math.min(y1, st.sy1 + 1); }
+        const r = [x0, y0, x1, y1].every(Number.isFinite)
+          ? { x0: Math.max(0, Math.floor(x0)), y0: Math.max(0, Math.floor(y0)), x1: Math.min(s.w, Math.ceil(x1)), y1: Math.min(s.h, Math.ceil(y1)) }
+          : { x0: 0, y0: 0, x1: s.w, y1: s.h };
+        const d = s.drawnRect;
+        s.drawnRect = d ? { x0: Math.min(d.x0, r.x0), y0: Math.min(d.y0, r.y0), x1: Math.max(d.x1, r.x1), y1: Math.max(d.y1, r.y1) } : r;
+      }
       if (p.depth && (st.depthWrite || (st.stencil && st.stencilWriteMask))) p.depth.dirty = true;
     }
 
