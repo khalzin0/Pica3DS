@@ -128,6 +128,7 @@
   .hud { z-index: 2; }
   .hud { position: absolute; top: 14px; left: 14px; padding: 3px 8px; border-radius: 6px; background: rgba(0,0,0,.6); color: #fff; font: 600 12px/1.3 ui-monospace, Consolas, monospace; pointer-events: none; font-variant-numeric: tabular-nums; }
   .hud[hidden] { display: none; }
+  .shader-note { top: auto; bottom: 14px; font-weight: 500; }
 
   /* Welcome / error card over the screens */
   .overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(8, 9, 12, .72); backdrop-filter: blur(6px); z-index: 1; }
@@ -342,6 +343,7 @@
       <div class="screen top">
         <canvas id="top" width="400" height="240"></canvas>
         <div class="hud" id="hud" hidden></div>
+        <div class="hud shader-note" id="shader-note" hidden></div>
       </div>
       <div class="hinge"></div>
       <div class="screen bottom">
@@ -454,6 +456,7 @@
         </div>
         <div class="field"><label for="smooth">Smooth scaling<small>Blend pixels instead of keeping them sharp</small></label><span class="switch"><input type="checkbox" id="smooth"><i></i></span></div>
         <div class="field"><label for="low-power">Low-power mode<small>For slower phones and tablets: the game still runs at full speed, but the screens update 30 times a second at a lower resolution, and the performance graph pauses</small></label><span class="switch"><input type="checkbox" id="low-power"><i></i></span></div>
+        <div class="field"><label for="async-shaders">Build shaders in the background<small>No stutter when a new effect first appears: it may be missing for a moment while its shader is built. Off: the game waits for each new shader</small></label><span class="switch"><input type="checkbox" id="async-shaders"><i></i></span></div>
         <div class="field"><label for="show-hud">FPS counter on screen</label><span class="switch"><input type="checkbox" id="show-hud"><i></i></span></div>
       </div>
       <div class="section">

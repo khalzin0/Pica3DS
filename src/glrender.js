@@ -30,6 +30,7 @@
   const HAS_ALPHA = [true, false, true, false, true];
   // Per vertex: window x, y, depth, w | color | uv0, uv1 | uv2, uv0 w, - | quaternion | view
   const VTX = 23;
+  const MAX_SKIP = 20; // frames a draw may be skipped while its shader is being built (see asyncShaders)
   const SEM = { QUAT: 4, COLOR: 8, UV0: 12, UV1: 14, UV0W: 16, VIEW: 18, UV2: 22 };
 
   const VERTEX_SHADER = `#version 300 es
@@ -421,6 +422,15 @@ void main() {
       this.shaderIds = 1;
       this.newPairs = [];             // [vertex source, fragment source] linked for the first time
       this.knownPairs = new Set();    // "vsId|fsId" already recorded or warmed
+      // Asynchronous shaders: asking whether a new shader has compiled waits for the driver to finish it, which
+      // freezes the page (the stutter when an effect first appears). Instead, a draw whose program is not built yet
+      // is skipped for a few frames while the driver builds it in the background (asked without waiting, with
+      // KHR_parallel_shader_compile; else given 2 frames). After MAX_SKIP frames it waits, so nothing stays missing.
+      this.asyncShaders = true;
+      this.frameNo = 0;
+      this.waiting = new Map();       // program key -> entry, still being built
+      this.shadersBuilt = 0;          // programs built (this session)
+      this.warm = null;               // { done, total } while the game's shader cache is being built
 
       this.vbo = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
@@ -555,7 +565,7 @@ void main() {
         const gl = this.gl, p = gl.createProgram();
         gl.attachShader(p, vs); gl.attachShader(p, fs);
         gl.linkProgram(p);
-        e = { prog: p, checked: false, key };
+        e = { prog: p, checked: false, key, frame: this.frameNo };
         this.programByPair.set(key, e);
       }
       return e;
@@ -567,11 +577,27 @@ void main() {
         const gl = this.gl;
         if (!gl.getProgramParameter(e.prog, gl.LINK_STATUS)) {
           this.programByPair.delete(e.key);
+          for (const sh of [vs, fs]) this.compile(sh === vs ? gl.VERTEX_SHADER : gl.FRAGMENT_SHADER, this.shaderInfo.get(sh).src);
           throw new Error(`GL link: ${gl.getProgramInfoLog(e.prog)}`);
         }
         e.checked = true;
+        this.shadersBuilt++;
+        this.waiting.delete(e.key);
       }
       return e.prog;
+    }
+
+    // Is this program built? Asked without waiting (see asyncShaders)
+    built(e) {
+      if (e.checked) return true;
+      if (this.parallelCompile) return !!this.gl.getProgramParameter(e.prog, 0x91B1); // COMPLETION_STATUS_KHR
+      return this.frameNo - e.frame >= 2;
+    }
+
+    // For the page: programs being built now, built so far, and the shader cache being built ({ done, total })
+    shaderStatus() {
+      for (const [key, e] of this.waiting) if (e.checked || this.frameNo - e.frame > MAX_SKIP + 2) this.waiting.delete(key);
+      return { compiling: this.waiting.size, built: this.shadersBuilt, warm: this.warm };
     }
 
     // Shader pairs linked since the last call, to keep for this game: [[vertex source, fragment source], ...]
@@ -582,6 +608,7 @@ void main() {
     warmShaders(pairs, done) {
       const gl = this.gl;
       let i = 0;
+      this.warm = { done: 0, total: pairs.length };
       const step = () => {
         const end = Math.min(pairs.length, i + (this.parallelCompile ? 40 : 6));
         for (; i < end; i++) {
@@ -589,8 +616,9 @@ void main() {
           try {
             const v = this.startShader(gl.VERTEX_SHADER, vsSrc), f = this.startShader(gl.FRAGMENT_SHADER, fsSrc);
             this.knownPairs.add(this.startLink(v.shader, f.shader).key);
-          } catch (e) { /* context lost: give up quietly */ return; }
+          } catch (e) { /* context lost: give up quietly */ this.warm = null; return; }
         }
+        this.warm = i < pairs.length ? { done: i, total: pairs.length } : null;
         if (i < pairs.length) setTimeout(step, 0); else if (done) done(pairs.length);
       };
       step();
@@ -1036,7 +1064,7 @@ void main() {
         st.textures.map((t) => t && [t.wrapS === 1, t.wrapT === 1, t.project]), lightKey(st.lighting)]);
       let f = this.fragShaders.get(key);
       if (!f) {
-        f = { key, shader: this.compile(this.gl.FRAGMENT_SHADER, genFragment(st)) };
+        f = { key, shader: this.startShader(this.gl.FRAGMENT_SHADER, genFragment(st)).shader };
         if (this.fragShaders.size > 2000) this.fragShaders.delete(this.fragShaders.keys().next().value);
         this.fragShaders.set(key, f);
       }
@@ -1044,12 +1072,17 @@ void main() {
       return f;
     }
 
-    // Linked program for a vertex shader ({ id, shader }; default: the one for CPU-processed vertices) and a state
+    // Linked program for a vertex shader ({ id, shader }; default: the one for CPU-processed vertices) and a state.
+    // Null while it is still being built (asyncShaders): the draw is skipped.
     program(st, vert = this.cpuVert) {
       const frag = this.fragmentShader(st), key = `${vert.id}|${frag.key}`;
       let p = this.programs.get(key);
       if (!p) {
         const gl = this.gl;
+        if (this.asyncShaders) {
+          const e = this.startLink(vert.shader, frag.shader);
+          if (!this.built(e) && this.frameNo - e.frame < MAX_SKIP) { this.waiting.set(e.key, e); this.stats.skipped = (this.stats.skipped || 0) + 1; return null; }
+        }
         const prog = this.link(vert.shader, frag.shader);
         const pairKey = `${this.shaderInfo.get(vert.shader).id}|${this.shaderInfo.get(frag.shader).id}`;
         if (!this.knownPairs.has(pairKey)) {
@@ -1126,6 +1159,7 @@ void main() {
 
     // Free GL textures of decoded textures the GPU cache dropped
     endFrame() {
+      this.frameNo++;
       if (this.count) this.flush();
       if (this.texObjects.size < 64) return;
       const live = new Set(this.gpu.texCache.values());
@@ -1189,7 +1223,9 @@ void main() {
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer(color || this.scratchColor(st.fbW, st.fbH), depth));
       this.updateLuts();
 
-      const p = this.program(st, vert), u = p.u;
+      const p = this.program(st, vert);
+      if (!p) return null; // its shader is still being built
+      const u = p.u;
       gl.useProgram(p.prog);
       const k = new Float32Array(24);
       st.tev.forEach((s, i) => k.set(s.konst, i * 4));
@@ -1274,7 +1310,7 @@ void main() {
       let v = byMap.get(mapKey);
       if (v === undefined) {
         const src = genVertexShader(gpu);
-        v = src ? { id: this.vertIds++, shader: this.compile(this.gl.VERTEX_SHADER, src) } : null;
+        v = src ? { id: this.vertIds++, shader: this.startShader(this.gl.VERTEX_SHADER, src).shader } : null;
         byMap.set(mapKey, v);
       }
       return v;

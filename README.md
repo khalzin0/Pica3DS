@@ -23,6 +23,28 @@ Open `index.html?demo` to start the demo automatically.
 
 **On a phone or tablet:** on-screen controls appear automatically (Circle Pad or D-Pad, A/B/X/Y, L/R, ZL/ZR, Start/Select), in portrait or landscape. For the most screen space, install it: *Add to Home Screen* on iPhone and iPad (Share menu), or *Install app* on Android. It then opens full screen like an app and works offline (the emulator's own files are cached; games stay on your device). Speed depends heavily on the phone; recent high-end phones do best. On slower phones, turn on **Settings → Low-power mode** (the game keeps full speed; the screens update 30 times a second at a lower resolution).
 
+## System requirements
+
+Pica3DS runs in the browser, so nothing is installed, but the device does the emulation. Emulation runs on one thread, so **single-core CPU speed matters most**; extra cores help little. These are estimates: only some devices have been tested, and big 3D games need more than homebrew, the HOME Menu and system apps.
+
+| | Minimum (lighter games, homebrew, system apps; may run below full speed) | Recommended (full speed in most of what works) |
+|---|---|---|
+| **Windows / Linux PC** | Intel Core i5 4th gen or Ryzen 3 1200, 4 GB RAM, a GPU with WebGL 2 | Intel Core i5 10th gen or Ryzen 5 3600 or newer, 8 GB RAM, any GPU from the last 6–7 years |
+| **Mac** | Intel Mac from 2015, 4 GB RAM | Apple M1 or newer, 8 GB RAM |
+| **Chromebook** | Intel Core i3 / recent MediaTek Kompanio, 4 GB RAM | Intel Core i5 or better, 8 GB RAM |
+| **Android phone or tablet** | Snapdragon 855 / Tensor G1 / Dimensity 1000 class, 4 GB RAM, Android 10 | Snapdragon 8 Gen 1 or newer (or equal), 8 GB RAM |
+| **iPhone / iPad** | iPhone XS / iPad (8th gen) with A12, iOS 16.4 | iPhone 13 / iPad Air (M1) or newer |
+| **Browser** | Latest Chrome, Edge, Brave, Firefox or Safari 16.4+ | Chrome, Edge or Brave (fastest JavaScript engine in testing); Safari on Apple devices |
+| **Graphics** | WebGL 2 (without it, a much slower software renderer is used) | WebGL 2 with `KHR_parallel_shader_compile` (most desktop browsers): shaders build in the background |
+| **Storage (browser data)** | About 300 MB free for saves, save states and shader caches | About 1 GB free if you add your console's system files (about 175 MB) and keep many save states |
+
+Notes:
+
+- **Memory:** the emulated 3DS memory alone takes 128–320 MB, plus the game and its textures. Browsers on phones with 2–3 GB of RAM may reload the tab.
+- **iPhone and iPad:** Safari limits the memory one tab can use, so very large games or the WebAssembly CPU option may fail on older models.
+- **Slower devices:** turn on **Settings → Low-power mode**, and keep **Build shaders in the background** on.
+- **Graphics device:** Settings shows which GPU the browser uses. A laptop with two GPUs may need the browser set to use the faster one (Windows: Settings → Display → Graphics).
+
 ## Status
 
 | Works | Partly works | Not yet |
@@ -45,7 +67,7 @@ Open `index.html?demo` to start the demo automatically.
 | Kernel (HLE) | `src/kernel.js` | Threads with a priority scheduler, mutexes, semaphores, events, timers, address arbiters, shared memory, and heap/linear memory (old and new linear heap layouts) |
 | 3D GPU | `src/gpu.js` | PICA200 in software: command lists, vertex and geometry shaders, clipping, rasterizer, all 14 texture formats including ETC1, texture combiners, fragment lighting, fog, and the output merger. This is also the reference the WebGL renderer is checked against |
 | Audio (HLE) | `src/audio.js` | The DSP's audio pipeline: reads the voices the game sets up in DSP shared memory, plays their buffer queues (PCM8, PCM16, DSP-ADPCM), resamples, mixes with the game's gains and reports playback status back. The browser plays it as scheduled buffers, time-stretched (WSOLA) when the game runs below full speed so the pitch stays right |
-| WebGL renderer | `src/glrender.js` | Draws with your graphics card: vertex shaders translated to GLSL, texture combiners, lighting and fog as generated fragment shaders, render targets kept on the graphics card and copied to emulated memory only when something reads them, display transfers without copies, and both screens drawn straight onto the page (no WebGL-to-2D-canvas copies, which are slow in Safari). A per-game shader cache is kept in the browser and built in the background when the game starts again, so effects do not stutter the first time they appear |
+| WebGL renderer | `src/glrender.js` | Draws with your graphics card: vertex shaders translated to GLSL, texture combiners, lighting and fog as generated fragment shaders, render targets kept on the graphics card and copied to emulated memory only when something reads them, display transfers without copies, and both screens drawn straight onto the page (no WebGL-to-2D-canvas copies, which are slow in Safari). A per-game shader cache is kept in the browser and built in the background when the game starts again. New shaders are also built in the background while the game runs (a draw is skipped for a moment instead of freezing the page; **Settings → Build shaders in the background**), and the top screen shows "Compiling shaders…" or "Building shader cache" while it happens |
 | Services (HLE) | `src/services.js` | `srv:`, `APT` (parameters, shared font, library applets), `gsp::Gpu`, `hid`, `fs` (RomFS, save data, extra data, SD card), `dsp` (with `src/audio.js`), `y2r:u` (YUV to RGB for video), `mic:u` (silence), `ldr:ro` (code modules), `cfg`, `ptm`, `err:f`. Other services are stubbed |
 | System data | `src/sysdata.js` | RomFS builder, plus stand-ins for missing system data (Mii data, system fonts, bad word list) and an empty archive for any other |
 | Loader | `src/loader.js` | `.3dsx`, ARM ELF, and decrypted `.3ds`/`.cci` (NCSD), `.cxi` (NCCH) and `.cia` (installable titles: the main program is taken from content 0), including compressed code and RomFS. Decryption is judged by the contents, so dumps whose header still says "encrypted" load too. Games over 256 MB (up to 4 GB cartridges) are not read whole: the code is loaded and game data is read from the file in 1 MB chunks as the game asks for it |

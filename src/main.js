@@ -289,6 +289,27 @@
   let useGL = !!glRenderer && store.get('renderer', 'webgl') !== 'software';
   function applyRenderer() { emu.setRenderer(useGL && glRenderer ? glRenderer : null); }
 
+  // Shaders built in the background (see GLRenderer.asyncShaders), and a note on the top screen while shaders are
+  // being built, like other emulators show
+  let asyncShaders = store.get('async-shaders', '1') === '1', shaderNoteUntil = 0, shaderNoteTick = 0;
+  $('async-shaders').checked = asyncShaders;
+  if (glRenderer) glRenderer.asyncShaders = asyncShaders;
+  $('async-shaders').addEventListener('change', () => {
+    asyncShaders = $('async-shaders').checked;
+    store.set('async-shaders', asyncShaders ? '1' : '0');
+    if (glRenderer) glRenderer.asyncShaders = asyncShaders;
+  });
+  function updateShaderNote(now) {
+    if (++shaderNoteTick % 6) return;
+    const gl = emu.loaded && !emu.halted && emu.gpu && emu.gpu.gl, note = $('shader-note');
+    const s = gl && gl.shaderStatus();
+    let text = '';
+    if (s && s.warm) text = `Building shader cache ${s.warm.done}/${s.warm.total}…`;
+    else if (s && s.compiling) text = `Compiling shaders… ${s.compiling}`;
+    if (text) { note.textContent = text; shaderNoteUntil = now + 600; } // kept a moment, so it doesn't flicker
+    note.hidden = !text && now > shaderNoteUntil;
+  }
+
   // Compilers for ARM code, shaders and rasterization (on by default; off = interpreters, same output, slower)
   let useJit = store.get('jit', '1') !== '0';
   // Low-power mode: present every other frame, lower display resolution, no performance graph
@@ -1263,8 +1284,9 @@
     $('speed').textContent = running ? speed + '%' : '–';
     setTone($('stat-fps'), running ? fps : 60, 57, 40);
     setTone($('stat-speed'), running ? speed : 100, 95, 70);
+    const sh = emu.gpu && emu.gpu.gl && emu.gpu.gl.shaderStatus();
     $('perf').textContent = n
-      ? `${avg.toFixed(1)} ms average, ${p95.toFixed(1)} ms 95th percentile (budget 16.7 ms). ${stat.cpu > 0 ? (stat.insns / stat.cpu / 1000).toFixed(0) : '–'} million ARM instructions per second.`
+      ? `${avg.toFixed(1)} ms average, ${p95.toFixed(1)} ms 95th percentile (budget 16.7 ms). ${stat.cpu > 0 ? (stat.insns / stat.cpu / 1000).toFixed(0) : '–'} million ARM instructions per second.${sh ? ` Shaders: ${sh.built} built${sh.compiling ? `, ${sh.compiling} compiling` : ''}.` : ''}`
       : running ? '' : 'Start a game to see performance.';
     const parts = { cpu: stat.cpu / Math.max(1, n), gpu: stat.gpu / Math.max(1, n), xfer: stat.xfer / Math.max(1, n), present: stat.present / Math.max(1, stat.presents) };
     for (const k in parts) {
@@ -1276,6 +1298,7 @@
 
   function loop(now) {
     requestAnimationFrame(loop);
+    updateShaderNote(now);
     const gap = now - lastRaf; lastRaf = now;
     if (gap > 4 && gap < 100) rafMs += (gap - rafMs) * 0.05;
     if (now - stat.time >= 500) showStats(now);
