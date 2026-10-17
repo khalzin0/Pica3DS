@@ -466,11 +466,13 @@
 
   // Shader cache: the GPU shaders each game uses are kept, and built in the background when it starts again
   let shaderList = [], shaderKey = null, shaderSaved = 0;
+  // Kept per shader generator version: shaders saved by an older version are not built again for nothing
+  const SHADER_CACHE = 'v4:';
   function loadShaderCache(key, gen) {
     shaderList = []; shaderKey = key; shaderSaved = 0;
     const cur = emu.gpu && emu.gpu.gl;
     if (cur) { cur.takeShaderPairs(); cur.knownPairs.clear(); } // what is recorded from now on is this game's
-    dbGet('shaders', key).then((list) => {
+    dbGet('shaders', SHADER_CACHE + key).then((list) => {
       if (emu.loadGeneration !== gen || !Array.isArray(list)) return;
       shaderList = list.concat(shaderList); shaderSaved = list.length;
       const gl = emu.gpu && emu.gpu.gl;
@@ -483,7 +485,7 @@
     const fresh = gl.takeShaderPairs();
     if (fresh.length) shaderList.push(...fresh);
     if (shaderList.length > 4000) shaderList = shaderList.slice(-4000);
-    if (shaderList.length !== shaderSaved) { shaderSaved = shaderList.length; dbPut('shaders', shaderKey, shaderList.slice()); }
+    if (shaderList.length !== shaderSaved) { shaderSaved = shaderList.length; dbPut('shaders', SHADER_CACHE + shaderKey, shaderList.slice()); }
   }, 8000);
 
   const SLOTS = 4;
@@ -1229,11 +1231,43 @@
   // than skipping emulated work.
   // The ~12 ms budget grows when the display gives the page fewer animation frames (iOS Low Power Mode: 30 a
   // second), so two emulated frames per animation frame still fit there.
+  // Display-synced pacing: when the display refreshes at a multiple of 60 Hz (60, 120, 240 Hz), time is counted in
+  // refreshes instead of milliseconds, n refreshes per emulated frame. Every frame then lands on a refresh: on a
+  // millisecond clock, 59.83 Hz against 60 Hz leaves a refresh without a new frame every few seconds (a hitch), and a
+  // game that does all its work every other frame (30 FPS games) gets its frames paired unevenly. The game runs 0.3%
+  // faster than a 3DS, which nobody can tell (the sound adjusts). Other refresh rates (75, 144 Hz) keep the clock.
   const FRAME_MS = 1000 / 59.83, CATCH_UP_MS = 12;
   let lastTime = performance.now(), acc = 0, lastRaf = 0, rafMs = 1000 / 60;
+  // The refresh interval: a low percentile of recent gaps between animation frames (a long emulated frame makes
+  // the page miss refreshes, which must not read as a slower display)
+  const rafGaps = []; let refreshMs = 1000 / 60, gapTick = 0;
+  function refreshesPerFrame() {
+    const k = FRAME_MS / refreshMs, n = Math.round(k);
+    return n >= 1 && Math.abs(k - n) < 0.03 * n ? n : 0; // 0: not a multiple of 60 Hz
+  }
   // Telemetry since the last stats update
   const stat = { time: performance.now(), frames: 0, presents: 0, insns: 0, cpu: 0, gpu: 0, xfer: 0, present: 0, frameMs: [] };
-  const history = []; // recent frame times (ms) for the graph
+  // The graph: time between new pictures the game shows (like other emulators): steady when the game is smooth,
+  // whatever its frame rate, and a spike for each stutter. (How long each emulated frame takes to compute varies
+  // a lot by itself: games that run at 30 FPS do their work every other frame.)
+  const history = []; // { t: when shown, ms: time since the previous new picture }
+  let lastPictures = -1, lastPictureTime = 0, picCount = 0;
+  function notePicture(now) {
+    const gsp = emu.services && emu.services.instances.get('gsp::Gpu');
+    const n = gsp ? gsp.pictures || 0 : 0;
+    if (n === lastPictures) return;
+    if (lastPictures >= 0 && lastPictureTime && now - lastPictureTime < 1000) { history.push({ t: now, ms: now - lastPictureTime }); if (history.length > 240) history.shift(); }
+    lastPictures = n; lastPictureTime = now; picCount++;
+  }
+  // Pacing figures over the graph's pictures: median, 95th percentile, worst; a stutter is a picture shown more
+  // than 1.5 times the usual gap after the previous one (and over 20 ms)
+  function pacing() {
+    if (history.length < 4) return null;
+    const ms = history.map((h) => h.ms).sort((a, b) => a - b), at = (q) => ms[Math.min(ms.length - 1, Math.floor(ms.length * q))];
+    const med = at(0.5), t = performance.now();
+    const stutters = history.filter((h) => t - h.t < 10000 && h.ms > Math.max(20, med * 1.5)).length;
+    return { med, p95: at(0.95), max: ms[ms.length - 1], stutters };
+  }
 
   function present() {
     const t0 = performance.now();
@@ -1256,19 +1290,49 @@
     stat.presents++;
   }
 
+  // Frame pacing graph: one line, newest on the right; the scale grows to fit spikes (at least 50 ms); dashed
+  // guides at 60 and 30 FPS; a dot on each stutter. Hovering shows the value under the pointer.
+  let graphScale = 50;
+  const cssVar = (n, f) => getComputedStyle(document.body).getPropertyValue(n).trim() || f;
+  const GX = 4; // graph side padding (canvas pixels)
   function drawGraph() {
-    const c = $('graph'), g = c.getContext('2d'), W = c.width, H = c.height;
+    const c = $('graph'), g = c.getContext('2d'), W = c.width, H = c.height, top = 8, bottom = 8;
     g.clearRect(0, 0, W, H);
-    const maxMs = 40, y = (ms) => H - Math.min(ms, maxMs) / maxMs * (H - 6) - 3;
-    g.strokeStyle = 'rgba(141,149,168,.35)'; g.setLineDash([6, 6]); g.lineWidth = 2;
-    g.beginPath(); g.moveTo(0, y(16.7)); g.lineTo(W, y(16.7)); g.stroke(); g.setLineDash([]);
-    g.fillStyle = 'rgba(141,149,168,.8)'; g.font = '20px system-ui'; g.fillText('16.7 ms', 8, y(16.7) - 8);
+    const peak = history.reduce((m, h) => Math.max(m, h.ms), 0);
+    graphScale = Math.min(200, Math.max(50, Math.ceil(peak / 25) * 25));
+    const y = (ms) => H - bottom - Math.min(ms, graphScale) / graphScale * (H - top - bottom);
+    const muted = cssVar('--muted', '#8d95a8'), accent = cssVar('--accent', '#ff3b57');
+    g.lineWidth = 1.5; g.setLineDash([5, 6]); g.strokeStyle = muted; g.globalAlpha = 0.5;
+    g.font = '18px system-ui'; g.fillStyle = muted;
+    for (const [ms, label] of [[16.7, '60 FPS · 16.7 ms'], [33.3, '30 FPS · 33.3 ms']]) {
+      g.beginPath(); g.moveTo(GX, y(ms)); g.lineTo(W - GX, y(ms)); g.stroke();
+      g.fillText(label, GX + 6, y(ms) - 6);
+    }
+    g.setLineDash([]); g.globalAlpha = 1;
+    g.textAlign = 'right'; g.fillText(`${graphScale} ms`, W - GX - 6, top + 14); g.textAlign = 'left';
     if (history.length < 2) return;
-    const dx = W / (240 - 1);
+    const dx = (W - 2 * GX) / (240 - 1), x = (i) => W - GX - (history.length - 1 - i) * dx;
     g.beginPath();
-    history.forEach((ms, i) => { const px = W - (history.length - 1 - i) * dx; if (i) g.lineTo(px, y(ms)); else g.moveTo(px, y(ms)); });
-    g.strokeStyle = '#ff3b57'; g.lineWidth = 3; g.stroke();
+    history.forEach((h, i) => { if (i) g.lineTo(x(i), y(h.ms)); else g.moveTo(x(i), y(h.ms)); });
+    g.strokeStyle = accent; g.lineWidth = 2.5; g.lineJoin = 'round'; g.stroke();
+    const p = pacing();
+    if (p) {
+      g.fillStyle = accent;
+      history.forEach((h, i) => { if (h.ms > Math.max(20, p.med * 1.5)) { g.beginPath(); g.arc(x(i), y(h.ms), 5, 0, Math.PI * 2); g.fill(); } });
+    }
   }
+  $('graph').addEventListener('pointermove', (e) => {
+    const c = $('graph'), r = c.getBoundingClientRect(), tip = $('graph-tip');
+    if (history.length < 2) { tip.hidden = true; return; }
+    const px = (e.clientX - r.left) / r.width * c.width, dx = (c.width - 2 * GX) / (240 - 1);
+    const i = Math.round(history.length - 1 - (c.width - GX - px) / dx);
+    if (i < 0 || i >= history.length) { tip.hidden = true; return; }
+    const h = history[i];
+    tip.textContent = `${h.ms.toFixed(1)} ms · ${((performance.now() - h.t) / 1000).toFixed(1)} s ago`;
+    tip.style.left = `${Math.min(Math.max(e.clientX - r.left, 70), r.width - 70)}px`;
+    tip.hidden = false;
+  });
+  $('graph').addEventListener('pointerleave', () => { $('graph-tip').hidden = true; });
 
   function setTone(el, value, good, ok) { el.classList.toggle('good', value >= good); el.classList.toggle('warn', value < good && value >= ok); el.classList.toggle('bad', value < ok); }
 
@@ -1276,27 +1340,53 @@
     const dt = now - stat.time, n = stat.frames;
     const ms = stat.frameMs.sort((a, b) => a - b);
     const avg = n ? ms.reduce((a, b) => a + b, 0) / n : 0, p95 = n ? ms[Math.min(n - 1, Math.floor(n * 0.95))] : 0;
-    const fps = n * 1000 / dt, speed = Math.round(fps / 59.83 * 100);
+    const fps = n * 1000 / dt, speed = Math.round(fps / 59.83 * 100), pics = picCount * 1000 / dt;
     const running = emu.loaded && !emu.halted && !paused;
     $('hud').textContent = running ? `${fps.toFixed(0)} FPS · ${speed}%` : paused ? 'Paused' : '';
-    if (panelOpen() && !$('pane-perf').hidden) showPerfPane(running, fps, speed, n, avg, p95, dt);
+    if (panelOpen() && !$('pane-perf').hidden) showPerfPane(running, fps, speed, n, avg, p95, dt, pics);
     Object.assign(stat, { time: now, frames: 0, presents: 0, insns: 0, cpu: 0, gpu: 0, xfer: 0, present: 0, frameMs: [] });
+    picCount = 0;
   }
 
-  function showPerfPane(running, fps, speed, n, avg, p95, dt) {
-    $('fps').textContent = running ? fps.toFixed(0) : '–';
-    $('host-fps').textContent = running ? (stat.presents * 1000 / dt).toFixed(0) : '–';
-    $('speed').textContent = running ? speed + '%' : '–';
+  function showPerfPane(running, fps, speed, n, avg, p95, dt, pics) {
+    const dash = '–';
+    $('fps').textContent = running ? fps.toFixed(0) : dash;
+    $('pics').textContent = running && pics ? pics.toFixed(0) : dash;
+    $('speed').textContent = running ? speed + '%' : dash;
     setTone($('stat-fps'), running ? fps : 60, 57, 40);
     setTone($('stat-speed'), running ? speed : 100, 95, 70);
-    const sh = emu.gpu && emu.gpu.gl && emu.gpu.gl.shaderStatus();
-    $('perf').textContent = n
-      ? `${avg.toFixed(1)} ms average, ${p95.toFixed(1)} ms 95th percentile (budget 16.7 ms). ${stat.cpu > 0 ? (stat.insns / stat.cpu / 1000).toFixed(0) : '–'} million ARM instructions per second.${sh ? ` Shaders: ${sh.built} built${sh.compiling ? `, ${sh.compiling} compiling` : ''}.` : ''}`
-      : running ? '' : 'Start a game to see performance.';
+    const p = running ? pacing() : null;
+    $('stutters').textContent = p ? String(p.stutters) : dash;
+    setTone($('stat-stutter'), p ? -p.stutters : 0, -1, -5); // 0-1 good, 2-5 fair, more: poor
+    $('pace-med').textContent = p ? p.med.toFixed(1) + ' ms' : dash;
+    $('pace-p95').textContent = p ? p.p95.toFixed(1) + ' ms' : dash;
+    $('pace-max').textContent = p ? p.max.toFixed(1) + ' ms' : dash;
     const parts = { cpu: stat.cpu / Math.max(1, n), gpu: stat.gpu / Math.max(1, n), xfer: stat.xfer / Math.max(1, n), present: stat.present / Math.max(1, stat.presents) };
     for (const k in parts) {
       $('bar-' + k).style.width = Math.min(100, parts[k] / 16.7 * 100) + '%';
-      $('val-' + k).textContent = n ? parts[k].toFixed(1) + ' ms' : '–';
+      $('val-' + k).textContent = n ? parts[k].toFixed(1) + ' ms' : dash;
+    }
+    const total = parts.cpu + parts.gpu + parts.xfer;
+    $('bar-total').style.width = Math.min(100, total / 16.7 * 100) + '%';
+    $('bar-total').parentElement.classList.toggle('over', n > 0 && total > 16.7);
+    $('val-total').textContent = n ? total.toFixed(1) + ' ms' : dash;
+    // Details
+    const dl = $('perf-details');
+    dl.textContent = '';
+    if (!emu.loaded) {
+      const dd = document.createElement('dd'); dd.textContent = 'Start a game to see performance.'; dl.append(dd);
+    } else {
+      const sh = emu.gpu && emu.gpu.gl && emu.gpu.gl.shaderStatus();
+      const nSync = refreshesPerFrame();
+      const rows = [
+        ['Emulating a frame', n ? `${avg.toFixed(1)} ms average, ${p95.toFixed(1)} ms for the slowest 5%` : dash],
+        ['ARM instructions', n && stat.cpu > 0 ? `${(stat.insns / stat.cpu / 1000).toFixed(0)} million per second` : dash],
+        ['Shaders', sh ? `${sh.built} built${sh.compiling ? `, ${sh.compiling} compiling` : ''}${sh.warm ? ` (cache ${sh.warm.done}/${sh.warm.total})` : ''}` : dash],
+        ['Screen updates', running ? `${(stat.presents * 1000 / dt).toFixed(0)} per second` : dash],
+        ['Display', `${Math.round(1000 / refreshMs)} Hz, ${nSync ? `frames timed to the display (every ${nSync === 1 ? 'refresh' : `${nSync} refreshes`})` : 'frames timed by the clock'}`],
+        ['Renderer', emu.gpu && emu.gpu.gl ? `Graphics card (WebGL)${glRenderer && glRenderer.parallelCompile ? ', background shader building' : ''}` : 'Software (CPU)'],
+      ];
+      for (const [k, v] of rows) { const t = document.createElement('dt'), d = document.createElement('dd'); t.textContent = k; d.textContent = v; dl.append(t, d); }
     }
     if (!lowPower) drawGraph();
   }
@@ -1306,13 +1396,18 @@
     updateShaderNote(now);
     const gap = now - lastRaf; lastRaf = now;
     if (gap > 4 && gap < 100) rafMs += (gap - rafMs) * 0.05;
+    if (gap > 2 && gap < 100) {
+      rafGaps.push(gap); if (rafGaps.length > 90) rafGaps.shift();
+      if (++gapTick % 30 === 0) { const sorted = rafGaps.slice().sort((a, b) => a - b); refreshMs = sorted[Math.floor(sorted.length * 0.25)]; }
+    }
     if (now - stat.time >= 500) showStats(now);
-    if (!emu.loaded || emu.halted || paused) { lastTime = now; return; }
-    acc += Math.min(now - lastTime, 250);
+    if (!emu.loaded || emu.halted || paused) { lastTime = now; lastPictureTime = 0; return; }
+    const elapsed = Math.min(now - lastTime, 250), n = refreshesPerFrame();
+    acc += n ? Math.max(1, Math.round(elapsed / refreshMs)) * FRAME_MS / n : elapsed; // synced: whole refreshes
     lastTime = now;
     let ran = 0;
     const t0 = performance.now();
-    while (acc >= FRAME_MS && !emu.halted) {
+    while (acc >= FRAME_MS - 1e-6 && !emu.halted) {
       updateInput();
       const insns = emu.insnCount;
       emu.runFrame();
@@ -1321,12 +1416,11 @@
       const p = emu.perf;
       stat.frames++; stat.insns += emu.insnCount - insns;
       stat.cpu += p.frame - p.gpu - p.xfer; stat.gpu += p.gpu; stat.xfer += p.xfer; stat.frameMs.push(p.frame);
-      history.push(p.frame); if (history.length > 240) history.shift();
       if (performance.now() - t0 > Math.max(CATCH_UP_MS, rafMs * 0.75)) break;
     }
     if (acc > FRAME_MS) acc = FRAME_MS; // behind: keep at most one frame due instead of building up a backlog
     audio.flush();
-    if (ran && (!lowPower || (presentTick++ & 1) === 0)) present();
+    if (ran && (!lowPower || (presentTick++ & 1) === 0)) { present(); notePicture(performance.now()); }
   }
   requestAnimationFrame(loop);
 

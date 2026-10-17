@@ -434,6 +434,9 @@
 
     vblank() {
       this.processGx();
+      // A new top-screen picture (new framebuffer info since the last vblank), taken now as the hardware does; the
+      // page times the pictures for its frame-time graph
+      if (this.threadId !== undefined && this.shared[0x200 + this.threadId * 0x80 + 1]) { this.pictures = (this.pictures || 0) + 1; this.screenInfo(0); }
       this.pushInterrupt(GSP_INT.VBLANK0);
       this.pushInterrupt(GSP_INT.VBLANK1);
     }
@@ -446,6 +449,7 @@
         case 0x5: { // SetBufferSwap(screen, FramebufferInfo)
           const screen = ipc.get(1) & 1;
           this.screens[screen] = this.parseInfo((i) => ipc.get(2 + i));
+          if (!screen) this.pictures = (this.pictures || 0) + 1;
           ipc.reply(id, [0]);
           return true;
         }

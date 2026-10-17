@@ -31,6 +31,9 @@
   // Per vertex: window x, y, depth, w | color | uv0, uv1 | uv2, uv0 w, - | quaternion | view
   const VTX = 23;
   const MAX_SKIP = 20; // frames a draw may be skipped while its shader is being built (see asyncShaders)
+  // With KHR_parallel_shader_compile the driver says when a shader is ready, so draws wait for it without freezing
+  // the page; this only bounds how long (10 s) in case a driver never reports it
+  const MAX_SKIP_PARALLEL = 600;
   const SEM = { QUAT: 4, COLOR: 8, UV0: 12, UV1: 14, UV0W: 16, VIEW: 18, UV2: 22 };
 
   const VERTEX_SHADER = `#version 300 es
@@ -263,12 +266,14 @@ ${c}}`;
 
   // ------------------------------------------------------------------ vertex shaders on the host GPU
   // PICA vertex programs are flattened for the current bool/int uniforms (EMU.flattenShaderBody) and written
-  // as GLSL. Registers: inputs v0-v15 are attributes, r[] temporaries, C[] float uniforms, o[] outputs.
+  // as GLSL. Registers: inputs v0-v15 are attributes, r0-r15 temporaries, C[] float uniforms, o0-o15 outputs.
+  // Registers are plain variables, not arrays: Direct3D (ANGLE on Windows) compiles arrays cleared in loops very
+  // slowly (over a second per shader in Super Mario 3D Land).
   function glslSrc(raw, sw, neg, offs, c) {
     const ch = 'xyzw'[sw[c]];
     let e;
     if (raw < 0x10) e = `v${raw}.${ch}`;
-    else if (raw < 0x20) e = `r[${raw - 0x10}].${ch}`;
+    else if (raw < 0x20) e = `r${raw - 0x10}.${ch}`;
     else if (typeof offs === 'number') {
       const i = raw + offs;
       if (i < 0x20 || i >= 0x80) return '0.0';
@@ -278,27 +283,50 @@ ${c}}`;
     return neg ? `(-${e})` : e;
   }
 
+  // A source read as a vector: the components listed (indices into its swizzle), e.g. "(-r3.zx)"; a constant
+  // out of range reads 0
+  function glslVec(raw, sw, neg, offs, comps) {
+    const n = comps.length, sz = comps.map((c) => 'xyzw'[sw[c]]).join('');
+    let e;
+    if (raw < 0x10) e = `v${raw}.${sz}`;
+    else if (raw < 0x20) e = `r${raw - 0x10}.${sz}`;
+    else if (typeof offs === 'number') {
+      const i = raw + offs;
+      if (i < 0x20 || i >= 0x80) return n === 1 ? '0.0' : `vec${n}(0.0)`;
+      e = `C[${i - 0x20}].${sz}`;
+    } else if (offs) e = `CR(${raw - 0x20} + ${offs}).${sz}`;
+    else e = `C[${raw - 0x20}].${sz}`;
+    return neg ? `(-${e})` : e;
+  }
+
   function glslOp(ins, offs) {
     const OP = EMU.SHADER_OP, d = ins.desc;
     const comps = d ? [0, 1, 2, 3].filter((c) => d.mask & (8 >> c)) : [];
-    const dst = (c) => `${ins.dst < 0x10 ? `o[${ins.dst}]` : `r[${ins.dst & 0xF}]`}.${'xyzw'[c]}`;
+    const dst = (c) => `${ins.dst < 0x10 ? `o${ins.dst}` : `r${ins.dst & 0xF}`}.${'xyzw'[c]}`;
     const s1 = (c, off) => glslSrc(ins.s1, d.sw1, d.n1, off, c), s2 = (c, off) => glslSrc(ins.s2, d.sw2, d.n2, off, c), s3 = (c, off) => glslSrc(ins.s3, d.sw3, d.n3, off, c);
     const o1 = ins.inv ? '' : offs, o2 = ins.inv ? offs : '';
     // Compute every component first, then write (the destination may also be a source)
     const assign = (vals) => `{ ${comps.map((c) => `float t${c} = ${vals(c)};`).join(' ')} ${comps.map((c) => `${dst(c)} = t${c};`).join(' ')} }\n`;
+    // Component-wise operations as one vector statement (a quarter of the code: shaders compile several times
+    // faster). The right side is computed before the write, so a destination that is also a source is fine.
+    const n = comps.length, mask = comps.map((c) => 'xyzw'[c]).join('');
+    const dstReg = ins.dst < 0x10 ? `o${ins.dst}` : `r${ins.dst & 0xF}`;
+    const v1 = (off) => glslVec(ins.s1, d.sw1, d.n1, off, comps), v2 = (off) => glslVec(ins.s2, d.sw2, d.n2, off, comps), v3 = (off) => glslVec(ins.s3, d.sw3, d.n3, off, comps);
+    const vec = (expr) => `${dstReg}.${mask} = ${expr};\n`;
     switch (ins.op) {
-      case OP.ADD: return comps.length ? assign((c) => `${s1(c, o1)} + ${s2(c, o2)}`) : '';
-      case OP.MUL: return comps.length ? assign((c) => `M(${s1(c, o1)}, ${s2(c, o2)})`) : '';
-      case OP.MAX: return comps.length ? assign((c) => `MX(${s1(c, o1)}, ${s2(c, o2)})`) : '';
-      case OP.MIN: return comps.length ? assign((c) => `MN(${s1(c, o1)}, ${s2(c, o2)})`) : '';
-      case OP.SGE: case OP.SGEI: return comps.length ? assign((c) => `(${s1(c, o1)} >= ${s2(c, o2)} ? 1.0 : 0.0)`) : '';
-      case OP.SLT: case OP.SLTI: return comps.length ? assign((c) => `(${s1(c, o1)} < ${s2(c, o2)} ? 1.0 : 0.0)`) : '';
+      case OP.ADD: return n ? vec(`${v1(o1)} + ${v2(o2)}`) : '';
+      case OP.MUL: return n ? vec(`M(${v1(o1)}, ${v2(o2)})`) : '';
+      case OP.MAX: return n ? vec(`MX(${v1(o1)}, ${v2(o2)})`) : '';
+      case OP.MIN: return n ? vec(`MN(${v1(o1)}, ${v2(o2)})`) : '';
+      case OP.SGE: case OP.SGEI: return n ? vec(`SGE(${v1(o1)}, ${v2(o2)})`) : '';
+      case OP.SLT: case OP.SLTI: return n ? vec(`SLT(${v1(o1)}, ${v2(o2)})`) : '';
       case OP.DP3: case OP.DP4: case OP.DPH: case OP.DPHI: {
-        if (!comps.length) return '';
-        const n = ins.op === OP.DP3 ? 3 : 4, h = ins.op === OP.DPH || ins.op === OP.DPHI;
-        const terms = [];
-        for (let c = 0; c < n; c++) terms.push(`M(${h && c === 3 ? '1.0' : s1(c, o1)}, ${s2(c, o2)})`);
-        return `{ float t = ${terms.join(' + ')}; ${comps.map((c) => `${dst(c)} = t;`).join(' ')} }\n`;
+        if (!n) return '';
+        const all = ins.op === OP.DP3 ? [0, 1, 2] : [0, 1, 2, 3], h = ins.op === OP.DPH || ins.op === OP.DPHI;
+        const a = h ? `vec4(${glslVec(ins.s1, d.sw1, d.n1, o1, [0, 1, 2])}, 1.0)` : glslVec(ins.s1, d.sw1, d.n1, o1, all);
+        const b = glslVec(ins.s2, d.sw2, d.n2, o2, all);
+        const sum = all.length === 3 ? 'p.x + p.y + p.z' : 'p.x + p.y + p.z + p.w';
+        return `{ vec${all.length} p = M(${a}, ${b}); float t = ${sum}; ${dstReg}.${mask} = ${n === 1 ? 't' : `vec${n}(t)`}; }\n`;
       }
       case OP.DST: case OP.DSTI:
         return comps.length ? assign((c) => [`1.0`, `M(${s1(1, o1)}, ${s2(1, o2)})`, s1(2, o1), s2(3, o2)][c]) : '';
@@ -312,8 +340,8 @@ ${c}}`;
           float t0 = max(x0, 0.0), t1 = clamp(x1, -127.9961, 127.9961), t2 = x2, t3 = max(x3, 0.0);
           cx = x0 > 0.0; cy = x3 > 0.0; ${comps.map((c) => `${dst(c)} = t${c};`).join(' ')} }\n`;
       }
-      case OP.FLR: return comps.length ? assign((c) => `floor(${s1(c, offs)})`) : '';
-      case OP.MOV: return comps.length ? assign((c) => s1(c, offs)) : '';
+      case OP.FLR: return n ? vec(`floor(${v1(offs)})`) : '';
+      case OP.MOV: return n ? vec(v1(offs)) : '';
       case OP.MOVA: {
         if (!(d.mask & 12)) return '';
         return `{ float x = ${s1(0, offs)}, y = ${s1(1, offs)};${d.mask & 8 ? ' a0x = int(trunc(x));' : ''}${d.mask & 4 ? ' a0y = int(trunc(y));' : ''} }\n`;
@@ -325,7 +353,7 @@ ${c}}`;
       case OP.MAD: case OP.MADI: {
         if (!comps.length) return '';
         const inv = ins.op === OP.MADI;
-        return assign((c) => `M(${s1(c, '')}, ${s2(c, inv ? '' : offs)}) + ${s3(c, inv ? offs : '')}`);
+        return vec(`M(${v1('')}, ${v2(inv ? '' : offs)}) + ${v3(inv ? offs : '')}`);
       }
       case OP.END: case OP.BREAK: case OP.BREAKC: case OP.CALL: case OP.CALLC: case OP.CALLU:
       case OP.IFU: case OP.IFC: case OP.LOOP: case OP.JMPC: case OP.JMPU: return null;
@@ -346,8 +374,10 @@ ${c}}`;
     const body = EMU.flattenShaderBody(vs, r[0x2BA] & 0xFFFF, GLSL_LANG);
     if (body === null) return null;
     const map = gpu.outputMap(r[0x2BD] & 0xFFFF);
-    let out = 'float S[24]; for (int i = 0; i < 24; i++) S[i] = 0.0; S[3] = 1.0;\n';
-    for (let k = 0; k < map.length; k += 2) out += `S[${map[k]}] = o[${map[k + 1] >> 2}].${'xyzw'[map[k + 1] & 3]};\n`;
+    // Output semantics (S0-S23) from the output map; position w defaults to 1
+    const S = Array.from({ length: 24 }, (_, i) => (i === 3 ? '1.0' : '0.0'));
+    for (let k = 0; k < map.length; k += 2) S[map[k]] = `o${map[k + 1] >> 2}.${'xyzw'[map[k + 1] & 3]}`;
+    const regs = (p) => Array.from({ length: 16 }, (_, i) => `${p}${i} = vec4(0.0)`).join(', ');
     let inputs = '';
     for (let i = 0; i < 16; i++) inputs += `layout(location = ${i}) in vec4 v${i};\n`;
     return `#version 300 es
@@ -357,26 +387,32 @@ ${inputs}
 uniform vec4 C[96];
 uniform vec2 uDepth; // PICA depth = scale * z / w + offset
 out vec4 vColor; out vec4 vUV01; out vec4 vUV2W; out vec4 vQuat; out vec3 vView;
-vec4 r[16]; vec4 o[16];
+vec4 ${regs('r')};
+vec4 ${regs('o')};
 int a0x = 0, a0y = 0;
 bool cx = false, cy = false;
-float M(float a, float b) { float p = a * b; return (p != p && a == a && b == b) ? 0.0 : p; } // 0 * inf = 0
+float M(float a, float b) { float p = a * b; return isnan(p) ? 0.0 : p; } // 0 * inf = 0 (one test: compiles fast)
 float MX(float a, float b) { return a > b ? a : b; }
 float MN(float a, float b) { return a < b ? a : b; }
-vec4 CR(int i) { return i >= 0 && i < 96 ? C[i] : vec4(0.0); }
+float SGE(float a, float b) { return a >= b ? 1.0 : 0.0; }
+float SLT(float a, float b) { return a < b ? 1.0 : 0.0; }
+${[2, 3, 4].map((k) => `vec${k} M(vec${k} a, vec${k} b) { vec${k} p = a * b; return mix(p, vec${k}(0.0), isnan(p)); }
+vec${k} MX(vec${k} a, vec${k} b) { return mix(b, a, greaterThan(a, b)); }
+vec${k} MN(vec${k} a, vec${k} b) { return mix(b, a, lessThan(a, b)); }
+vec${k} SGE(vec${k} a, vec${k} b) { return vec${k}(greaterThanEqual(a, b)); }
+vec${k} SLT(vec${k} a, vec${k} b) { return vec${k}(lessThan(a, b)); }`).join('\n')}
+vec4 CR(int i) { return C[clamp(i, 0, 95)] * float(uint(i) < 96u); } // out of range: 0 (no branch)
 void run() {
 ${body}}
 void main() {
-  for (int i = 0; i < 16; i++) { r[i] = vec4(0.0); o[i] = vec4(0.0); }
   run();
-  ${out}
   // Window depth equals the PICA depth value, and clipping matches its near/far planes for the usual setup
-  gl_Position = vec4(S[0], S[1], 2.0 * uDepth.x * S[2] + (2.0 * uDepth.y - 1.0) * S[3], S[3]);
-  vColor = min(abs(vec4(S[8], S[9], S[10], S[11])), vec4(1.0));
-  vUV01 = vec4(S[12], S[13], S[14], S[15]);
-  vUV2W = vec4(S[22], S[23], S[16], 0.0);
-  vQuat = vec4(S[4], S[5], S[6], S[7]);
-  vView = vec3(S[18], S[19], S[20]);
+  gl_Position = vec4(${S[0]}, ${S[1]}, 2.0 * uDepth.x * ${S[2]} + (2.0 * uDepth.y - 1.0) * ${S[3]}, ${S[3]});
+  vColor = min(abs(vec4(${S[8]}, ${S[9]}, ${S[10]}, ${S[11]})), vec4(1.0));
+  vUV01 = vec4(${S[12]}, ${S[13]}, ${S[14]}, ${S[15]});
+  vUV2W = vec4(${S[22]}, ${S[23]}, ${S[16]}, 0.0);
+  vQuat = vec4(${S[4]}, ${S[5]}, ${S[6]}, ${S[7]});
+  vView = vec3(${S[18]}, ${S[19]}, ${S[20]});
 }`;
   }
 
@@ -596,7 +632,7 @@ void main() {
 
     // For the page: programs being built now, built so far, and the shader cache being built ({ done, total })
     shaderStatus() {
-      for (const [key, e] of this.waiting) if (e.checked || this.frameNo - e.frame > MAX_SKIP + 2) this.waiting.delete(key);
+      for (const [key, e] of this.waiting) if (e.checked || this.frameNo - e.frame > MAX_SKIP_PARALLEL + 2) this.waiting.delete(key);
       return { compiling: this.waiting.size, built: this.shadersBuilt, warm: this.warm };
     }
 
@@ -928,8 +964,13 @@ void main() {
     displayTransfer(srcPhys, dstPhys, inW, inH, outW, outH, inFmt, outFmt, flags) {
       if (flags & 0xA) return false; // raw copies and tiled output
       if (this.count) this.flush();
-      const src = this.surfaces.find((x) => x.kind === 'color' && x.phys === srcPhys && x.w === inW && x.h === inH && !x.stale);
+      // The source: a render target held here, from its start or from a whole row of tiles into it (Super Mario 3D
+      // Land copies the bottom screen from 80 lines into its 400-line target); the rows read must be inside it
+      const rowsRead = Math.min(inH, outH << (((flags >> 24) & 3) === 2 ? 1 : 0));
+      const src = this.surfaces.find((x) => x.kind === 'color' && x.w === inW && !x.stale && srcPhys >= x.phys && srcPhys < x.phys + x.bytes
+        && (srcPhys - x.phys) % (x.w * x.bpp * 8) === 0 && (srcPhys - x.phys) / (x.w * x.bpp) + rowsRead <= x.h);
       if (!src || !src.dirty) return false; // memory already holds the pixels: the CPU copy is as good
+      const rowOff = (srcPhys - src.phys) / (src.w * src.bpp);
       const bpp = [4, 3, 2, 2, 2][outFmt] || 4, bytes = outW * outH * bpp;
       let dst = this.surfaces.find((x) => x.kind === 'linear' && x.phys === dstPhys && x.w === outW && x.h === outH && x.fmt === outFmt);
       for (const o of this.surfaces) { // anything else held for the destination memory is replaced
@@ -952,7 +993,7 @@ void main() {
       gl.activeTexture(gl.TEXTURE0); gl.bindSampler(0, null); gl.bindTexture(gl.TEXTURE_2D, src.tex);
       const scale = (flags >> 24) & 3;
       gl.uniform1i(this.uni(this.transferProg, 'uSrc'), 0);
-      gl.uniform4i(this.uni(this.transferProg, 'uIn'), inW, inH, src.h, scale === 2 ? 1 : 0);
+      gl.uniform4i(this.uni(this.transferProg, 'uIn'), inW, inH, src.h - rowOff, scale === 2 ? 1 : 0); // memory row r: y = h - 1 - r
       gl.uniform4i(this.uni(this.transferProg, 'uOut'), outW, outH, flags & 1, scale ? 1 : 0);
       gl.bindVertexArray(this.quadVao);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -1110,7 +1151,7 @@ void main() {
         const gl = this.gl;
         if (this.asyncShaders) {
           const e = this.startLink(vert.shader, frag.shader);
-          if (!this.built(e) && this.frameNo - e.frame < MAX_SKIP) { this.waiting.set(e.key, e); this.stats.skipped = (this.stats.skipped || 0) + 1; return null; }
+          if (!this.built(e) && this.frameNo - e.frame < (this.parallelCompile ? MAX_SKIP_PARALLEL : MAX_SKIP)) { this.waiting.set(e.key, e); this.stats.skipped = (this.stats.skipped || 0) + 1; return null; }
         }
         const prog = this.link(vert.shader, frag.shader);
         const pairKey = `${this.shaderInfo.get(vert.shader).id}|${this.shaderInfo.get(frag.shader).id}`;
@@ -1370,6 +1411,12 @@ void main() {
       if (!(st.halfW > 0 && st.halfH > 0)) return false;
       const vert = this.vertexShader(gpu);
       if (!vert) return false;
+      // Its program still being built: drawn with the vertices shaded on the CPU meanwhile (that program is quick to
+      // build), instead of missing until the driver is done
+      if (this.asyncShaders && !this.programs.has(`${vert.id}|${this.fragmentShader(st).key}`)) {
+        const e = this.startLink(vert.shader, this.fragmentShader(st).shader);
+        if (!this.built(e)) { this.waiting.set(e.key, e); return false; }
+      }
 
       const base = (r[0x200] & 0x1FFFFFFF) << 3;
       // Indices
@@ -1421,24 +1468,34 @@ void main() {
       const p = this.setup(st, vert);
       if (!p) return true;
       gl.bindVertexArray(this.hwVao);
-      const R = gpu.vs.R;
-      for (let i = 0; i < 16; i++) { gl.disableVertexAttribArray(i); gl.vertexAttrib4f(i, R[i * 4], R[i * 4 + 1], R[i * 4 + 2], R[i * 4 + 3]); }
-      const inArray = new Set();
+      // Each input: an array, or a constant (its register value, or the fixed attribute). Only changes reach WebGL:
+      // thousands of calls a frame otherwise. The enabled arrays are this VAO's state; constants are only set here.
+      const R = gpu.vs.R, D = gpu.defaults, ac = this.attrCache || (this.attrCache = { on: new Uint8Array(16), v: new Float32Array(64).fill(NaN) });
+      const want = this.attrWant || (this.attrWant = new Float32Array(64)), on = this.attrOn || (this.attrOn = new Uint8Array(16));
+      want.set(R.subarray(0, 64)); on.fill(0);
       for (const arr of arrays) {
         gl.bindBuffer(gl.ARRAY_BUFFER, this.hwBuffers[arr.l]);
         gl.bufferData(gl.ARRAY_BUFFER, arr.sp.u8.subarray(arr.sp.off, arr.sp.off + arr.size), gl.STREAM_DRAW);
         for (const at of arr.attrs) {
           if (at.a >= nIn) continue;
           const loc = gpu.inputRegister(at.a);
-          gl.enableVertexAttribArray(loc);
+          on[loc] = 1;
           gl.vertexAttribPointer(loc, at.n, glType[at.type], false, arr.stride, at.off);
-          inArray.add(at.a);
         }
       }
-      const D = gpu.defaults;
       for (let a = 0; a < nIn; a++) {
-        if (inArray.has(a) || !(fixedMask & (1 << a))) continue;
-        gl.vertexAttrib4f(gpu.inputRegister(a), D[a * 4], D[a * 4 + 1], D[a * 4 + 2], D[a * 4 + 3]);
+        const loc = gpu.inputRegister(a);
+        if (on[loc] || !(fixedMask & (1 << a))) continue;
+        for (let k = 0; k < 4; k++) want[loc * 4 + k] = D[a * 4 + k];
+      }
+      for (let i = 0; i < 16; i++) {
+        if (on[i] !== ac.on[i]) { if (on[i]) gl.enableVertexAttribArray(i); else gl.disableVertexAttribArray(i); ac.on[i] = on[i]; }
+        if (on[i]) continue;
+        const o = i * 4;
+        if (want[o] !== ac.v[o] || want[o + 1] !== ac.v[o + 1] || want[o + 2] !== ac.v[o + 2] || want[o + 3] !== ac.v[o + 3]) {
+          gl.vertexAttrib4f(i, want[o], want[o + 1], want[o + 2], want[o + 3]);
+          ac.v.set(want.subarray(o, o + 4), o);
+        }
       }
       gl.uniform4fv(p.u.C, R.subarray(0x20 * 4, 0x80 * 4));
       gl.uniform2f(p.u.uDepth, st.depthScale, st.depthOffset);

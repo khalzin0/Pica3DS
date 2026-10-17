@@ -159,12 +159,25 @@
   .section h4 { margin: 0 0 8px; font-size: 11.5px; text-transform: uppercase; letter-spacing: .8px; color: var(--faint); font-weight: 700; }
   .note { color: var(--muted); font-size: 12.5px; margin: 0; }
 
-  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  @media (max-width: 420px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+  .h-note { font-weight: 400; color: var(--muted); text-transform: none; letter-spacing: 0; }
+  .graph-wrap { position: relative; }
+  .graph-tip { position: absolute; top: 6px; pointer-events: none; padding: 3px 7px; border-radius: 6px; background: var(--panel-3); border: 1px solid var(--border); color: var(--text); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap; transform: translateX(-50%); }
+  .graph-tip[hidden] { display: none; }
+  .pace-row { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 6px; font-size: 12px; color: var(--muted); }
+  .pace-row b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .breakdown .total { font-weight: 600; }
+  .breakdown .bar.budget { position: relative; overflow: visible; }
+  .breakdown .bar.budget i { background: var(--text); opacity: .55; }
+  .breakdown .bar.budget.over i { background: var(--bad); opacity: 1; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; margin: 0; font-size: 12px; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; color: var(--text); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
   .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 9px 11px; }
   .stat b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; line-height: 1.2; }
   .stat span { color: var(--muted); font-size: 11.5px; }
   .stat.good b { color: var(--ok); } .stat.warn b { color: var(--warn); } .stat.bad b { color: var(--bad); }
-  .graph { width: 100%; height: 70px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
+  .graph { display: block; width: 100%; height: 96px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
   .perf { font-variant-numeric: tabular-nums; line-height: 1.5; }
   .breakdown { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 10px; align-items: center; font-size: 12.5px; }
   .breakdown .bar { height: 6px; border-radius: 3px; background: var(--panel-3); overflow: hidden; }
@@ -415,22 +428,32 @@
     <div class="pane" id="pane-perf" role="tabpanel">
       <div class="stats">
         <div class="stat" id="stat-fps" title="Emulated frames per second (a real 3DS runs at 59.83)"><b id="fps">–</b><span>Game FPS</span></div>
-        <div class="stat" title="Screen updates per second in this browser"><b id="host-fps">–</b><span>Display FPS</span></div>
+        <div class="stat" id="stat-pics" title="New pictures the game shows per second (many games run at 30)"><b id="pics">–</b><span>Pictures/s</span></div>
         <div class="stat" id="stat-speed" title="Emulation speed compared with a real 3DS"><b id="speed">–</b><span>Speed</span></div>
+        <div class="stat" id="stat-stutter" title="Pictures shown late in the last 10 seconds (more than 1.5 times the usual gap)"><b id="stutters">–</b><span>Stutters (10 s)</span></div>
       </div>
       <div class="section">
-        <h4>Frame time</h4>
-        <canvas class="graph" id="graph" width="656" height="140" aria-label="Frame time graph"></canvas>
-        <p class="note perf" id="perf" style="margin-top:6px"></p>
+        <h4>Frame pacing <small class="h-note">time between new pictures</small></h4>
+        <div class="graph-wrap">
+          <canvas class="graph" id="graph" width="656" height="180" aria-label="Time between new pictures, last 240 pictures"></canvas>
+          <div class="graph-tip" id="graph-tip" hidden></div>
+        </div>
+        <div class="pace-row" id="pace-row"><span>Median <b id="pace-med">–</b></span><span>95th percentile <b id="pace-p95">–</b></span><span>Worst <b id="pace-max">–</b></span></div>
       </div>
       <div class="section">
-        <h4>Where the time goes (per frame)</h4>
+        <h4>Where the time goes <small class="h-note">per emulated frame · budget 16.7 ms</small></h4>
         <div class="breakdown" id="breakdown">
           <span>CPU</span><div class="bar"><i id="bar-cpu"></i></div><span class="val" id="val-cpu">–</span>
           <span>GPU</span><div class="bar"><i id="bar-gpu"></i></div><span class="val" id="val-gpu">–</span>
           <span>Copies</span><div class="bar"><i id="bar-xfer"></i></div><span class="val" id="val-xfer">–</span>
           <span>Present</span><div class="bar"><i id="bar-present"></i></div><span class="val" id="val-present">–</span>
+          <span class="total">Total</span><div class="bar budget"><i id="bar-total"></i><em></em></div><span class="val" id="val-total">–</span>
         </div>
+      </div>
+      <div class="section">
+        <h4>Details</h4>
+        <dl class="kv" id="perf-details"></dl>
+        <p class="note perf" id="perf" hidden></p>
       </div>
     </div>
 
